@@ -10,7 +10,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
+BASE_URL = (os.getenv("BASE_URL") or "").rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
 
 router = Router()
@@ -34,7 +34,7 @@ async def start(m: Message):
 @router.message(Command("connect"))
 async def connect(m: Message):
     if not BASE_URL:
-        await m.answer("Ошибка: BASE_URL не задан (адрес web-сервиса).")
+        await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
         return
 
     tg_id = m.from_user.id
@@ -49,12 +49,13 @@ async def connect(m: Message):
 @router.message(Command("me"))
 async def me(m: Message):
     if not BASE_URL:
-        await m.answer("Ошибка: BASE_URL не задан (адрес web-сервиса).")
+        await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
         return
 
     tg_id = m.from_user.id
+
     async with httpx.AsyncClient(timeout=25) as client:
-        r = await client.get(f"{BASE_URL}/tracker/me", params={"tg": tg_id})
+        r = await client.get(f"{BASE_URL}/tracker/me_by_tg", params={"tg": tg_id})
 
     try:
         data = r.json()
@@ -69,7 +70,8 @@ async def me(m: Message):
     status_code = data.get("status_code")
     if status_code == 200:
         user = data.get("response", {})
-        await m.answer(f"Ок. Tracker user: {user.get('login', user.get('uid', 'unknown'))}")
+        login = user.get("login") or user.get("display") or user.get("uid") or "unknown"
+        await m.answer(f"Ок. Tracker user: {login}")
     else:
         await m.answer(f"Tracker вернул {status_code}: {data.get('response')}")
 
@@ -91,7 +93,6 @@ async def run_web():
 
 
 async def main():
-    # запускаем и polling, и веб-сервер одновременно
     await asyncio.gather(run_web(), run_bot())
 
 
