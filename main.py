@@ -607,4 +607,22 @@ async def debug_checklist(tg: int, issue: str):
 
     # Достаём сырой checklist
     st, payload = await _service.tracker.get_checklist(access, issue)  # noqa: SLF001
-    return {"status_code": st, "response": payload}    
+    return {"status_code": st, "response": payload}
+    
+@app.get("/tracker/debug_issue")
+async def debug_issue(tg: int, issue: str):
+    cfg_err = _require(settings)
+    if cfg_err:
+        return cfg_err
+
+    assert _service is not None
+    access, err = await _service._get_valid_access_token(tg)  # noqa: SLF001
+    if err:
+        return JSONResponse(err["body"], status_code=err["http_status"])
+
+    assert _http is not None
+    url = f"https://api.tracker.yandex.net/v2/issues/{issue}"
+    headers = {"Authorization": f"OAuth {access}", "X-Org-Id": settings.yandex_org_id}
+
+    r = await _http.get(url, headers=headers)
+    return {"status_code": r.status_code, "response": _safe_json(r)}
