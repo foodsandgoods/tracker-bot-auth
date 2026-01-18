@@ -27,23 +27,51 @@ class Settings:
     yandex_token_url: str = "https://oauth.yandex.ru/token"
     tracker_myself_url: str = "https://api.tracker.yandex.net/v2/myself"
 
-    http_timeout_seconds: float = 20.0
+    http_timeout_seconds: float = 25.0
 
 
 def load_settings() -> Settings:
-    base_url = (os.getenv("BASE_URL") or "").rstrip("/")
-    client_id = os.getenv("YANDEX_CLIENT_ID") or ""
-    client_secret = os.getenv("YANDEX_CLIENT_SECRET") or ""
-    org_id = os.getenv("YANDEX_ORG_ID") or ""
-    db_url = os.getenv("DATABASE_URL") or ""
-
     return Settings(
-        base_url=base_url,
-        yandex_client_id=client_id,
-        yandex_client_secret=client_secret,
-        yandex_org_id=org_id,
-        database_url=db_url,
+        base_url=(os.getenv("BASE_URL") or "").rstrip("/"),
+        yandex_client_id=os.getenv("YANDEX_CLIENT_ID") or "",
+        yandex_client_secret=os.getenv("YANDEX_CLIENT_SECRET") or "",
+        yandex_org_id=os.getenv("YANDEX_ORG_ID") or "",
+        database_url=os.getenv("DATABASE_URL") or "",
     )
+
+
+# =========================
+# Utils
+# =========================
+def _safe_json(r: httpx.Response) -> Any:
+    try:
+        return r.json()
+    except Exception:
+        return {"raw": r.text}
+
+
+def _require(settings: Settings) -> Optional[JSONResponse]:
+    missing = []
+    if not settings.base_url:
+        missing.append("BASE_URL")
+    if not settings.yandex_client_id:
+        missing.append("YANDEX_CLIENT_ID")
+    if not settings.yandex_client_secret:
+        missing.append("YANDEX_CLIENT_SECRET")
+    if not settings.yandex_org_id:
+        missing.append("YANDEX_ORG_ID")
+    if not settings.database_url:
+        missing.append("DATABASE_URL")
+
+    if missing:
+        return JSONResponse({"error": "Service not configured", "missing": missing}, status_code=500)
+    return None
+
+
+def _parse_state(state: str) -> int:
+    # state = "tg_id:nonce"
+    tg_str, _nonce = state.split(":", 1)
+    return int(tg_str)
 
 
 # =========================
@@ -65,6 +93,16 @@ class TokenStorage:
                         token_type TEXT,
                         expires_in BIGINT,
                         obtained_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+                await cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS tg_users (
+                        tg_id BIGINT PRIMARY KEY,
+                        tracker_login TEXT NOT NULL,
+                        tracker_uid TEXT,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
                     """
                 )
@@ -112,9 +150,35 @@ class TokenStorage:
                 row = await cur.fetchone()
         return row
 
+    async def upsert_user(self, tg_id: int, tracker_login: str, tracker_uid: Optional[str]) -> None:
+        async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO tg_users (tg_id, tracker_login, tracker_uid, updated_at)
+                    VALUES (%s, %s, %s, NOW())
+                    ON CONFLICT (tg_id) DO UPDATE SET
+                        tracker_login = EXCLUDED.tracker_login,
+                        tracker_uid = EXCLUDED.tracker_uid,
+                        updated_at = NOW();
+                    """,
+                    (tg_id, tracker_login, tracker_uid),
+                )
+            await conn.commit()
+
+    async def get_user(self, tg_id: int) -> Optional[dict]:
+        async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT tracker_login, tracker_uid FROM tg_users WHERE tg_id=%s",
+                    (tg_id,),
+                )
+                row = await cur.fetchone()
+        return row
+
 
 # =========================
-# OAuth + Tracker clients
+# HTTP clients
 # =========================
 class OAuthClient:
     def __init__(self, http: httpx.AsyncClient, settings: Settings):
@@ -122,11 +186,10 @@ class OAuthClient:
         self.settings = settings
 
     def build_authorize_url(self, tg_id: int) -> str:
-        # state формата "tg:nonce" — без серверных сессий
         nonce = secrets.token_urlsafe(16)
         state = f"{tg_id}:{nonce}"
-
         redirect_uri = f"{self.settings.base_url}/oauth/callback"
+
         params = {
             "response_type": "code",
             "client_id": self.settings.yandex_client_id,
@@ -173,12 +236,45 @@ class TrackerClient:
         self.http = http
         self.settings = settings
 
-    async def myself(self, access_token: str) -> tuple[int, Any]:
-        headers = {
+    def _headers(self, access_token: str) -> dict[str, str]:
+        return {
             "Authorization": f"OAuth {access_token}",
             "X-Org-Id": self.settings.yandex_org_id,
         }
-        r = await self.http.get(self.settings.tracker_myself_url, headers=headers)
+
+    async def myself(self, access_token: str) -> tuple[int, Any]:
+        r = await self.http.get(self.settings.tracker_myself_url, headers=self._headers(access_token))
+        return r.status_code, _safe_json(r)
+
+    async def search_issues(self, access_token: str, query: str, limit: int = 50) -> tuple[int, Any]:
+        url = "https://api.tracker.yandex.net/v2/issues/_search"
+        headers = {**self._headers(access_token), "Content-Type": "application/json"}
+        r = await self.http.post(url, headers=headers, json={"query": query, "perPage": limit})
+        return r.status_code, _safe_json(r)
+
+    async def get_checklist(self, access_token: str, issue_key: str) -> tuple[int, Any]:
+        # Docs: Getting checklist parameters
+        url_v2 = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/checklist"
+        url_v3 = f"https://api.tracker.yandex.net/v3/issues/{issue_key}/checklist"
+
+        r = await self.http.get(url_v2, headers=self._headers(access_token))
+        if r.status_code in (404, 405):
+            r = await self.http.get(url_v3, headers=self._headers(access_token))
+        return r.status_code, _safe_json(r)
+
+    async def set_checklist_item_checked(
+        self, access_token: str, issue_key: str, item_id: str, checked: bool
+    ) -> tuple[int, Any]:
+        # В разных версиях API путь/метод может отличаться. Начинаем с PATCH + fallback.
+        url_v2 = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/checklist/items/{item_id}"
+        url_v3 = f"https://api.tracker.yandex.net/v3/issues/{issue_key}/checklist/items/{item_id}"
+
+        headers = {**self._headers(access_token), "Content-Type": "application/json"}
+        body = {"checked": checked}
+
+        r = await self.http.patch(url_v2, headers=headers, json=body)
+        if r.status_code in (404, 405):
+            r = await self.http.patch(url_v3, headers=headers, json=body)
         return r.status_code, _safe_json(r)
 
 
@@ -191,77 +287,166 @@ class TrackerService:
         self.oauth = oauth
         self.tracker = tracker
 
-    async def myself_by_tg(self, tg_id: int) -> dict[str, Any]:
+    async def _get_valid_access_token(self, tg_id: int) -> tuple[Optional[str], Optional[dict]]:
         tokens = await self.storage.get_tokens(tg_id)
         if not tokens or not tokens.get("access_token"):
-            return {"http_status": 401, "body": {"error": "No token for this tg. Use /connect first."}}
+            return None, {"http_status": 401, "body": {"error": "No token. Use /connect first."}}
 
         access = tokens["access_token"]
-        status, payload = await self.tracker.myself(access)
-        if status != 401:
-            return {"http_status": 200, "body": {"status_code": status, "response": payload}}
 
-        # access token invalid/expired -> refresh
+        # Ленивая стратегия: валидируем только если реально словили 401 на запросе ниже.
+        # Но для получения user/login удобнее сделать myself и по нему при необходимости refresh.
+        status, me = await self.tracker.myself(access)
+        if status != 401:
+            # параллельно можем обновить user-таблицу
+            if status == 200 and isinstance(me, dict):
+                login = me.get("login")
+                uid = me.get("trackerUid") or me.get("passportUid") or me.get("uid")
+                if login:
+                    await self.storage.upsert_user(tg_id, login, str(uid) if uid is not None else None)
+            return access, None
+
         refresh_token = tokens.get("refresh_token")
         if not refresh_token:
-            return {
-                "http_status": 401,
-                "body": {"error": "Access token expired and no refresh_token stored. Reconnect with /connect."},
-            }
+            return None, {"http_status": 401, "body": {"error": "Expired token and no refresh_token. Reconnect."}}
 
-        try:
-            new_payload = await self.oauth.refresh(refresh_token)
-        except Exception as e:
-            return {"http_status": 401, "body": {"error": "Token refresh failed", "detail": str(e)}}
-
+        new_payload = await self.oauth.refresh(refresh_token)
         new_access = new_payload.get("access_token")
         new_refresh = new_payload.get("refresh_token") or refresh_token
-        new_type = new_payload.get("token_type")
-        new_expires = new_payload.get("expires_in")
 
-        await self.storage.upsert_token(tg_id, new_access, new_refresh, new_type, new_expires)
+        await self.storage.upsert_token(
+            tg_id,
+            new_access,
+            new_refresh,
+            new_payload.get("token_type"),
+            new_payload.get("expires_in"),
+        )
 
-        status2, payload2 = await self.tracker.myself(new_access)
-        return {"http_status": 200, "body": {"status_code": status2, "response": payload2}}
+        # обновим user-таблицу
+        status2, me2 = await self.tracker.myself(new_access)
+        if status2 == 200 and isinstance(me2, dict):
+            login2 = me2.get("login")
+            uid2 = me2.get("trackerUid") or me2.get("passportUid") or me2.get("uid")
+            if login2:
+                await self.storage.upsert_user(tg_id, login2, str(uid2) if uid2 is not None else None)
+
+        return new_access, None
+
+    async def me_by_tg(self, tg_id: int) -> dict:
+        access, err = await self._get_valid_access_token(tg_id)
+        if err:
+            return err
+        status, payload = await self.tracker.myself(access)
+        return {"http_status": 200, "body": {"status_code": status, "response": payload}}
+
+    async def user_by_tg(self, tg_id: int) -> dict:
+        user = await self.storage.get_user(tg_id)
+        if user:
+            return {"http_status": 200, "body": user}
+
+        # если нет — попробуем подтянуть через myself (и сохранить)
+        access, err = await self._get_valid_access_token(tg_id)
+        if err:
+            return err
+
+        user2 = await self.storage.get_user(tg_id)
+        if user2:
+            return {"http_status": 200, "body": user2}
+
+        return {"http_status": 404, "body": {"error": "User not linked yet. Run /connect again."}}
+
+    def _extract_checklist_items(self, checklist_payload: Any) -> list[dict]:
+        # В разных версиях: либо {"checklistItems":[...]} либо {"items":[...]} либо сразу список
+        if isinstance(checklist_payload, list):
+            return checklist_payload
+        if isinstance(checklist_payload, dict):
+            if isinstance(checklist_payload.get("checklistItems"), list):
+                return checklist_payload["checklistItems"]
+            if isinstance(checklist_payload.get("items"), list):
+                return checklist_payload["items"]
+        return []
+
+    async def checklist_assigned_issues(self, tg_id: int, only_unchecked: bool, limit: int = 10) -> dict:
+        # узнаём login автоматически
+        u = await self.user_by_tg(tg_id)
+        if u["http_status"] != 200:
+            return u
+        login = (u["body"].get("tracker_login") or "").lower()
+        if not login:
+            return {"http_status": 500, "body": {"error": "tracker_login is empty for this tg"}}
+
+        access, err = await self._get_valid_access_token(tg_id)
+        if err:
+            return err
+
+        # Кандидаты задач: лучше сузить под тебя/очередь. Пока берем последние 30 дней.
+        query = "Updated: >= now()-30d"
+        st, payload = await self.tracker.search_issues(access, query=query, limit=50)
+        if st != 200:
+            return {"http_status": 200, "body": {"status_code": st, "response": payload, "query": query}}
+
+        issues = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
+        result: list[dict] = []
+
+        for it in issues:
+            key = it.get("key")
+            if not key:
+                continue
+
+            stc, checklist = await self.tracker.get_checklist(access, key)
+            if stc != 200:
+                continue
+
+            items = self._extract_checklist_items(checklist)
+            if not items:
+                continue
+
+            matched_items = []
+            for ci in items:
+                ass = ci.get("assignee") or {}
+                ass_login = (ass.get("login") or "").lower()
+                if ass_login != login:
+                    continue
+                if only_unchecked and ci.get("checked") is True:
+                    continue
+                matched_items.append(
+                    {
+                        "id": str(ci.get("id")),
+                        "text": ci.get("text") or ci.get("textHtml") or "",
+                        "checked": bool(ci.get("checked", False)),
+                    }
+                )
+
+            if matched_items:
+                result.append(
+                    {
+                        "key": key,
+                        "summary": it.get("summary"),
+                        "url": f"https://tracker.yandex.ru/{key}",
+                        "items": matched_items,
+                    }
+                )
+
+            if len(result) >= limit:
+                break
+
+        return {"http_status": 200, "body": {"status_code": 200, "issues": result, "query": query, "login": login}}
+
+    async def checklist_item_check(self, tg_id: int, issue_key: str, item_id: str, checked: bool) -> dict:
+        access, err = await self._get_valid_access_token(tg_id)
+        if err:
+            return err
+
+        st, payload = await self.tracker.set_checklist_item_checked(access, issue_key, item_id, checked)
+        return {"http_status": 200, "body": {"status_code": st, "response": payload}}
 
 
 # =========================
-# Utils
-# =========================
-def _safe_json(r: httpx.Response) -> Any:
-    try:
-        return r.json()
-    except Exception:
-        return {"raw": r.text}
-
-
-def _require(settings: Settings) -> Optional[JSONResponse]:
-    # Проверяем минимально необходимое для OAuth/Tracker
-    missing = []
-    if not settings.base_url:
-        missing.append("BASE_URL")
-    if not settings.yandex_client_id:
-        missing.append("YANDEX_CLIENT_ID")
-    if not settings.yandex_client_secret:
-        missing.append("YANDEX_CLIENT_SECRET")
-    if not settings.yandex_org_id:
-        missing.append("YANDEX_ORG_ID")
-    if not settings.database_url:
-        missing.append("DATABASE_URL")
-
-    if missing:
-        return JSONResponse({"error": "Service not configured", "missing": missing}, status_code=500)
-    return None
-
-
-# =========================
-# FastAPI app wiring
+# FastAPI wiring
 # =========================
 app = FastAPI()
-
 settings = load_settings()
 
-# один клиент на всё приложение (быстрее и правильнее)
 _http: Optional[httpx.AsyncClient] = None
 _storage: Optional[TokenStorage] = None
 _oauth: Optional[OAuthClient] = None
@@ -273,15 +458,13 @@ _service: Optional[TrackerService] = None
 async def startup():
     global _http, _storage, _oauth, _tracker, _service
 
-    # создаём общий http клиент
     _http = httpx.AsyncClient(timeout=settings.http_timeout_seconds)
 
-    cfg_err = _require(settings)
-    # даже если не настроено — поднимем сервис, но без OAuth он будет отдавать 500 с missing
     if settings.database_url:
         _storage = TokenStorage(settings.database_url)
         await _storage.ensure_schema()
 
+    cfg_err = _require(settings)
     if not cfg_err and _http and _storage:
         _oauth = OAuthClient(_http, settings)
         _tracker = TrackerClient(_http, settings)
@@ -314,7 +497,6 @@ async def oauth_start(tg: int):
     cfg_err = _require(settings)
     if cfg_err:
         return cfg_err
-
     assert _oauth is not None
     return RedirectResponse(_oauth.build_authorize_url(tg), status_code=302)
 
@@ -330,15 +512,14 @@ async def oauth_callback(code: str | None = None, state: str | None = None, erro
     if not code or not state:
         return JSONResponse({"ok": False, "error": "Missing code/state"}, status_code=400)
 
-    # state = "tg:nonce"
     try:
-        tg_str, _nonce = state.split(":", 1)
-        tg_id = int(tg_str)
+        tg_id = _parse_state(state)
     except Exception:
         return JSONResponse({"ok": False, "error": "Invalid state format"}, status_code=400)
 
     assert _oauth is not None
     assert _storage is not None
+    assert _tracker is not None
 
     try:
         token_payload = await _oauth.exchange_code(code)
@@ -352,22 +533,18 @@ async def oauth_callback(code: str | None = None, state: str | None = None, erro
 
     await _storage.upsert_token(tg_id, access, refresh, token_type, expires_in)
 
-    # Токены не возвращаем
+    # Сразу получим login и запишем в tg_users
+    st, me = await _tracker.myself(access)
+    if st == 200 and isinstance(me, dict):
+        login = me.get("login")
+        uid = me.get("trackerUid") or me.get("passportUid") or me.get("uid")
+        if login:
+            await _storage.upsert_user(tg_id, login, str(uid) if uid is not None else None)
+
     return JSONResponse(
         {"ok": True, "message": "Connected. Return to Telegram and run /me", "tg": tg_id},
         status_code=200,
     )
-
-
-@app.get("/tracker/me")
-async def tracker_me(token: str):
-    # оставляем endpoint для отладки/ручных запросов
-    if not settings.yandex_org_id:
-        return JSONResponse({"error": "YANDEX_ORG_ID is not set"}, status_code=500)
-
-    assert _tracker is not None
-    status, payload = await _tracker.myself(token)
-    return {"status_code": status, "response": payload}
 
 
 @app.get("/tracker/me_by_tg")
@@ -375,7 +552,46 @@ async def tracker_me_by_tg(tg: int):
     cfg_err = _require(settings)
     if cfg_err:
         return cfg_err
-
     assert _service is not None
-    result = await _service.myself_by_tg(tg)
+    result = await _service.me_by_tg(tg)
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.get("/tracker/user_by_tg")
+async def tracker_user_by_tg(tg: int):
+    cfg_err = _require(settings)
+    if cfg_err:
+        return cfg_err
+    assert _service is not None
+    result = await _service.user_by_tg(tg)
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.get("/tracker/checklist/assigned")
+async def checklist_assigned(tg: int, limit: int = 10):
+    cfg_err = _require(settings)
+    if cfg_err:
+        return cfg_err
+    assert _service is not None
+    result = await _service.checklist_assigned_issues(tg, only_unchecked=False, limit=limit)
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.get("/tracker/checklist/assigned_unchecked")
+async def checklist_assigned_unchecked(tg: int, limit: int = 10):
+    cfg_err = _require(settings)
+    if cfg_err:
+        return cfg_err
+    assert _service is not None
+    result = await _service.checklist_assigned_issues(tg, only_unchecked=True, limit=limit)
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.post("/tracker/checklist/check")
+async def checklist_check(tg: int, issue: str, item: str, checked: bool = True):
+    cfg_err = _require(settings)
+    if cfg_err:
+        return cfg_err
+    assert _service is not None
+    result = await _service.checklist_item_check(tg, issue_key=issue, item_id=item, checked=checked)
     return JSONResponse(result["body"], status_code=result["http_status"])
