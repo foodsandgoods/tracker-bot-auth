@@ -1,6 +1,7 @@
 import os
 import secrets
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 import httpx
 import psycopg
@@ -19,12 +20,15 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 YANDEX_AUTH_URL = "https://oauth.yandex.ru/authorize"
 YANDEX_TOKEN_URL = "https://oauth.yandex.ru/token"
+TRACKER_MYSELF_URL = "https://api.tracker.yandex.net/v2/myself"
 
 
-# ===== DB =====
+# ===== DB HELPERS =====
 async def ensure_db() -> None:
+    """Create table if it doesn't exist."""
     if not DATABASE_URL:
         return
+
     async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -62,7 +66,14 @@ async def upsert_token(
                     expires_in = EXCLUDED.expires_in,
                     obtained_at = EXCLUDED.obtained_at;
                 """,
-                (tg_id, access_token, refresh_token, token_type, expires_in, datetime.now(timezone.utc)),
+                (
+                    tg_id,
+                    access_token,
+                    refresh_token,
+                    token_type,
+                    expires_in,
+                    datetime.now(timezone.utc),
+                ),
             )
         await conn.commit()
 
@@ -72,11 +83,13 @@ async def get_access_token_by_tg(tg_id: int) -> str | None:
         async with conn.cursor() as cur:
             await cur.execute("SELECT access_token FROM oauth_tokens WHERE tg_id=%s", (tg_id,))
             row = await cur.fetchone()
+
     if not row:
         return None
     return row.get("access_token")
 
 
+# ===== LIFECYCLE =====
 @app.on_event("startup")
 async def on_startup():
     await ensure_db()
@@ -106,16 +119,14 @@ async def oauth_start(tg: int):
     redirect_uri = f"{BASE_URL}/oauth/callback"
 
     params = {
-    "response_type": "code",
-    "client_id": YANDEX_CLIENT_ID,
-    "redirect_uri": redirect_uri,
-    "state": state,
-}
+        "response_type": "code",
+        "client_id": YANDEX_CLIENT_ID,
+        "redirect_uri": redirect_uri,
+        "state": state,
+    }
 
-async with httpx.AsyncClient() as client:
-    url = str(client.build_request("GET", YANDEX_AUTH_URL, params=params).url)
-
-return RedirectResponse(url, status_code=302)
+    url = f"{YANDEX_AUTH_URL}?{urlencode(params)}"
+    return RedirectResponse(url, status_code=302)
 
 
 @app.get("/oauth/callback")
@@ -135,6 +146,7 @@ async def oauth_callback(code: str | None = None, state: str | None = None, erro
     if not DATABASE_URL:
         return JSONResponse({"ok": False, "error": "DATABASE_URL is not set"}, status_code=500)
 
+    # state = "tg_id:nonce"
     try:
         tg_str, _nonce = state.split(":", 1)
         tg_id = int(tg_str)
@@ -178,6 +190,7 @@ async def oauth_callback(code: str | None = None, state: str | None = None, erro
 
     await upsert_token(tg_id, access_token, refresh_token, token_type, expires_in)
 
+    # Не светим токены в ответе
     return JSONResponse(
         {"ok": True, "status_code": 200, "message": "Connected. Return to Telegram and run /me", "tg": tg_id}
     )
@@ -185,14 +198,14 @@ async def oauth_callback(code: str | None = None, state: str | None = None, erro
 
 @app.get("/tracker/me")
 async def tracker_me(token: str):
+    """Proxy endpoint if you want to pass token explicitly."""
     if not YANDEX_ORG_ID:
         return JSONResponse({"error": "YANDEX_ORG_ID is not set"}, status_code=500)
 
-    url = "https://api.tracker.yandex.net/v2/myself"
     headers = {"Authorization": f"OAuth {token}", "X-Org-Id": YANDEX_ORG_ID}
 
     async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(url, headers=headers)
+        r = await client.get(TRACKER_MYSELF_URL, headers=headers)
 
     try:
         payload = r.json()
@@ -204,6 +217,7 @@ async def tracker_me(token: str):
 
 @app.get("/tracker/me_by_tg")
 async def tracker_me_by_tg(tg: int):
+    """Proxy endpoint used by the bot: reads token by Telegram user id."""
     if not DATABASE_URL:
         return JSONResponse({"error": "DATABASE_URL is not set"}, status_code=500)
     if not YANDEX_ORG_ID:
@@ -213,11 +227,10 @@ async def tracker_me_by_tg(tg: int):
     if not token:
         return JSONResponse({"error": "No token for this tg. Use /connect first."}, status_code=401)
 
-    url = "https://api.tracker.yandex.net/v2/myself"
     headers = {"Authorization": f"OAuth {token}", "X-Org-Id": YANDEX_ORG_ID}
 
     async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(url, headers=headers)
+        r = await client.get(TRACKER_MYSELF_URL, headers=headers)
 
     try:
         payload = r.json()
