@@ -5,3 +5,26 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: BASE_URL
+        sync: false
+      - key: YANDEX_CLIENT_ID
+        sync: false
+      - key: YANDEX_CLIENT_SECRET
+        sync: false
+      - key: YANDEX_ORG_ID
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+
+  - type: worker
+    name: tracker-bot-worker
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: BASE_URL
+        sync: false
