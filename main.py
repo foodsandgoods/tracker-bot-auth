@@ -25,7 +25,6 @@ class Settings:
 
     yandex_auth_url: str = "https://oauth.yandex.ru/authorize"
     yandex_token_url: str = "https://oauth.yandex.ru/token"
-    tracker_myself_url: str = "https://api.tracker.yandex.net/v2/myself"
 
     http_timeout_seconds: float = 25.0
 
@@ -73,6 +72,27 @@ def _parse_state(state: str) -> int:
     return int(tg_str)
 
 
+def _normalize_queues_csv(s: str) -> str:
+    # "INV, DOC;HR" -> "INV,DOC,HR"
+    raw = s.replace(";", ",").replace(" ", "")
+    parts = [p for p in raw.split(",") if p]
+    # верхний регистр, уникальные, сохраняем порядок
+    seen = set()
+    out = []
+    for p in parts:
+        p2 = p.upper()
+        if p2 not in seen:
+            out.append(p2)
+            seen.add(p2)
+    return ",".join(out)
+
+
+def _queues_list(csv: str) -> list[str]:
+    if not csv:
+        return []
+    return [p for p in csv.split(",") if p]
+
+
 # =========================
 # Storage (Postgres)
 # =========================
@@ -101,6 +121,16 @@ class TokenStorage:
                         tg_id BIGINT PRIMARY KEY,
                         tracker_login TEXT NOT NULL,
                         tracker_uid TEXT,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+                await cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS tg_settings (
+                        tg_id BIGINT PRIMARY KEY,
+                        queues_csv TEXT NOT NULL DEFAULT '',
+                        days INT NOT NULL DEFAULT 30,
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
                     """
@@ -142,10 +172,7 @@ class TokenStorage:
     async def get_tokens(self, tg_id: int) -> Optional[dict]:
         async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
             async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT access_token, refresh_token FROM oauth_tokens WHERE tg_id=%s",
-                    (tg_id,),
-                )
+                await cur.execute("SELECT access_token, refresh_token FROM oauth_tokens WHERE tg_id=%s", (tg_id,))
                 row = await cur.fetchone()
         return row
 
@@ -168,12 +195,62 @@ class TokenStorage:
     async def get_user(self, tg_id: int) -> Optional[dict]:
         async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
             async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT tracker_login, tracker_uid FROM tg_users WHERE tg_id=%s",
-                    (tg_id,),
-                )
+                await cur.execute("SELECT tracker_login, tracker_uid FROM tg_users WHERE tg_id=%s", (tg_id,))
                 row = await cur.fetchone()
         return row
+
+    async def ensure_settings_row(self, tg_id: int) -> None:
+        async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO tg_settings (tg_id)
+                    VALUES (%s)
+                    ON CONFLICT (tg_id) DO NOTHING;
+                    """,
+                    (tg_id,),
+                )
+            await conn.commit()
+
+    async def get_settings(self, tg_id: int) -> dict:
+        await self.ensure_settings_row(tg_id)
+        async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT queues_csv, days FROM tg_settings WHERE tg_id=%s", (tg_id,))
+                row = await cur.fetchone()
+        return row or {"queues_csv": "", "days": 30}
+
+    async def set_queues(self, tg_id: int, queues_csv: str) -> None:
+        q = _normalize_queues_csv(queues_csv)
+        async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO tg_settings (tg_id, queues_csv, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (tg_id) DO UPDATE SET
+                        queues_csv = EXCLUDED.queues_csv,
+                        updated_at = NOW();
+                    """,
+                    (tg_id, q),
+                )
+            await conn.commit()
+
+    async def set_days(self, tg_id: int, days: int) -> None:
+        days = max(1, min(int(days), 3650))
+        async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO tg_settings (tg_id, days, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (tg_id) DO UPDATE SET
+                        days = EXCLUDED.days,
+                        updated_at = NOW();
+                    """,
+                    (tg_id, days),
+                )
+            await conn.commit()
 
 
 # =========================
@@ -188,7 +265,6 @@ class OAuthClient:
         nonce = secrets.token_urlsafe(16)
         state = f"{tg_id}:{nonce}"
         redirect_uri = f"{self.settings.base_url}/oauth/callback"
-
         params = {
             "response_type": "code",
             "client_id": self.settings.yandex_client_id,
@@ -236,48 +312,29 @@ class TrackerClient:
         self.settings = settings
 
     def _headers(self, access_token: str) -> dict[str, str]:
-        return {
-            "Authorization": f"OAuth {access_token}",
-            "X-Org-Id": self.settings.yandex_org_id,
-        }
+        return {"Authorization": f"OAuth {access_token}", "X-Org-Id": self.settings.yandex_org_id}
 
     async def myself(self, access_token: str) -> tuple[int, Any]:
-        r = await self.http.get(self.settings.tracker_myself_url, headers=self._headers(access_token))
+        url = "https://api.tracker.yandex.net/v2/myself"
+        r = await self.http.get(url, headers=self._headers(access_token))
         return r.status_code, _safe_json(r)
 
     async def search_issues(self, access_token: str, query: str, limit: int = 50) -> tuple[int, Any]:
-        """
-        В некоторых инсталляциях Tracker поле perPage в JSON-body не принимается.
-        Поэтому передаём пагинацию query-параметрами.
-        """
         url = "https://api.tracker.yandex.net/v2/issues/_search"
         headers = {**self._headers(access_token), "Content-Type": "application/json"}
-
         params = {"page": 1, "perPage": limit}
         r = await self.http.post(url, headers=headers, params=params, json={"query": query})
         return r.status_code, _safe_json(r)
 
-    async def get_checklist(self, access_token: str, issue_key: str) -> tuple[int, Any]:
-        url_v2 = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/checklist"
-        url_v3 = f"https://api.tracker.yandex.net/v3/issues/{issue_key}/checklist"
-
-        r = await self.http.get(url_v2, headers=self._headers(access_token))
-        if r.status_code in (404, 405):
-            r = await self.http.get(url_v3, headers=self._headers(access_token))
+    async def get_issue(self, access_token: str, issue_key: str) -> tuple[int, Any]:
+        url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}"
+        r = await self.http.get(url, headers=self._headers(access_token))
         return r.status_code, _safe_json(r)
 
-    async def set_checklist_item_checked(
-        self, access_token: str, issue_key: str, item_id: str, checked: bool
-    ) -> tuple[int, Any]:
-        url_v2 = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/checklist/items/{item_id}"
-        url_v3 = f"https://api.tracker.yandex.net/v3/issues/{issue_key}/checklist/items/{item_id}"
-
+    async def patch_issue(self, access_token: str, issue_key: str, patch: dict) -> tuple[int, Any]:
+        url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}"
         headers = {**self._headers(access_token), "Content-Type": "application/json"}
-        body = {"checked": checked}
-
-        r = await self.http.patch(url_v2, headers=headers, json=body)
-        if r.status_code in (404, 405):
-            r = await self.http.patch(url_v3, headers=headers, json=body)
+        r = await self.http.patch(url, headers=headers, json=patch)
         return r.status_code, _safe_json(r)
 
 
@@ -296,10 +353,9 @@ class TrackerService:
             return None, {"http_status": 401, "body": {"error": "No token. Use /connect first."}}
 
         access = tokens["access_token"]
-
-        status, me = await self.tracker.myself(access)
-        if status != 401:
-            if status == 200 and isinstance(me, dict):
+        st, me = await self.tracker.myself(access)
+        if st != 401:
+            if st == 200 and isinstance(me, dict):
                 login = me.get("login")
                 uid = me.get("trackerUid") or me.get("passportUid") or me.get("uid")
                 if login:
@@ -313,30 +369,16 @@ class TrackerService:
         new_payload = await self.oauth.refresh(refresh_token)
         new_access = new_payload.get("access_token")
         new_refresh = new_payload.get("refresh_token") or refresh_token
+        await self.storage.upsert_token(tg_id, new_access, new_refresh, new_payload.get("token_type"), new_payload.get("expires_in"))
 
-        await self.storage.upsert_token(
-            tg_id,
-            new_access,
-            new_refresh,
-            new_payload.get("token_type"),
-            new_payload.get("expires_in"),
-        )
-
-        status2, me2 = await self.tracker.myself(new_access)
-        if status2 == 200 and isinstance(me2, dict):
+        st2, me2 = await self.tracker.myself(new_access)
+        if st2 == 200 and isinstance(me2, dict):
             login2 = me2.get("login")
             uid2 = me2.get("trackerUid") or me2.get("passportUid") or me2.get("uid")
             if login2:
                 await self.storage.upsert_user(tg_id, login2, str(uid2) if uid2 is not None else None)
 
         return new_access, None
-
-    async def me_by_tg(self, tg_id: int) -> dict:
-        access, err = await self._get_valid_access_token(tg_id)
-        if err:
-            return err
-        status, payload = await self.tracker.myself(access)
-        return {"http_status": 200, "body": {"status_code": status, "response": payload}}
 
     async def user_by_tg(self, tg_id: int) -> dict:
         user = await self.storage.get_user(tg_id)
@@ -353,30 +395,55 @@ class TrackerService:
 
         return {"http_status": 404, "body": {"error": "User not linked yet. Run /connect again."}}
 
-    def _extract_checklist_items(self, checklist_payload: Any) -> list[dict]:
-        if isinstance(checklist_payload, list):
-            return checklist_payload
-        if isinstance(checklist_payload, dict):
-            if isinstance(checklist_payload.get("checklistItems"), list):
-                return checklist_payload["checklistItems"]
-            if isinstance(checklist_payload.get("items"), list):
-                return checklist_payload["items"]
+    async def me_by_tg(self, tg_id: int) -> dict:
+        access, err = await self._get_valid_access_token(tg_id)
+        if err:
+            return err
+        st, payload = await self.tracker.myself(access)
+        return {"http_status": 200, "body": {"status_code": st, "response": payload}}
+
+    async def settings_get(self, tg_id: int) -> dict:
+        s = await self.storage.get_settings(tg_id)
+        return {"http_status": 200, "body": {"queues": _queues_list(s.get("queues_csv", "")), "days": s.get("days", 30)}}
+
+    async def settings_set_queues(self, tg_id: int, queues_csv: str) -> dict:
+        await self.storage.set_queues(tg_id, queues_csv)
+        return await self.settings_get(tg_id)
+
+    async def settings_set_days(self, tg_id: int, days: int) -> dict:
+        await self.storage.set_days(tg_id, days)
+        return await self.settings_get(tg_id)
+
+    def _build_candidate_query(self, queues: list[str], days: int) -> str:
+        base = f"Updated: >= now()-{int(days)}d"
+        if not queues:
+            return base
+        q = " OR ".join([f"Queue: {x}" for x in queues])
+        return f"({q}) AND {base}"
+
+    @staticmethod
+    def _extract_checklist_items(issue_payload: Any) -> list[dict]:
+        if isinstance(issue_payload, dict) and isinstance(issue_payload.get("checklistItems"), list):
+            return issue_payload["checklistItems"]
         return []
 
     async def checklist_assigned_issues(self, tg_id: int, only_unchecked: bool, limit: int = 10) -> dict:
         u = await self.user_by_tg(tg_id)
         if u["http_status"] != 200:
             return u
-
         login = (u["body"].get("tracker_login") or "").lower()
         if not login:
-            return {"http_status": 500, "body": {"error": "tracker_login is empty for this tg"}}
+            return {"http_status": 500, "body": {"error": "tracker_login is empty"}}
 
         access, err = await self._get_valid_access_token(tg_id)
         if err:
             return err
 
-        query = "(Queue: INV OR Queue: DOC OR Queue: HR) AND Updated: >= now()-15d"
+        s = await self.storage.get_settings(tg_id)
+        queues = _queues_list(s.get("queues_csv", ""))
+        days = int(s.get("days", 30))
+
+        query = self._build_candidate_query(queues, days)
         st, payload = await self.tracker.search_issues(access, query=query, limit=50)
         if st != 200:
             return {"http_status": 200, "body": {"status_code": st, "response": payload, "query": query}}
@@ -389,23 +456,21 @@ class TrackerService:
             if not key:
                 continue
 
-            stc, checklist = await self.tracker.get_checklist(access, key)
-            if stc != 200:
+            sti, issue_full = await self.tracker.get_issue(access, key)
+            if sti != 200 or not isinstance(issue_full, dict):
                 continue
 
-            items = self._extract_checklist_items(checklist)
-            if not items:
+            checklist_items = self._extract_checklist_items(issue_full)
+            if not checklist_items:
                 continue
 
             matched_items = []
-            for ci in items:
+            for ci in checklist_items:
                 ass = ci.get("assignee") or {}
-                ass_login = (ass.get("login") or "").lower()
-                if ass_login != login:
+                if (ass.get("login") or "").lower() != login:
                     continue
                 if only_unchecked and ci.get("checked") is True:
                     continue
-
                 matched_items.append(
                     {
                         "id": str(ci.get("id")),
@@ -418,7 +483,7 @@ class TrackerService:
                 result.append(
                     {
                         "key": key,
-                        "summary": it.get("summary"),
+                        "summary": it.get("summary") or issue_full.get("summary"),
                         "url": f"https://tracker.yandex.ru/{key}",
                         "items": matched_items,
                     }
@@ -427,15 +492,49 @@ class TrackerService:
             if len(result) >= limit:
                 break
 
-        return {"http_status": 200, "body": {"status_code": 200, "issues": result, "query": query, "login": login}}
+        return {
+            "http_status": 200,
+            "body": {
+                "status_code": 200,
+                "issues": result,
+                "query": query,
+                "settings": {"queues": queues, "days": days},
+                "login": login,
+            },
+        }
 
     async def checklist_item_check(self, tg_id: int, issue_key: str, item_id: str, checked: bool) -> dict:
         access, err = await self._get_valid_access_token(tg_id)
         if err:
             return err
 
-        st, payload = await self.tracker.set_checklist_item_checked(access, issue_key, item_id, checked)
-        return {"http_status": 200, "body": {"status_code": st, "response": payload}}
+        # 1) получить issue, достать checklistItems
+        sti, issue_full = await self.tracker.get_issue(access, issue_key)
+        if sti != 200 or not isinstance(issue_full, dict):
+            return {"http_status": 200, "body": {"status_code": sti, "response": issue_full}}
+
+        items = self._extract_checklist_items(issue_full)
+        if not items:
+            return {"http_status": 404, "body": {"error": "No checklistItems in issue"}}
+
+        # 2) обновить checked у нужного item
+        found = False
+        new_items = []
+        for ci in items:
+            if str(ci.get("id")) == str(item_id):
+                ci2 = dict(ci)
+                ci2["checked"] = bool(checked)
+                new_items.append(ci2)
+                found = True
+            else:
+                new_items.append(ci)
+
+        if not found:
+            return {"http_status": 404, "body": {"error": "Checklist item not found in issue", "item_id": item_id}}
+
+        # 3) PATCH issue (возможный формат)
+        stp, resp = await self.tracker.patch_issue(access, issue_key, {"checklistItems": new_items})
+        return {"http_status": 200, "body": {"status_code": stp, "response": resp}}
 
 
 # =========================
@@ -454,7 +553,6 @@ _service: Optional[TrackerService] = None
 @app.on_event("startup")
 async def startup():
     global _http, _storage, _oauth, _tracker, _service
-
     _http = httpx.AsyncClient(timeout=settings.http_timeout_seconds)
 
     if settings.database_url:
@@ -537,10 +635,7 @@ async def oauth_callback(code: str | None = None, state: str | None = None, erro
         if login:
             await _storage.upsert_user(tg_id, login, str(uid) if uid is not None else None)
 
-    return JSONResponse(
-        {"ok": True, "message": "Connected. Return to Telegram and run /me", "tg": tg_id},
-        status_code=200,
-    )
+    return JSONResponse({"ok": True, "message": "Connected. Return to Telegram and run /me", "tg": tg_id}, status_code=200)
 
 
 @app.get("/tracker/me_by_tg")
@@ -560,6 +655,36 @@ async def tracker_user_by_tg(tg: int):
         return cfg_err
     assert _service is not None
     result = await _service.user_by_tg(tg)
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.get("/tg/settings")
+async def tg_settings(tg: int):
+    cfg_err = _require(settings)
+    if cfg_err:
+        return cfg_err
+    assert _service is not None
+    result = await _service.settings_get(tg)
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.post("/tg/settings/queues")
+async def tg_settings_queues(tg: int, queues: str):
+    cfg_err = _require(settings)
+    if cfg_err:
+        return cfg_err
+    assert _service is not None
+    result = await _service.settings_set_queues(tg, queues)
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.post("/tg/settings/days")
+async def tg_settings_days(tg: int, days: int):
+    cfg_err = _require(settings)
+    if cfg_err:
+        return cfg_err
+    assert _service is not None
+    result = await _service.settings_set_days(tg, days)
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
@@ -591,38 +716,3 @@ async def checklist_check(tg: int, issue: str, item: str, checked: bool = True):
     assert _service is not None
     result = await _service.checklist_item_check(tg, issue_key=issue, item_id=item, checked=checked)
     return JSONResponse(result["body"], status_code=result["http_status"])
-    
-@app.get("/tracker/debug_checklist")
-async def debug_checklist(tg: int, issue: str):
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-
-    assert _service is not None
-
-    # Получаем валидный access token
-    access, err = await _service._get_valid_access_token(tg)  # noqa: SLF001
-    if err:
-        return JSONResponse(err["body"], status_code=err["http_status"])
-
-    # Достаём сырой checklist
-    st, payload = await _service.tracker.get_checklist(access, issue)  # noqa: SLF001
-    return {"status_code": st, "response": payload}
-    
-@app.get("/tracker/debug_issue")
-async def debug_issue(tg: int, issue: str):
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-
-    assert _service is not None
-    access, err = await _service._get_valid_access_token(tg)  # noqa: SLF001
-    if err:
-        return JSONResponse(err["body"], status_code=err["http_status"])
-
-    assert _http is not None
-    url = f"https://api.tracker.yandex.net/v2/issues/{issue}"
-    headers = {"Authorization": f"OAuth {access}", "X-Org-Id": settings.yandex_org_id}
-
-    r = await _http.get(url, headers=headers)
-    return {"status_code": r.status_code, "response": _safe_json(r)}
