@@ -53,7 +53,6 @@ async def me(m: Message):
         return
 
     tg_id = m.from_user.id
-
     async with httpx.AsyncClient(timeout=25) as client:
         r = await client.get(f"{BASE_URL}/tracker/me_by_tg", params={"tg": tg_id})
 
