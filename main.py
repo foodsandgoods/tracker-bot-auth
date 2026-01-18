@@ -69,7 +69,6 @@ def _require(settings: Settings) -> Optional[JSONResponse]:
 
 
 def _parse_state(state: str) -> int:
-    # state = "tg_id:nonce"
     tg_str, _nonce = state.split(":", 1)
     return int(tg_str)
 
@@ -247,13 +246,18 @@ class TrackerClient:
         return r.status_code, _safe_json(r)
 
     async def search_issues(self, access_token: str, query: str, limit: int = 50) -> tuple[int, Any]:
+        """
+        В некоторых инсталляциях Tracker поле perPage в JSON-body не принимается.
+        Поэтому передаём пагинацию query-параметрами.
+        """
         url = "https://api.tracker.yandex.net/v2/issues/_search"
         headers = {**self._headers(access_token), "Content-Type": "application/json"}
-        r = await self.http.post(url, headers=headers, json={"query": query, "perPage": limit})
+
+        params = {"page": 1, "perPage": limit}
+        r = await self.http.post(url, headers=headers, params=params, json={"query": query})
         return r.status_code, _safe_json(r)
 
     async def get_checklist(self, access_token: str, issue_key: str) -> tuple[int, Any]:
-        # Docs: Getting checklist parameters
         url_v2 = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/checklist"
         url_v3 = f"https://api.tracker.yandex.net/v3/issues/{issue_key}/checklist"
 
@@ -265,7 +269,6 @@ class TrackerClient:
     async def set_checklist_item_checked(
         self, access_token: str, issue_key: str, item_id: str, checked: bool
     ) -> tuple[int, Any]:
-        # В разных версиях API путь/метод может отличаться. Начинаем с PATCH + fallback.
         url_v2 = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/checklist/items/{item_id}"
         url_v3 = f"https://api.tracker.yandex.net/v3/issues/{issue_key}/checklist/items/{item_id}"
 
@@ -294,11 +297,8 @@ class TrackerService:
 
         access = tokens["access_token"]
 
-        # Ленивая стратегия: валидируем только если реально словили 401 на запросе ниже.
-        # Но для получения user/login удобнее сделать myself и по нему при необходимости refresh.
         status, me = await self.tracker.myself(access)
         if status != 401:
-            # параллельно можем обновить user-таблицу
             if status == 200 and isinstance(me, dict):
                 login = me.get("login")
                 uid = me.get("trackerUid") or me.get("passportUid") or me.get("uid")
@@ -322,7 +322,6 @@ class TrackerService:
             new_payload.get("expires_in"),
         )
 
-        # обновим user-таблицу
         status2, me2 = await self.tracker.myself(new_access)
         if status2 == 200 and isinstance(me2, dict):
             login2 = me2.get("login")
@@ -344,7 +343,6 @@ class TrackerService:
         if user:
             return {"http_status": 200, "body": user}
 
-        # если нет — попробуем подтянуть через myself (и сохранить)
         access, err = await self._get_valid_access_token(tg_id)
         if err:
             return err
@@ -356,7 +354,6 @@ class TrackerService:
         return {"http_status": 404, "body": {"error": "User not linked yet. Run /connect again."}}
 
     def _extract_checklist_items(self, checklist_payload: Any) -> list[dict]:
-        # В разных версиях: либо {"checklistItems":[...]} либо {"items":[...]} либо сразу список
         if isinstance(checklist_payload, list):
             return checklist_payload
         if isinstance(checklist_payload, dict):
@@ -367,10 +364,10 @@ class TrackerService:
         return []
 
     async def checklist_assigned_issues(self, tg_id: int, only_unchecked: bool, limit: int = 10) -> dict:
-        # узнаём login автоматически
         u = await self.user_by_tg(tg_id)
         if u["http_status"] != 200:
             return u
+
         login = (u["body"].get("tracker_login") or "").lower()
         if not login:
             return {"http_status": 500, "body": {"error": "tracker_login is empty for this tg"}}
@@ -379,8 +376,7 @@ class TrackerService:
         if err:
             return err
 
-        # Кандидаты задач: лучше сузить под тебя/очередь. Пока берем последние 30 дней.
-        query = "(Queue: INV OR Queue: DOC OR Queue: HR) AND Updated: >= now()-30d AND Status: !Resolved"
+        query = "(Queue: INV OR Queue: DOC OR Queue: HR) AND Updated: >= now()-15d"
         st, payload = await self.tracker.search_issues(access, query=query, limit=50)
         if st != 200:
             return {"http_status": 200, "body": {"status_code": st, "response": payload, "query": query}}
@@ -409,6 +405,7 @@ class TrackerService:
                     continue
                 if only_unchecked and ci.get("checked") is True:
                     continue
+
                 matched_items.append(
                     {
                         "id": str(ci.get("id")),
@@ -533,7 +530,6 @@ async def oauth_callback(code: str | None = None, state: str | None = None, erro
 
     await _storage.upsert_token(tg_id, access, refresh, token_type, expires_in)
 
-    # Сразу получим login и запишем в tg_users
     st, me = await _tracker.myself(access)
     if st == 200 and isinstance(me, dict):
         login = me.get("login")
