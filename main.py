@@ -591,3 +591,20 @@ async def checklist_check(tg: int, issue: str, item: str, checked: bool = True):
     assert _service is not None
     result = await _service.checklist_item_check(tg, issue_key=issue, item_id=item, checked=checked)
     return JSONResponse(result["body"], status_code=result["http_status"])
+    
+@app.get("/tracker/debug_checklist")
+async def debug_checklist(tg: int, issue: str):
+    cfg_err = _require(settings)
+    if cfg_err:
+        return cfg_err
+
+    assert _service is not None
+
+    # Получаем валидный access token
+    access, err = await _service._get_valid_access_token(tg)  # noqa: SLF001
+    if err:
+        return JSONResponse(err["body"], status_code=err["http_status"])
+
+    # Достаём сырой checklist
+    st, payload = await _service.tracker.get_checklist(access, issue)  # noqa: SLF001
+    return {"status_code": st, "response": payload}    
