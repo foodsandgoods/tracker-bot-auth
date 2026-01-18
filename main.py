@@ -11,6 +11,7 @@ app = FastAPI()
 YANDEX_CLIENT_ID = os.getenv("YANDEX_CLIENT_ID", "")
 YANDEX_CLIENT_SECRET = os.getenv("YANDEX_CLIENT_SECRET", "")
 BASE_URL = os.getenv("BASE_URL", "")
+YANDEX_ORG_ID = os.getenv("YANDEX_ORG_ID", "")
 
 AUTH_URL = "https://oauth.yandex.ru/authorize"
 TOKEN_URL = "https://oauth.yandex.ru/token"
@@ -86,12 +87,14 @@ async def oauth_callback(request: Request):
         payload = {"raw": resp.text}
 @app.get("/tracker/me")
 async def tracker_me(token: str):
-    """
-    Тест: проверяем, что OAuth-токен даёт доступ к Tracker API.
-    Временно принимаем token через query-параметр (это небезопасно, потом уберём).
-    """
+    if not YANDEX_ORG_ID:
+        return JSONResponse({"error": "YANDEX_ORG_ID is not set"}, status_code=500)
+
     url = "https://api.tracker.yandex.net/v2/myself"
-    headers = {"Authorization": f"OAuth {token}"}
+    headers = {
+        "Authorization": f"OAuth {token}",
+        "X-Org-Id": YANDEX_ORG_ID,
+    }
 
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(url, headers=headers)
@@ -102,6 +105,7 @@ async def tracker_me(token: str):
         payload = {"raw": r.text}
 
     return {"status_code": r.status_code, "response": payload}
+
     return JSONResponse(
         {"ok": resp.status_code == 200, "status_code": resp.status_code, "state": state, "token_response": payload},
         status_code=200 if resp.status_code == 200 else 400,
