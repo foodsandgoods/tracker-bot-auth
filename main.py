@@ -21,12 +21,12 @@ YANDEX_AUTH_URL = "https://oauth.yandex.ru/authorize"
 YANDEX_TOKEN_URL = "https://oauth.yandex.ru/token"
 
 
-# ===== DB helpers =====
-## async def ensure_db():
-    ## if not DATABASE_URL:
+# ===== DB =====
+async def ensure_db() -> None:
+    if not DATABASE_URL:
         return
-    ## async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
-        ## async with conn.cursor() as cur:
+    async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
+        async with conn.cursor() as cur:
             await cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS oauth_tokens (
@@ -48,9 +48,9 @@ async def upsert_token(
     refresh_token: str | None,
     token_type: str | None,
     expires_in: int | None,
-):
-    ## async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
-        ## async with conn.cursor() as cur:
+) -> None:
+    async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
+        async with conn.cursor() as cur:
             await cur.execute(
                 """
                 INSERT INTO oauth_tokens (tg_id, access_token, refresh_token, token_type, expires_in, obtained_at)
@@ -67,46 +67,42 @@ async def upsert_token(
         await conn.commit()
 
 
-## async def get_access_token_by_tg(tg_id: int) -> str | None:
-    ## async with await psycopg.AsyncConnection.connect(DATABASE_URL, row_factory=dict_row) as conn:
-        ## async with conn.cursor() as cur:
+async def get_access_token_by_tg(tg_id: int) -> str | None:
+    async with await psycopg.AsyncConnection.connect(DATABASE_URL, row_factory=dict_row) as conn:
+        async with conn.cursor() as cur:
             await cur.execute("SELECT access_token FROM oauth_tokens WHERE tg_id=%s", (tg_id,))
             row = await cur.fetchone()
-    ## if not row:
+    if not row:
         return None
     return row.get("access_token")
 
 
-# ===== App events =====
 @app.on_event("startup")
-## async def on_startup():
+async def on_startup():
     await ensure_db()
 
 
-# ===== Routes =====
+# ===== ROUTES =====
 @app.get("/")
-## async def root():
+async def root():
     return {"ok": True, "service": "tracker-bot-auth"}
 
 
 @app.get("/ping")
-## async def ping():
+async def ping():
     return "pong"
 
 
 @app.get("/oauth/start")
-## async def oauth_start(tg: int):
-    # Проверки конфигурации
-    ## if not YANDEX_CLIENT_ID or not BASE_URL:
+async def oauth_start(tg: int):
+    if not YANDEX_CLIENT_ID or not BASE_URL:
         return JSONResponse(
             {"error": "OAuth not configured. Set YANDEX_CLIENT_ID and BASE_URL."},
             status_code=500,
         )
 
-    # Генерим state и кодируем в него tg (так проще, без серверной сессии)
     nonce = secrets.token_urlsafe(16)
     state = f"{tg}:{nonce}"
-
     redirect_uri = f"{BASE_URL}/oauth/callback"
 
     params = {
@@ -114,39 +110,115 @@ async def upsert_token(
         "client_id": YANDEX_CLIENT_ID,
         "redirect_uri": redirect_uri,
         "state": state,
-        # scope можно добавить при необходимости:
-        # "scope": "tracker:read tracker:write"
     }
     url = httpx.URL(YANDEX_AUTH_URL).copy_add_params(params)
     return RedirectResponse(str(url), status_code=302)
 
 
 @app.get("/oauth/callback")
-## async def oauth_callback(code: str | None = None, state: str | None = None, error: str | None = None):
-    ## if error:
+async def oauth_callback(code: str | None = None, state: str | None = None, error: str | None = None):
+    if error:
         return JSONResponse({"ok": False, "error": error, "state": state}, status_code=400)
 
-    ## if not code or not state:
+    if not code or not state:
         return JSONResponse({"ok": False, "error": "Missing code/state"}, status_code=400)
 
-    ## if not (YANDEX_CLIENT_ID and YANDEX_CLIENT_SECRET and BASE_URL):
+    if not (YANDEX_CLIENT_ID and YANDEX_CLIENT_SECRET and BASE_URL):
         return JSONResponse(
             {"ok": False, "error": "OAuth not configured. Set YANDEX_CLIENT_ID, YANDEX_CLIENT_SECRET, BASE_URL."},
             status_code=500,
         )
 
-    ## if not DATABASE_URL:
+    if not DATABASE_URL:
         return JSONResponse({"ok": False, "error": "DATABASE_URL is not set"}, status_code=500)
 
-    # извлекаем tg из state формата "tg:nonce"
-    ## try:
+    try:
         tg_str, _nonce = state.split(":", 1)
         tg_id = int(tg_str)
-    ## except Exception:
+    except Exception:
         return JSONResponse({"ok": False, "error": "Invalid state format"}, status_code=400)
 
     redirect_uri = f"{BASE_URL}/oauth/callback"
 
-    # Меняем code на token
     data = {
-        "grant_type
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": YANDEX_CLIENT_ID,
+        "client_secret": YANDEX_CLIENT_SECRET,
+        "redirect_uri": redirect_uri,
+    }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(YANDEX_TOKEN_URL, data=data)
+
+    try:
+        token_payload = r.json()
+    except Exception:
+        token_payload = {"raw": r.text}
+
+    if r.status_code != 200:
+        return JSONResponse(
+            {"ok": False, "status_code": r.status_code, "token_response": token_payload},
+            status_code=400,
+        )
+
+    access_token = token_payload.get("access_token")
+    refresh_token = token_payload.get("refresh_token")
+    token_type = token_payload.get("token_type")
+    expires_in = token_payload.get("expires_in")
+
+    if not access_token:
+        return JSONResponse(
+            {"ok": False, "error": "No access_token in token response", "token_response": token_payload},
+            status_code=400,
+        )
+
+    await upsert_token(tg_id, access_token, refresh_token, token_type, expires_in)
+
+    return JSONResponse(
+        {"ok": True, "status_code": 200, "message": "Connected. Return to Telegram and run /me", "tg": tg_id}
+    )
+
+
+@app.get("/tracker/me")
+async def tracker_me(token: str):
+    if not YANDEX_ORG_ID:
+        return JSONResponse({"error": "YANDEX_ORG_ID is not set"}, status_code=500)
+
+    url = "https://api.tracker.yandex.net/v2/myself"
+    headers = {"Authorization": f"OAuth {token}", "X-Org-Id": YANDEX_ORG_ID}
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, headers=headers)
+
+    try:
+        payload = r.json()
+    except Exception:
+        payload = {"raw": r.text}
+
+    return {"status_code": r.status_code, "response": payload}
+
+
+@app.get("/tracker/me_by_tg")
+async def tracker_me_by_tg(tg: int):
+    if not DATABASE_URL:
+        return JSONResponse({"error": "DATABASE_URL is not set"}, status_code=500)
+    if not YANDEX_ORG_ID:
+        return JSONResponse({"error": "YANDEX_ORG_ID is not set"}, status_code=500)
+
+    token = await get_access_token_by_tg(tg)
+    if not token:
+        return JSONResponse({"error": "No token for this tg. Use /connect first."}, status_code=401)
+
+    url = "https://api.tracker.yandex.net/v2/myself"
+    headers = {"Authorization": f"OAuth {token}", "X-Org-Id": YANDEX_ORG_ID}
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, headers=headers)
+
+    try:
+        payload = r.json()
+    except Exception:
+        payload = {"raw": r.text}
+
+    return {"status_code": r.status_code, "response": payload}
