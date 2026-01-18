@@ -84,7 +84,24 @@ async def oauth_callback(request: Request):
         payload = resp.json()
     except Exception:
         payload = {"raw": resp.text}
+@app.get("/tracker/me")
+async def tracker_me(token: str):
+    """
+    Тест: проверяем, что OAuth-токен даёт доступ к Tracker API.
+    Временно принимаем token через query-параметр (это небезопасно, потом уберём).
+    """
+    url = "https://api.tracker.yandex.net/v2/myself"
+    headers = {"Authorization": f"OAuth {token}"}
 
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, headers=headers)
+
+    try:
+        payload = r.json()
+    except Exception:
+        payload = {"raw": r.text}
+
+    return {"status_code": r.status_code, "response": payload}
     return JSONResponse(
         {"ok": resp.status_code == 200, "status_code": resp.status_code, "state": state, "token_response": payload},
         status_code=200 if resp.status_code == 200 else 400,
