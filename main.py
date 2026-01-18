@@ -380,7 +380,7 @@ class TrackerService:
             return err
 
         # Кандидаты задач: лучше сузить под тебя/очередь. Пока берем последние 30 дней.
-        query = "Updated: >= now()-30d"
+        query = "(Queue: INV OR Queue: DOC OR Queue: HR) AND Updated: >= now()-30d AND Status: !Resolved"
         st, payload = await self.tracker.search_issues(access, query=query, limit=50)
         if st != 200:
             return {"http_status": 200, "body": {"status_code": st, "response": payload, "query": query}}
