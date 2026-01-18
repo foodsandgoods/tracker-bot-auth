@@ -30,6 +30,7 @@ async def root():
         "base_url": BASE_URL,
         "client_id_set": bool(YANDEX_CLIENT_ID),
         "client_secret_set": bool(YANDEX_CLIENT_SECRET),
+        "org_id_set": bool(YANDEX_ORG_ID),
     }
 
 
@@ -51,7 +52,7 @@ async def oauth_start():
         "state": state,
     }
     url = AUTH_URL + "?" + urllib.parse.urlencode(params)
-    return RedirectResponse(url)
+    return RedirectResponse(url=url, status_code=302)
 
 
 @app.get("/oauth/callback")
@@ -62,8 +63,10 @@ async def oauth_callback(request: Request):
 
     if error:
         return JSONResponse({"ok": False, "error": error, "params": dict(request.query_params)}, status_code=400)
+
     if not code:
         return JSONResponse({"ok": False, "error": "no_code", "params": dict(request.query_params)}, status_code=400)
+
     if not (YANDEX_CLIENT_ID and YANDEX_CLIENT_SECRET and BASE_URL):
         return JSONResponse({"ok": False, "error": "OAuth not configured"}, status_code=500)
 
@@ -85,6 +88,13 @@ async def oauth_callback(request: Request):
         payload = resp.json()
     except Exception:
         payload = {"raw": resp.text}
+
+    return JSONResponse(
+        {"ok": resp.status_code == 200, "status_code": resp.status_code, "state": state, "token_response": payload},
+        status_code=200 if resp.status_code == 200 else 400,
+    )
+
+
 @app.get("/tracker/me")
 async def tracker_me(token: str):
     if not YANDEX_ORG_ID:
@@ -105,8 +115,3 @@ async def tracker_me(token: str):
         payload = {"raw": r.text}
 
     return {"status_code": r.status_code, "response": payload}
-
-    return JSONResponse(
-        {"ok": resp.status_code == 200, "status_code": resp.status_code, "state": state, "token_response": payload},
-        status_code=200 if resp.status_code == 200 else 400,
-    )
