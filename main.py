@@ -106,13 +106,16 @@ async def oauth_start(tg: int):
     redirect_uri = f"{BASE_URL}/oauth/callback"
 
     params = {
-        "response_type": "code",
-        "client_id": YANDEX_CLIENT_ID,
-        "redirect_uri": redirect_uri,
-        "state": state,
-    }
-    url = httpx.URL(YANDEX_AUTH_URL).copy_add_params(params)
-    return RedirectResponse(str(url), status_code=302)
+    "response_type": "code",
+    "client_id": YANDEX_CLIENT_ID,
+    "redirect_uri": redirect_uri,
+    "state": state,
+}
+
+async with httpx.AsyncClient() as client:
+    url = str(client.build_request("GET", YANDEX_AUTH_URL, params=params).url)
+
+return RedirectResponse(url, status_code=302)
 
 
 @app.get("/oauth/callback")
