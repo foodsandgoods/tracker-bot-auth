@@ -1,7 +1,7 @@
 services:
   # 1) Web API: OAuth + callback + работа с БД
   - type: web
-    name: tracker-bot-auth
+    name: tracker-bot-auth1
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
@@ -22,7 +22,7 @@ services:
 
   # 2) Bot: тоже web (чтобы Render был доволен портом), внутри polling
   - type: web
-    name: tracker-bot-bot
+    name: tracker-bot-bot1
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
