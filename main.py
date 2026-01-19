@@ -446,7 +446,11 @@ class TrackerService:
         base = f"Updated: >= now()-{int(days)}d"
         if not queues:
             return base
-        q = " OR ".join([f"Queue: {x}" for x in queues])
+        # Yandex Tracker syntax: Queue: KEY OR Queue: KEY2 OR Queue: KEY3
+        # Each queue condition should be separate
+        queue_conditions = [f"Queue: {x}" for x in queues]
+        q = " OR ".join(queue_conditions)
+        # Wrap in parentheses to ensure proper precedence
         return f"({q}) AND {base}"
 
     @staticmethod
@@ -475,7 +479,10 @@ class TrackerService:
             limit = int(s.get("limit_results", 10))
 
         query = self._build_candidate_query(queues, days)
-        st, payload = await self.tracker.search_issues(access, query=query, limit=50)
+        # Increase search limit to get more results from all queues before filtering
+        # We need to search more issues to find enough matching checklist items across all queues
+        search_limit = max(100, limit * 10)  # Search at least 100 issues or 10x the result limit
+        st, payload = await self.tracker.search_issues(access, query=query, limit=search_limit)
         if st != 200:
             return {"http_status": 200, "body": {"status_code": st, "response": payload, "query": query}}
 
