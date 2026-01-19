@@ -480,17 +480,21 @@ class TrackerService:
             limit = int(s.get("limit_results", 10))
 
         query = self._build_candidate_query(queues, days)
-        # Increase search limit to get more results from all queues before filtering
-        # We need to search more issues to find enough matching checklist items across all queues
-        search_limit = max(100, limit * 10)  # Search at least 100 issues or 10x the result limit
+        # Optimize search limit: we need more issues to find matching checklist items
+        # But not too many - 3-5x should be enough for most cases
+        search_limit = min(max(50, limit * 5), 200)  # Between 50 and 200 issues
         st, payload = await self.tracker.search_issues(access, query=query, limit=search_limit)
         if st != 200:
             return {"http_status": 200, "body": {"status_code": st, "response": payload, "query": query}}
 
         issues = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
         
-        # Extract keys first
+        # Extract keys first, but limit processing to reasonable amount
+        # We don't need to process all issues if we can find matches earlier
         issue_keys = [it.get("key") for it in issues if it.get("key")]
+        # Limit to first 150 keys max to avoid processing too many
+        max_keys_to_process = min(len(issue_keys), 150)
+        issue_keys = issue_keys[:max_keys_to_process]
         
         # Fetch all issues in parallel for better performance
         async def fetch_issue(key: str) -> tuple[str, dict | None]:
@@ -499,15 +503,24 @@ class TrackerService:
                 return key, issue_full
             return key, None
         
-        # Process in batches to avoid overwhelming the API
-        batch_size = 20
+        # Process in larger batches for better parallelism
+        # Increased batch size for faster processing
+        batch_size = 30
         result: list[dict] = []
         
         for i in range(0, len(issue_keys), batch_size):
+            # Early exit if we have enough results
+            if len(result) >= limit:
+                break
+                
             batch_keys = issue_keys[i:i + batch_size]
             batch_results = await asyncio.gather(*[fetch_issue(key) for key in batch_keys], return_exceptions=True)
             
             for result_item in batch_results:
+                # Early exit check
+                if len(result) >= limit:
+                    break
+                    
                 # Handle exceptions from gather
                 if isinstance(result_item, Exception):
                     continue
@@ -548,12 +561,6 @@ class TrackerService:
                             "items": matched_items,
                         }
                     )
-
-                if len(result) >= limit:
-                    break
-            
-            if len(result) >= limit:
-                break
 
         return {
             "http_status": 200,
