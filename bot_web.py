@@ -1,5 +1,6 @@
 import os
 import asyncio
+import re
 from datetime import datetime
 
 import httpx
@@ -27,15 +28,16 @@ async def ping():
 # =========================
 # Helpers
 # =========================
-def _fmt_item(item: dict) -> str:
+def _fmt_item(item: dict, num: int = None) -> str:
     checked = item.get("checked", False)
     mark = "✅" if checked else "⬜"
     text = (item.get("text") or "").strip()
     item_id = item.get("id")
     text = text.replace("\n", " ").strip()
-    if len(text) > 120:
-        text = text[:117] + "..."
-    return f"{mark} {text} (id: {item_id})"
+    if len(text) > 100:
+        text = text[:97] + "..."
+    num_str = f"{num}. " if num is not None else ""
+    return f"{num_str}{mark} {text}"
 
 
 def _fmt_date(date_str: str | None) -> str:
@@ -238,6 +240,61 @@ async def settings_cmd(m: Message):
 
 @router.callback_query()
 async def settings_callbacks(c: CallbackQuery):
+    # Handle checklist item check callbacks
+    if c.data and c.data.startswith("check:"):
+        parts = c.data.split(":")
+        if len(parts) >= 3:
+            _, issue_key, item_id = parts[0], parts[1], parts[2]
+            item_num = parts[3] if len(parts) > 3 else None
+            tg_id = c.from_user.id
+            
+            try:
+                # Call API to check the item
+                # Note: FastAPI will convert string "true" to bool True
+                sc, data = await _api_post("/tracker/checklist/check", {
+                    "tg": str(tg_id),
+                    "issue": issue_key,
+                    "item": item_id,
+                    "checked": True
+                })
+                
+                if sc == 200:
+                    await c.answer("✅ Пункт отмечен!", show_alert=False)
+                    # Update message to show item as checked
+                    if c.message:
+                        text = c.message.text or ""
+                        # Replace the specific item's unchecked mark with checked
+                        if item_num:
+                            # Replace "N. ⬜" with "N. ✅" for this specific item
+                            import re
+                            pattern = rf"{re.escape(item_num)}\. ⬜"
+                            new_text = re.sub(pattern, f"{item_num}. ✅", text, count=1)
+                        else:
+                            # Fallback: replace first unchecked
+                            new_text = text.replace("⬜", "✅", 1)
+                        
+                        # Remove the button for this item
+                        if c.message.reply_markup:
+                            new_kb = InlineKeyboardBuilder()
+                            for row in c.message.reply_markup.inline_keyboard:
+                                for button in row:
+                                    if button.callback_data != c.data:
+                                        new_kb.button(
+                                            text=button.text,
+                                            callback_data=button.callback_data
+                                        )
+                            new_kb.adjust(3)
+                            await c.message.edit_text(new_text, reply_markup=new_kb.as_markup() if new_kb.buttons else None)
+                        else:
+                            await c.message.edit_text(new_text)
+                else:
+                    error_msg = data.get("error", "Не удалось отметить") if isinstance(data, dict) else str(data)[:100]
+                    await c.answer(f"Ошибка: {error_msg}", show_alert=True)
+            except Exception as e:
+                await c.answer(f"Ошибка: {str(e)[:100]}", show_alert=True)
+        return
+    
+    # Handle settings callbacks
     if not c.data or not c.data.startswith("st:"):
         return
 
@@ -443,15 +500,45 @@ async def cl_my_open(m: Message):
             return
 
         lines = ["Неотмеченные пункты чеклиста, где ты исполнитель:"]
+        kb = InlineKeyboardBuilder()
+        item_counter = 1
+        item_mapping = {}  # Store mapping: counter -> (issue_key, item_id)
+        
         for iss in issues:
             updated = _fmt_date(iss.get("updatedAt"))
             date_str = f" (обновлено: {updated})" if updated else ""
             lines.append(f"\n{iss.get('key')} — {iss.get('summary')}{date_str}\n{iss.get('url')}")
+            
             for item in iss.get("items", []):
-                lines.append("  " + _fmt_item(item))
-
-        lines.append("\nЧтобы отметить пункт: /cl_done ISSUE-KEY ITEM_ID")
-        await m.answer("\n".join(lines))
+                if not item.get("checked", False):  # Only show unchecked items
+                    lines.append("  " + _fmt_item(item, item_counter))
+                    # Store mapping for callback
+                    issue_key = iss.get('key')
+                    item_id = item.get('id')
+                    item_mapping[item_counter] = (issue_key, item_id)
+                    # Add button for each unchecked item
+                    button_text = f"✅ {item_counter}"
+                    kb.button(text=button_text, callback_data=f"check:{issue_key}:{item_id}:{item_counter}")
+                    item_counter += 1
+        
+        if item_counter == 1:
+            # No unchecked items
+            await m.answer("\n".join(lines))
+            return
+        
+        lines.append(f"\n\nНажмите кнопку с номером, чтобы отметить пункт")
+        kb.adjust(3)  # 3 buttons per row
+        
+        # Split message if too long (Telegram limit is 4096 chars)
+        message_text = "\n".join(lines)
+        if len(message_text) > 4000:
+            # Split into chunks - send first with buttons, rest without
+            first_part = "\n".join(lines[:len(lines)-1])  # All except last line
+            await m.answer(first_part[:4000], reply_markup=kb.as_markup())
+            if len(message_text) > 4000:
+                await m.answer(message_text[4000:])
+        else:
+            await m.answer(message_text, reply_markup=kb.as_markup())
     except httpx.TimeoutException:
         await m.answer("⏱ Превышено время ожидания ответа от сервера. Попробуйте позже.")
     except Exception as e:
