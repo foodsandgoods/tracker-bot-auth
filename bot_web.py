@@ -280,7 +280,7 @@ async def cl_my(m: Message):
 
     tg_id = m.from_user.id
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.get(f"{BASE_URL}/tracker/checklist/assigned", params={"tg": tg_id, "limit": 10})
+        r = await client.get(f"{BASE_URL}/tracker/checklist/assigned", params={"tg": tg_id, "limit": 15})
 
     data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
 
@@ -312,7 +312,7 @@ async def cl_my_open(m: Message):
 
     tg_id = m.from_user.id
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.get(f"{BASE_URL}/tracker/checklist/assigned_unchecked", params={"tg": tg_id, "limit": 10})
+        r = await client.get(f"{BASE_URL}/tracker/checklist/assigned_unchecked", params={"tg": tg_id, "limit": 15})
 
     data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
 
