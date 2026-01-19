@@ -66,7 +66,7 @@ async def _api_get(path: str, params: dict) -> tuple[int, dict]:
     # Optimize HTTP client with connection pooling and shorter timeout
     limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
     timeout = httpx.Timeout(connect=5.0, read=15.0, write=5.0)
-    async with httpx.AsyncClient(timeout=timeout, limits=limits, http2=True) as client:
+    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
         r = await client.get(f"{BASE_URL}{path}", params=params)
     data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
     return r.status_code, data
@@ -76,7 +76,7 @@ async def _api_post(path: str, params: dict) -> tuple[int, dict]:
     # Optimize HTTP client with connection pooling and shorter timeout
     limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
     timeout = httpx.Timeout(connect=5.0, read=15.0, write=5.0)
-    async with httpx.AsyncClient(timeout=timeout, limits=limits, http2=True) as client:
+    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
         r = await client.post(f"{BASE_URL}{path}", params=params)
     data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
     return r.status_code, data
@@ -371,7 +371,7 @@ async def cl_my(m: Message):
     # Optimize HTTP client for checklist requests
     limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
     timeout = httpx.Timeout(connect=10.0, read=45.0, write=10.0)  # Longer read timeout for checklist processing
-    async with httpx.AsyncClient(timeout=timeout, limits=limits, http2=True) as client:
+    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
         r = await client.get(f"{BASE_URL}/tracker/checklist/assigned", params={"tg": tg_id, "limit": limit})
 
     data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
@@ -412,7 +412,7 @@ async def cl_my_open(m: Message):
     # Optimize HTTP client for checklist requests
     limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
     timeout = httpx.Timeout(connect=10.0, read=45.0, write=10.0)  # Longer read timeout for checklist processing
-    async with httpx.AsyncClient(timeout=timeout, limits=limits, http2=True) as client:
+    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
         r = await client.get(f"{BASE_URL}/tracker/checklist/assigned_unchecked", params={"tg": tg_id, "limit": limit})
 
     data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}

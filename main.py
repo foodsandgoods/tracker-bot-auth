@@ -667,7 +667,6 @@ async def startup():
     _http = httpx.AsyncClient(
         timeout=timeout,
         limits=limits,
-        http2=True,  # HTTP/2 for better performance
     )
 
     if settings.database_url:
