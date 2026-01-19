@@ -12,14 +12,14 @@ def _build_prompt(issue_data: dict) -> str:
     key = issue_data.get("key", "")
     summary = issue_data.get("summary", "")
     description = issue_data.get("description", "") or "Нет описания"
-    status = issue_data.get("status", {}).get("display", "Не указан")
-    assignee = issue_data.get("assignee", {}).get("display", "Не назначен")
+    status = issue_data.get("status", {}).get("display", "Не указан") if isinstance(issue_data.get("status"), dict) else "Не указан"
+    assignee = issue_data.get("assignee", {}).get("display", "Не назначен") if isinstance(issue_data.get("assignee"), dict) else "Не назначен"
     
-    # Собираем последние 3 комментария
+    # Собираем последние 5 комментариев
     comments = issue_data.get("comments", [])
     comments_text = ""
     if comments and isinstance(comments, list):
-        last_comments = comments[-3:]  # Последние 3
+        last_comments = comments[-5:]  # Последние 5
         comments_list = []
         for c in last_comments:
             if isinstance(c, dict):
@@ -47,26 +47,29 @@ def _build_prompt(issue_data: dict) -> str:
     # Ограничиваем длину описания
     desc_limited = description[:800] if len(description) > 800 else description
     
-    prompt = f"""Составь краткое резюме задачи из Yandex Tracker (максимум 200 символов).
+    prompt = f"""Составь подробное резюме задачи из Yandex Tracker (максимум 400 символов).
 
 Задача: {key} — {summary}
 Статус: {status}
 Исполнитель: {assignee}
 
-Описание: {desc_limited}
+Описание:
+{desc_limited}
 
 Чеклист:
 {checklist_text if checklist_text else "Нет чеклиста"}
 
-Комментарии:
+Последние комментарии:
 {comments_text if comments_text else "Нет комментариев"}
 
 Составь структурированное резюме в формате:
-1. Цель задачи
+1. Цель задачи (1-2 предложения)
 2. Текущий статус
-3. Ключевые моменты
+3. Ключевые моменты из описания
+4. Прогресс по чеклисту (если есть)
+5. Последние действия/комментарии (если есть)
 
-Резюме должно быть кратким (до 200 символов) и на русском языке."""
+Резюме должно быть информативным (до 400 символов) и на русском языке."""
     
     return prompt
 
@@ -99,7 +102,7 @@ async def generate_summary(issue_data: dict) -> tuple[Optional[str], Optional[st
             }
         ],
         "useWalletBalance": True,
-        "max_tokens": 300,  # Увеличиваем для надежности
+        "max_tokens": 500,  # Увеличено для резюме до 400 символов
         "temperature": 0.7
     }
     
@@ -169,9 +172,9 @@ async def generate_summary(issue_data: dict) -> tuple[Optional[str], Optional[st
                 
                 return None, "API вернул пустой ответ. Проверьте модель и баланс."
             
-            # Обрезаем до 200 символов если превышает
-            if len(content) > 200:
-                content = content[:197] + "..."
+            # Обрезаем до 400 символов если превышает
+            if len(content) > 400:
+                content = content[:397] + "..."
             
             return content.strip(), None
             
