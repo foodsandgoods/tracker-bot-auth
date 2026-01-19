@@ -44,18 +44,19 @@ def _build_prompt(issue_data: dict) -> str:
         if checklist_list:
             checklist_text = "\n".join(checklist_list)
     
-    # История изменений (changelog)
+    # История изменений (changelog) - может быть недоступна
     changelog_text = ""
-    changelog = issue_data.get("changelog", [])
-    if changelog:
+    changelog = issue_data.get("changelog")
+    if changelog and isinstance(changelog, list):
         changelog_list = []
         for change in changelog[-5:]:  # Последние 5 изменений
-            field = change.get("field", "")
-            from_val = change.get("from", "")
-            to_val = change.get("to", "")
-            author = change.get("updatedBy", {}).get("display", "Неизвестно")
-            if field and to_val:
-                changelog_list.append(f"  • {field}: {from_val} → {to_val} ({author})")
+            if isinstance(change, dict):
+                field = change.get("field", "")
+                from_val = change.get("from", "")
+                to_val = change.get("to", "")
+                author = change.get("updatedBy", {}).get("display", "Неизвестно")
+                if field and to_val:
+                    changelog_list.append(f"  • {field}: {from_val} → {to_val} ({author})")
         if changelog_list:
             changelog_text = "\n".join(changelog_list)
     

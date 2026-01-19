@@ -359,9 +359,19 @@ class TrackerClient:
     async def get_issue_with_changelog(self, access_token: str, issue_key: str) -> tuple[int, Any]:
         """Get issue with changelog and comments"""
         url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}"
-        # Получаем задачу с расширенными данными
-        params = {"expand": "changelog,comments"}
-        r = await self.http.get(url, headers=self._headers(access_token), params=params)
+        # Пробуем получить задачу с расширенными данными
+        # Если не поддерживается, вернемся к обычному запросу
+        try:
+            params = {"expand": "changelog,comments"}
+            r = await self.http.get(url, headers=self._headers(access_token), params=params)
+            if r.status_code == 200:
+                return r.status_code, _safe_json(r)
+            # Если expand не поддерживается, пробуем без него
+        except Exception:
+            pass
+        
+        # Fallback: обычный запрос без expand
+        r = await self.http.get(url, headers=self._headers(access_token))
         return r.status_code, _safe_json(r)
 
     async def patch_issue(self, access_token: str, issue_key: str, patch: dict) -> tuple[int, Any]:
@@ -695,10 +705,10 @@ class TrackerService:
         try:
             from ai_service import generate_summary
             summary_text = await generate_summary(issue_data)
-        except ImportError:
+        except ImportError as e:
             return {
                 "http_status": 500,
-                "body": {"error": "AI service module not found"}
+                "body": {"error": f"AI service module not found: {str(e)}"}
             }
         except Exception as e:
             return {
