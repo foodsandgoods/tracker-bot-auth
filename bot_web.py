@@ -2,6 +2,8 @@ import os
 import asyncio
 import re
 from datetime import datetime
+from functools import wraps
+from typing import Optional, Tuple, Dict, List, Any
 
 import httpx
 from fastapi import FastAPI
@@ -20,7 +22,13 @@ router = Router()
 app = FastAPI()
 
 # Cache for last checklist results (per user)
-_last_checklist_cache = {}  # tg_id -> {"issues": [...], "item_mapping": {num: (issue_key, item_id)}}
+_last_checklist_cache: Dict[int, Dict[str, Any]] = {}  # tg_id -> {"issues": [...], "item_mapping": {num: (issue_key, item_id)}}
+
+# HTTP client constants
+HTTP_LIMITS = httpx.Limits(max_keepalive_connections=5, max_connections=10)
+HTTP_TIMEOUT_SHORT = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
+HTTP_TIMEOUT_LONG = httpx.Timeout(connect=10.0, read=45.0, write=10.0, pool=5.0)
+HTTP_TIMEOUT_DEFAULT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=5.0)
 
 
 @app.get("/ping")
@@ -32,58 +40,60 @@ async def ping():
 # Helpers
 # =========================
 def _fmt_item(item: dict) -> str:
-    checked = item.get("checked", False)
-    mark = "✅" if checked else "⬜"
-    text = (item.get("text") or "").strip()
-    item_id = item.get("id")
-    text = text.replace("\n", " ").strip()
+    """Format checklist item for display"""
+    mark = "✅" if item.get("checked", False) else "⬜"
+    text = (item.get("text") or "").strip().replace("\n", " ")
     if len(text) > 100:
         text = text[:97] + "..."
     return f"{mark} {text}"
 
 
-def _fmt_date(date_str: str | None) -> str:
+def _fmt_date(date_str: Optional[str]) -> str:
     """Format ISO date string to readable format (DD.MM.YYYY HH:MM)"""
     if not date_str:
         return ""
     try:
-        # Yandex Tracker typically uses ISO format: "2024-01-15T10:30:00.000+0300" or "2024-01-15T10:30:00Z"
-        # Remove timezone info if present and parse
+        # Normalize timezone format: "2024-01-15T10:30:00.000+0300" -> "2024-01-15T10:30:00+03:00"
         clean_date = date_str.replace("Z", "+00:00")
-        # Handle format like "2024-01-15T10:30:00.000+0300" -> "2024-01-15T10:30:00+03:00"
-        if "+" in clean_date and len(clean_date.split("+")[1]) == 4:
-            tz_part = clean_date.split("+")[1]
-            clean_date = clean_date.replace(f"+{tz_part}", f"+{tz_part[:2]}:{tz_part[2:]}")
+        if "+" in clean_date:
+            parts = clean_date.split("+", 1)
+            if len(parts) == 2 and len(parts[1]) == 4 and ":" not in parts[1]:
+                # Format: +0300 -> +03:00
+                clean_date = f"{parts[0]}+{parts[1][:2]}:{parts[1][2:]}"
         dt = datetime.fromisoformat(clean_date)
         return dt.strftime("%d.%m.%Y %H:%M")
     except Exception:
-        # Fallback: try simple format without timezone
         try:
+            # Fallback: parse without timezone
             dt = datetime.strptime(date_str[:19], "%Y-%m-%dT%H:%M:%S")
             return dt.strftime("%d.%m.%Y %H:%M")
         except Exception:
-            # Last resort: return first 16 chars if available
             return date_str[:16] if len(date_str) > 16 else date_str
 
 
-async def _api_get(path: str, params: dict) -> tuple[int, dict]:
-    # Optimize HTTP client with connection pooling and shorter timeout
-    limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-    timeout = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
-    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+def _parse_response(r: httpx.Response) -> dict:
+    """Parse HTTP response to dict"""
+    content_type = r.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            return r.json()
+        except Exception:
+            return {"raw": r.text}
+    return {"raw": r.text}
+
+
+async def _api_get(path: str, params: dict) -> Tuple[int, dict]:
+    """Make GET request to API"""
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SHORT, limits=HTTP_LIMITS) as client:
         r = await client.get(f"{BASE_URL}{path}", params=params)
-    data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
-    return r.status_code, data
+    return r.status_code, _parse_response(r)
 
 
-async def _api_post(path: str, params: dict) -> tuple[int, dict]:
-    # Optimize HTTP client with connection pooling and shorter timeout
-    limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-    timeout = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
-    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+async def _api_post(path: str, params: dict) -> Tuple[int, dict]:
+    """Make POST request to API"""
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SHORT, limits=HTTP_LIMITS) as client:
         r = await client.post(f"{BASE_URL}{path}", params=params)
-    data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
-    return r.status_code, data
+    return r.status_code, _parse_response(r)
 
 
 def _kb_settings_main() -> InlineKeyboardMarkup:
@@ -140,14 +150,64 @@ def _render_settings_text(queues: list[str], days: int, limit: int) -> str:
     )
 
 
-async def _get_settings(tg_id: int) -> tuple[list[str], int, int] | tuple[None, None, None]:
+async def _get_settings(tg_id: int) -> Optional[Tuple[List[str], int, int]]:
+    """Get user settings from API"""
     sc, data = await _api_get("/tg/settings", {"tg": tg_id})
     if sc != 200:
-        return None, None, None
+        return None
     queues = data.get("queues", []) or []
     days = int(data.get("days", 30))
     limit = int(data.get("limit", 10))
     return queues, days, limit
+
+
+def _build_checklist_lines(
+    issues: List[dict],
+    header: str,
+    include_checked: bool = True,
+    add_buttons: bool = False
+) -> Tuple[List[str], Optional[InlineKeyboardBuilder], Dict[int, Tuple[str, str]]]:
+    """Build checklist response text and optional keyboard"""
+    lines = [header]
+    kb = InlineKeyboardBuilder() if add_buttons else None
+    issue_counter = 1
+    item_counter = 1
+    item_mapping = {}
+    
+    for iss in issues:
+        updated = _fmt_date(iss.get("updatedAt"))
+        date_str = f" (обновлено: {updated})" if updated else ""
+        lines.append(f"\n{issue_counter}. {iss.get('key')} — {iss.get('summary')}{date_str}\n{iss.get('url')}")
+        
+        for item in iss.get("items", []):
+            if include_checked or not item.get("checked", False):
+                lines.append("  " + _fmt_item(item))
+                issue_key = iss.get('key')
+                item_id = item.get('id')
+                item_mapping[item_counter] = (issue_key, item_id)
+                
+                if add_buttons and not item.get("checked", False):
+                    kb.button(text=f"✅ {item_counter}", callback_data=f"check:{issue_key}:{item_id}:{item_counter}")
+                item_counter += 1
+        issue_counter += 1
+    
+    if kb:
+        kb.adjust(3)
+    
+    return lines, kb, item_mapping
+
+
+def _require_base_url(func):
+    """Decorator to check BASE_URL before handler execution"""
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        if not BASE_URL:
+            message = args[0] if args else None
+            if message and hasattr(message, 'answer'):
+                await message.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
+            return
+        return await func(*args, **kwargs)
+    return wrapper
 
 
 # =========================
@@ -179,11 +239,8 @@ async def menu(m: Message):
 
 
 @router.message(Command("connect"))
+@_require_base_url
 async def connect(m: Message):
-    if not BASE_URL:
-        await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
-        return
-
     tg_id = m.from_user.id
     url = f"{BASE_URL}/oauth/start?tg={tg_id}"
     await m.answer(
@@ -194,21 +251,13 @@ async def connect(m: Message):
 
 
 @router.message(Command("me"))
+@_require_base_url
 async def me(m: Message):
-    if not BASE_URL:
-        await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
-        return
-
     tg_id = m.from_user.id
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
         r = await client.get(f"{BASE_URL}/tracker/me_by_tg", params={"tg": tg_id})
 
-    try:
-        data = r.json()
-    except Exception:
-        await m.answer(f"Сервер вернул не-JSON: {r.text[:500]}")
-        return
-
+    data = _parse_response(r)
     if r.status_code != 200:
         await m.answer(f"Ошибка {r.status_code}: {data}")
         return
@@ -223,20 +272,15 @@ async def me(m: Message):
 
 
 @router.message(Command("settings"))
+@_require_base_url
 async def settings_cmd(m: Message):
-    if not BASE_URL:
-        await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
-        return
-
     tg_id = m.from_user.id
-    sc, data = await _api_get("/tg/settings", {"tg": tg_id})
-    if sc != 200:
-        await m.answer(f"Ошибка {sc}: {data}")
+    settings = await _get_settings(tg_id)
+    if settings is None:
+        await m.answer("Ошибка: не удалось получить настройки")
         return
 
-    queues = data.get("queues", []) or []
-    days = int(data.get("days", 30))
-    limit = int(data.get("limit", 10))
+    queues, days, limit = settings
     await m.answer(_render_settings_text(queues, days, limit), reply_markup=_kb_settings_main())
 
 
@@ -265,26 +309,25 @@ async def settings_callbacks(c: CallbackQuery):
                     # Update message to show item as checked
                     if c.message:
                         text = c.message.text or ""
-                        # Replace "⬜" with "✅" for this specific item (find by button number context)
-                        # Since we removed numbering from items, we'll replace the first unchecked item
-                        # that appears before the button number in the text
-                        import re
+                        # Replace "⬜" with "✅" for this specific item
                         if item_num:
-                            # Find the line with this item (it should be near the button number)
-                            # Pattern: find "⬜" that appears before the button number context
+                            # Find the line with this item by searching near button number context
                             lines = text.split('\n')
                             new_lines = []
                             found = False
-                            for line in lines:
-                                if not found and "⬜" in line and item_num in text[text.find(line):text.find(line)+200]:
-                                    # Replace first ⬜ in this line
-                                    new_lines.append(line.replace("⬜", "✅", 1))
-                                    found = True
+                            for i, line in enumerate(lines):
+                                if not found and "⬜" in line:
+                                    # Check if this line is near the button number in the text
+                                    text_pos = text.find(line)
+                                    if item_num in text[max(0, text_pos-200):text_pos+200]:
+                                        new_lines.append(line.replace("⬜", "✅", 1))
+                                        found = True
+                                    else:
+                                        new_lines.append(line)
                                 else:
                                     new_lines.append(line)
                             new_text = '\n'.join(new_lines) if found else text.replace("⬜", "✅", 1)
                         else:
-                            # Fallback: replace first unchecked
                             new_text = text.replace("⬜", "✅", 1)
                         
                         # Remove the button for this item
@@ -293,12 +336,12 @@ async def settings_callbacks(c: CallbackQuery):
                             for row in c.message.reply_markup.inline_keyboard:
                                 for button in row:
                                     if button.callback_data != c.data:
-                                        new_kb.button(
-                                            text=button.text,
-                                            callback_data=button.callback_data
-                                        )
+                                        new_kb.button(text=button.text, callback_data=button.callback_data)
                             new_kb.adjust(3)
-                            await c.message.edit_text(new_text, reply_markup=new_kb.as_markup() if new_kb.buttons else None)
+                            await c.message.edit_text(
+                                new_text, 
+                                reply_markup=new_kb.as_markup() if new_kb.buttons else None
+                            )
                         else:
                             await c.message.edit_text(new_text)
                 else:
@@ -428,170 +471,103 @@ async def settings_callbacks(c: CallbackQuery):
     await c.answer()
 
 
-@router.message(Command("cl_my"))
-async def cl_my(m: Message):
-    if not BASE_URL:
-        await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
-        return
+async def _fetch_checklist(tg_id: int, endpoint: str, limit: int) -> Tuple[Optional[dict], Optional[str]]:
+    """Fetch checklist data from API"""
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_LONG, limits=HTTP_LIMITS) as client:
+            r = await client.get(f"{BASE_URL}/tracker/checklist/{endpoint}", params={"tg": tg_id, "limit": limit})
+        
+        data = _parse_response(r)
+        if r.status_code != 200:
+            return None, f"Ошибка {r.status_code}: {str(data)[:500]}"
+        return data, None
+    except httpx.TimeoutException:
+        return None, "⏱ Превышено время ожидания ответа от сервера. Попробуйте позже."
+    except Exception as e:
+        return None, f"❌ Произошла ошибка: {str(e)[:300]}"
 
+
+@router.message(Command("cl_my"))
+@_require_base_url
+async def cl_my(m: Message):
     try:
         tg_id = m.from_user.id
-        # Get limit from settings
-        sc, data = await _api_get("/tg/settings", {"tg": tg_id})
-        limit = int(data.get("limit", 10)) if sc == 200 else 10
+        settings = await _get_settings(tg_id)
+        limit = settings[2] if settings else 10
         
-        # Optimize HTTP client for checklist requests
-        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-        timeout = httpx.Timeout(connect=10.0, read=45.0, write=10.0, pool=5.0)  # Longer read timeout for checklist processing
-        async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
-            r = await client.get(f"{BASE_URL}/tracker/checklist/assigned", params={"tg": tg_id, "limit": limit})
-
-        try:
-            data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
-        except Exception as e:
-            await m.answer(f"Ошибка парсинга ответа: {str(e)[:200]}")
-            return
-
-        if r.status_code != 200:
-            await m.answer(f"Ошибка {r.status_code}: {str(data)[:500]}")
+        data, error = await _fetch_checklist(tg_id, "assigned", limit)
+        if error:
+            await m.answer(error)
             return
 
         issues = data.get("issues", [])
         if not issues:
-            settings = data.get("settings") or {}
-            days = settings.get("days", 30)
+            days = data.get("settings", {}).get("days", 30)
             await m.answer(f"Не нашёл задач, где ты назначен исполнителем пункта чеклиста (в выборке за {days} дней).")
             return
 
-        lines = ["Задачи с чеклистами, где ты исполнитель пункта:"]
-        issue_counter = 1
-        item_counter = 1
-        item_mapping = {}  # Store mapping: counter -> (issue_key, item_id)
+        lines, _, item_mapping = _build_checklist_lines(issues, "Задачи с чеклистами, где ты исполнитель пункта:", include_checked=True)
         
-        for iss in issues:
-            updated = _fmt_date(iss.get("updatedAt"))
-            date_str = f" (обновлено: {updated})" if updated else ""
-            # Add issue number before ISSUE-KEY
-            lines.append(f"\n{issue_counter}. {iss.get('key')} — {iss.get('summary')}{date_str}\n{iss.get('url')}")
-            for item in iss.get("items", []):
-                lines.append("  " + _fmt_item(item))
-                # Store mapping for /done command
-                issue_key = iss.get('key')
-                item_id = item.get('id')
-                item_mapping[item_counter] = (issue_key, item_id)
-                item_counter += 1
-            issue_counter += 1
-
         # Save to cache
-        _last_checklist_cache[tg_id] = {
-            "issues": issues,
-            "item_mapping": item_mapping
-        }
-
+        _last_checklist_cache[tg_id] = {"issues": issues, "item_mapping": item_mapping}
+        
         await m.answer("\n".join(lines))
-    except httpx.TimeoutException:
-        await m.answer("⏱ Превышено время ожидания ответа от сервера. Попробуйте позже.")
     except Exception as e:
         await m.answer(f"❌ Произошла ошибка: {str(e)[:300]}")
 
 
 @router.message(Command("cl_my_open"))
+@_require_base_url
 async def cl_my_open(m: Message):
-    if not BASE_URL:
-        await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
-        return
-
     try:
         tg_id = m.from_user.id
-        # Get limit from settings
-        sc, data = await _api_get("/tg/settings", {"tg": tg_id})
-        limit = int(data.get("limit", 10)) if sc == 200 else 10
+        settings = await _get_settings(tg_id)
+        limit = settings[2] if settings else 10
         
-        # Optimize HTTP client for checklist requests
-        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-        timeout = httpx.Timeout(connect=10.0, read=45.0, write=10.0, pool=5.0)  # Longer read timeout for checklist processing
-        async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
-            r = await client.get(f"{BASE_URL}/tracker/checklist/assigned_unchecked", params={"tg": tg_id, "limit": limit})
-
-        try:
-            data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
-        except Exception as e:
-            await m.answer(f"Ошибка парсинга ответа: {str(e)[:200]}")
-            return
-
-        if r.status_code != 200:
-            await m.answer(f"Ошибка {r.status_code}: {str(data)[:500]}")
+        data, error = await _fetch_checklist(tg_id, "assigned_unchecked", limit)
+        if error:
+            await m.answer(error)
             return
 
         issues = data.get("issues", [])
         if not issues:
-            settings = data.get("settings") or {}
-            days = settings.get("days", 30)
+            days = data.get("settings", {}).get("days", 30)
             await m.answer(f"Не нашёл неотмеченных пунктов чеклиста на тебе (в выборке за {days} дней).")
             return
 
-        lines = ["Неотмеченные пункты чеклиста, где ты исполнитель:"]
-        kb = InlineKeyboardBuilder()
-        issue_counter = 1
-        item_counter = 1
-        item_mapping = {}  # Store mapping: counter -> (issue_key, item_id)
+        lines, kb, item_mapping = _build_checklist_lines(
+            issues, "Неотмеченные пункты чеклиста, где ты исполнитель:", 
+            include_checked=False, add_buttons=True
+        )
         
-        for iss in issues:
-            updated = _fmt_date(iss.get("updatedAt"))
-            date_str = f" (обновлено: {updated})" if updated else ""
-            # Add issue number before ISSUE-KEY
-            lines.append(f"\n{issue_counter}. {iss.get('key')} — {iss.get('summary')}{date_str}\n{iss.get('url')}")
-            
-            for item in iss.get("items", []):
-                if not item.get("checked", False):  # Only show unchecked items
-                    lines.append("  " + _fmt_item(item))
-                    # Store mapping for callback and /done command
-                    issue_key = iss.get('key')
-                    item_id = item.get('id')
-                    item_mapping[item_counter] = (issue_key, item_id)
-                    # Add button for each unchecked item
-                    button_text = f"✅ {item_counter}"
-                    kb.button(text=button_text, callback_data=f"check:{issue_key}:{item_id}:{item_counter}")
-                    item_counter += 1
-            issue_counter += 1
-        
-        if item_counter == 1:
+        if not item_mapping:
             # No unchecked items
             await m.answer("\n".join(lines))
             return
         
-        lines.append(f"\n\nНажмите кнопку с номером, чтобы отметить пункт")
-        kb.adjust(3)  # 3 buttons per row
+        lines.append("\n\nНажмите кнопку с номером, чтобы отметить пункт")
         
         # Save to cache
-        _last_checklist_cache[tg_id] = {
-            "issues": issues,
-            "item_mapping": item_mapping
-        }
+        _last_checklist_cache[tg_id] = {"issues": issues, "item_mapping": item_mapping}
         
         # Split message if too long (Telegram limit is 4096 chars)
         message_text = "\n".join(lines)
         if len(message_text) > 4000:
             # Split into chunks - send first with buttons, rest without
-            first_part = "\n".join(lines[:len(lines)-1])  # All except last line
+            first_part = "\n".join(lines[:-1])  # All except last line
             await m.answer(first_part[:4000], reply_markup=kb.as_markup())
             if len(message_text) > 4000:
                 await m.answer(message_text[4000:])
         else:
             await m.answer(message_text, reply_markup=kb.as_markup())
-    except httpx.TimeoutException:
-        await m.answer("⏱ Превышено время ожидания ответа от сервера. Попробуйте позже.")
     except Exception as e:
         await m.answer(f"❌ Произошла ошибка: {str(e)[:300]}")
 
 
 @router.message(Command("done"))
+@_require_base_url
 async def done_cmd(m: Message):
     """Mark checklist item by number from last /cl_my or /cl_my_open result"""
-    if not BASE_URL:
-        await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
-        return
-
     parts = (m.text or "").split()
     if len(parts) != 2:
         await m.answer("Использование: /done N\nгде N — номер пункта из последнего списка (/cl_my или /cl_my_open)")
@@ -604,8 +580,6 @@ async def done_cmd(m: Message):
         return
 
     tg_id = m.from_user.id
-    
-    # Get from cache
     cache = _last_checklist_cache.get(tg_id)
     if not cache or not cache.get("item_mapping"):
         await m.answer("❌ Кэш пуст. Сначала выполните /cl_my или /cl_my_open")
@@ -636,11 +610,8 @@ async def done_cmd(m: Message):
 
 
 @router.message(Command("cl_done"))
+@_require_base_url
 async def cl_done(m: Message):
-    if not BASE_URL:
-        await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
-        return
-
     parts = (m.text or "").split()
     if len(parts) != 3:
         await m.answer("Использование: /cl_done ISSUE-KEY ITEM_ID")
@@ -649,14 +620,13 @@ async def cl_done(m: Message):
     _cmd, issue_key, item_id = parts
     tg_id = m.from_user.id
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
         r = await client.post(
             f"{BASE_URL}/tracker/checklist/check",
             params={"tg": tg_id, "issue": issue_key, "item": item_id, "checked": True},
         )
 
-    data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
-
+    data = _parse_response(r)
     if r.status_code != 200:
         await m.answer(f"Ошибка {r.status_code}: {data}")
         return
