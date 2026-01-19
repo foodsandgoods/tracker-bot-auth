@@ -19,6 +19,8 @@ services:
         sync: false
       - key: DATABASE_URL
         sync: false
+      - key: GPTUNNEL_API_KEY
+        sync: false
 
   # 2) Bot: тоже web (чтобы Render был доволен портом), внутри polling
   - type: web
@@ -33,4 +35,6 @@ services:
       - key: BOT_TOKEN
         sync: false
       - key: BASE_URL
+        sync: false
+      - key: GPTUNNEL_API_KEY
         sync: false

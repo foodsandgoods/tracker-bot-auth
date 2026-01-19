@@ -1,6 +1,7 @@
 import os
 import asyncio
 import re
+import time
 from datetime import datetime
 from functools import wraps
 from typing import Optional, Tuple, Dict, List, Any
@@ -23,6 +24,9 @@ app = FastAPI()
 
 # Cache for last checklist results (per user)
 _last_checklist_cache: Dict[int, Dict[str, Any]] = {}  # tg_id -> {"issues": [...], "item_mapping": {num: (issue_key, item_id)}}
+
+# Cache for issue summaries (per issue_key)
+_summary_cache: Dict[str, Dict[str, Any]] = {}  # issue_key -> {"summary": "...", "updated_at": timestamp}
 
 # HTTP client constants
 HTTP_LIMITS = httpx.Limits(max_keepalive_connections=5, max_connections=10)
@@ -233,7 +237,9 @@ async def menu(m: Message):
         "✅ Чеклисты:\n"
         "/cl_my — задачи, где ты назначен исполнителем пункта чеклиста\n"
         "/cl_my_open — ожидают мое согласование\n"
-        "/cl_done ISSUE-KEY ITEM_ID — отметить пункт чеклиста"
+        "/cl_done ISSUE-KEY ITEM_ID — отметить пункт чеклиста\n\n"
+        "🤖 ИИ функции:\n"
+        "/summary ISSUE-KEY — составить резюме задачи"
     )
     await m.answer(menu_text)
 
@@ -609,6 +615,99 @@ async def done_cmd(m: Message):
         await m.answer(f"❌ Произошла ошибка: {str(e)[:200]}")
 
 
+@router.message(Command("summary"))
+@_require_base_url
+async def summary_cmd(m: Message):
+    """Generate AI summary for issue"""
+    parts = (m.text or "").split()
+    if len(parts) != 2:
+        await m.answer("Использование: /summary ISSUE-KEY\nПример: /summary INV-123")
+        return
+    
+    issue_key = parts[1].upper().strip()
+    tg_id = m.from_user.id
+    
+    # Проверяем кэш (кэш действителен 1 час)
+    cache_key = issue_key
+    if cache_key in _summary_cache:
+        cached = _summary_cache[cache_key]
+        cache_age = time.time() - cached.get("updated_at", 0)
+        if cache_age < 3600:  # 1 час
+            summary_text = cached.get("summary", "")
+            issue_url = cached.get("issue_url", f"https://tracker.yandex.ru/{issue_key}")
+            response_text = (
+                f"📋 Резюме задачи {issue_key} (из кэша):\n\n"
+                f"{summary_text}\n\n"
+                f"🔗 {issue_url}"
+            )
+            await m.answer(response_text)
+            return
+    
+    # Показываем индикатор загрузки
+    loading_msg = await m.answer("🤖 Генерирую резюме...")
+    
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_LONG, limits=HTTP_LIMITS) as client:
+            r = await client.get(
+                f"{BASE_URL}/tracker/issue/{issue_key}/summary",
+                params={"tg": tg_id}
+            )
+        
+        data = _parse_response(r)
+        
+        if r.status_code != 200:
+            error_msg = data.get("error", "Неизвестная ошибка") if isinstance(data, dict) else str(data)[:200]
+            
+            # Детальные сообщения об ошибках
+            if r.status_code == 401:
+                await loading_msg.edit_text("❌ Ошибка авторизации. Выполните /connect для привязки аккаунта.")
+            elif r.status_code == 404:
+                await loading_msg.edit_text(f"❌ Задача {issue_key} не найдена или у вас нет доступа к ней.")
+            elif r.status_code == 500:
+                if "AI service" in error_msg or "GPTunneL" in error_msg:
+                    await loading_msg.edit_text(f"❌ Ошибка ИИ-сервиса: {error_msg}\n\nПроверьте настройки GPTunneL API.")
+                else:
+                    await loading_msg.edit_text(f"❌ Внутренняя ошибка сервера: {error_msg}")
+            else:
+                await loading_msg.edit_text(f"❌ Ошибка {r.status_code}: {error_msg}")
+            return
+        
+        summary = data.get("summary", "")
+        issue_url = data.get("issue_url", f"https://tracker.yandex.ru/{issue_key}")
+        
+        if not summary:
+            await loading_msg.edit_text("❌ Не удалось сгенерировать резюме. Попробуйте позже.")
+            return
+        
+        # Сохраняем в кэш
+        _summary_cache[cache_key] = {
+            "summary": summary,
+            "issue_url": issue_url,
+            "updated_at": time.time()
+        }
+        
+        # Форматируем ответ
+        response_text = (
+            f"📋 Резюме задачи {issue_key}:\n\n"
+            f"{summary}\n\n"
+            f"🔗 {issue_url}"
+        )
+        
+        # Telegram ограничение на длину сообщения - разбиваем если нужно
+        if len(response_text) > 4000:
+            # Отправляем первую часть
+            await loading_msg.edit_text(response_text[:4000])
+            # Отправляем остальное
+            await m.answer(response_text[4000:])
+        else:
+            await loading_msg.edit_text(response_text)
+            
+    except httpx.TimeoutException:
+        await loading_msg.edit_text("⏱ Превышено время ожидания ответа от сервера. Попробуйте позже.")
+    except Exception as e:
+        await loading_msg.edit_text(f"❌ Произошла ошибка: {str(e)[:300]}")
+
+
 @router.message(Command("cl_done"))
 @_require_base_url
 async def cl_done(m: Message):
@@ -652,6 +751,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="cl_my", description="✅ Мои задачи с чеклистами"),
         BotCommand(command="cl_my_open", description="⬜ Ожидают мое согласование"),
         BotCommand(command="done", description="✅ Отметить пункт по номеру"),
+        BotCommand(command="summary", description="🤖 Резюме задачи (ИИ)"),
     ]
     await bot.set_my_commands(commands)
 

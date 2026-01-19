@@ -356,6 +356,14 @@ class TrackerClient:
         r = await self.http.get(url, headers=self._headers(access_token))
         return r.status_code, _safe_json(r)
 
+    async def get_issue_with_changelog(self, access_token: str, issue_key: str) -> tuple[int, Any]:
+        """Get issue with changelog and comments"""
+        url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}"
+        # Получаем задачу с расширенными данными
+        params = {"expand": "changelog,comments"}
+        r = await self.http.get(url, headers=self._headers(access_token), params=params)
+        return r.status_code, _safe_json(r)
+
     async def patch_issue(self, access_token: str, issue_key: str, patch: dict) -> tuple[int, Any]:
         url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}"
         headers = {**self._headers(access_token), "Content-Type": "application/json"}
@@ -662,6 +670,57 @@ class TrackerService:
         stp, resp = await self.tracker.patch_issue(access, issue_key, {"checklistItems": new_items})
         return {"http_status": 200, "body": {"status_code": stp, "response": resp}}
 
+    async def get_issue_full(self, tg_id: int, issue_key: str) -> dict:
+        """Get full issue data with changelog and comments for summary generation"""
+        access, err = await self._get_valid_access_token(tg_id)
+        if err:
+            return err
+        
+        st, issue_data = await self.tracker.get_issue_with_changelog(access, issue_key)
+        if st != 200:
+            return {"http_status": st, "body": issue_data}
+        
+        return {"http_status": 200, "body": issue_data}
+
+    async def issue_summary(self, tg_id: int, issue_key: str) -> dict:
+        """Generate AI summary for issue"""
+        # Получаем данные задачи
+        issue_result = await self.get_issue_full(tg_id, issue_key)
+        if issue_result["http_status"] != 200:
+            return issue_result
+        
+        issue_data = issue_result["body"]
+        
+        # Генерируем summary с помощью ИИ
+        try:
+            from ai_service import generate_summary
+            summary_text = await generate_summary(issue_data)
+        except ImportError:
+            return {
+                "http_status": 500,
+                "body": {"error": "AI service module not found"}
+            }
+        except Exception as e:
+            return {
+                "http_status": 500,
+                "body": {"error": f"AI service error: {str(e)}"}
+            }
+        
+        if not summary_text:
+            return {
+                "http_status": 500,
+                "body": {"error": "Не удалось сгенерировать резюме. Проверьте настройки GPTunneL API."}
+            }
+        
+        return {
+            "http_status": 200,
+            "body": {
+                "issue_key": issue_key,
+                "summary": summary_text,
+                "issue_url": f"https://tracker.yandex.ru/{issue_key}"
+            }
+        }
+
 
 # =========================
 # FastAPI wiring
@@ -860,4 +919,14 @@ async def checklist_check(tg: int, issue: str, item: str, checked: bool = True):
         return cfg_err
     assert _service is not None
     result = await _service.checklist_item_check(tg, issue_key=issue, item_id=item, checked=checked)
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.get("/tracker/issue/{issue_key}/summary")
+async def issue_summary_endpoint(tg: int, issue_key: str):
+    cfg_err = _require(settings)
+    if cfg_err:
+        return cfg_err
+    assert _service is not None
+    result = await _service.issue_summary(tg, issue_key)
     return JSONResponse(result["body"], status_code=result["http_status"])
