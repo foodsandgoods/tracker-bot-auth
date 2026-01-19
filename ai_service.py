@@ -47,7 +47,7 @@ def _build_prompt(issue_data: dict) -> str:
     # Ограничиваем длину описания
     desc_limited = description[:800] if len(description) > 800 else description
     
-    prompt = f"""Составь подробное резюме задачи из Yandex Tracker (максимум 400 символов).
+    prompt = f"""Составь подробное резюме задачи из Yandex Tracker (максимум 500 символов).
 
 Задача: {key} — {summary}
 Статус: {status}
@@ -69,7 +69,7 @@ def _build_prompt(issue_data: dict) -> str:
 4. Прогресс по чеклисту (если есть)
 5. Последние действия/комментарии (если есть)
 
-Резюме должно быть информативным (до 400 символов) и на русском языке."""
+Резюме должно быть информативным (до 500 символов) и на русском языке."""
     
     return prompt
 
@@ -102,7 +102,7 @@ async def generate_summary(issue_data: dict) -> tuple[Optional[str], Optional[st
             }
         ],
         "useWalletBalance": True,
-        "max_tokens": 500,  # Увеличено для резюме до 400 символов
+        "max_tokens": 600,  # Увеличено для резюме до 500 символов
         "temperature": 0.7
     }
     
@@ -172,9 +172,9 @@ async def generate_summary(issue_data: dict) -> tuple[Optional[str], Optional[st
                 
                 return None, "API вернул пустой ответ. Проверьте модель и баланс."
             
-            # Обрезаем до 400 символов если превышает
-            if len(content) > 400:
-                content = content[:397] + "..."
+            # Обрезаем до 500 символов если превышает
+            if len(content) > 500:
+                content = content[:497] + "..."
             
             return content.strip(), None
             

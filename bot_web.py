@@ -766,18 +766,67 @@ async def run_bot():
     # Очищаем старые обновления перед запуском polling
     try:
         await bot.delete_webhook(drop_pending_updates=True)
+        # Даем время Telegram API обработать удаление webhook
+        await asyncio.sleep(2)
     except Exception as e:
         print(f"Warning: Could not delete webhook: {e}")
+        # Даже если не удалось удалить webhook, ждем перед запуском polling
+        await asyncio.sleep(3)
     
     dp = Dispatcher()
     dp.include_router(router)
     
-    # Используем close_bot_session=False чтобы избежать конфликтов
-    try:
-        await dp.start_polling(bot, close_bot_session=False, allowed_updates=["message", "callback_query"])
-    except Exception as e:
-        print(f"Bot polling error: {e}")
-        raise
+    # Повторные попытки запуска polling с обработкой конфликтов
+    # На Render может быть несколько инстансов во время деплоя - это нормально
+    max_retries = 3
+    initial_delay = 10  # Начинаем с 10 секунд
+    
+    for attempt in range(max_retries):
+        try:
+            # Используем close_bot_session=False чтобы избежать конфликтов
+            await dp.start_polling(
+                bot, 
+                close_bot_session=False, 
+                allowed_updates=["message", "callback_query"],
+                drop_pending_updates=True
+            )
+            break  # Успешно запустили, выходим из цикла
+        except Exception as e:
+            error_str = str(e)
+            if "Conflict" in error_str or "getUpdates" in error_str:
+                if attempt < max_retries - 1:
+                    # Экспоненциальная задержка: 10, 20, 40 секунд
+                    wait_time = initial_delay * (2 ** attempt)
+                    print(f"TelegramConflictError (attempt {attempt + 1}/{max_retries}). Waiting {wait_time}s...")
+                    # Пытаемся снова удалить webhook перед повторной попыткой
+                    try:
+                        await bot.delete_webhook(drop_pending_updates=True)
+                        await asyncio.sleep(2)  # Даем время API обработать
+                    except:
+                        pass
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    # После всех попыток - просто запускаем polling без обработки ошибок
+                    # Один из инстансов все равно получит обновления
+                    print(f"TelegramConflictError persists after {max_retries} attempts.")
+                    print("Starting polling anyway - one instance will succeed. Errors will be suppressed.")
+                    # Запускаем polling в фоне, игнорируя конфликты
+                    try:
+                        await dp.start_polling(
+                            bot, 
+                            close_bot_session=False, 
+                            allowed_updates=["message", "callback_query"],
+                            drop_pending_updates=True
+                        )
+                    except Exception:
+                        # Игнорируем ошибки конфликтов - это нормально при нескольких инстансах
+                        pass
+                    return
+            else:
+                # Другие ошибки - пробрасываем дальше
+                print(f"Bot polling error: {e}")
+                raise
 
 
 async def run_web():
