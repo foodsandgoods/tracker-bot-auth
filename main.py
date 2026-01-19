@@ -480,41 +480,69 @@ class TrackerService:
             limit = int(s.get("limit_results", 10))
 
         query = self._build_candidate_query(queues, days)
-        # Optimize search limit: we need more issues to find matching checklist items
-        # But not too many - 3-5x should be enough for most cases
-        search_limit = min(max(50, limit * 5), 200)  # Between 50 and 200 issues
+        # Optimized search limit for low-resource servers:
+        # Reduced multiplier and max limit to minimize API calls
+        search_limit = min(max(30, limit * 3), 100)  # Between 30 and 100 issues (reduced from 200)
         st, payload = await self.tracker.search_issues(access, query=query, limit=search_limit)
         if st != 200:
             return {"http_status": 200, "body": {"status_code": st, "response": payload, "query": query}}
 
         issues = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
         
-        # Extract keys first, but limit processing to reasonable amount
-        # We don't need to process all issues if we can find matches earlier
-        issue_keys = [it.get("key") for it in issues if it.get("key")]
-        # Limit to first 150 keys max to avoid processing too many
-        max_keys_to_process = min(len(issue_keys), 150)
+        # Early exit if no issues found
+        if not issues:
+            return {
+                "http_status": 200,
+                "body": {
+                    "status_code": 200,
+                    "issues": [],
+                    "query": query,
+                    "settings": {"queues": queues, "days": days},
+                    "login": login,
+                },
+            }
+        
+        # Create lookup dict for O(1) access instead of O(n) search
+        issues_by_key = {it.get("key"): it for it in issues if it.get("key")}
+        issue_keys = list(issues_by_key.keys())
+        
+        # Further limit processing for low-resource servers
+        max_keys_to_process = min(len(issue_keys), 80)  # Reduced from 150 to 80
         issue_keys = issue_keys[:max_keys_to_process]
         
         # Fetch all issues in parallel for better performance
         async def fetch_issue(key: str) -> tuple[str, dict | None]:
-            sti, issue_full = await self.tracker.get_issue(access, key)
-            if sti == 200 and isinstance(issue_full, dict):
-                return key, issue_full
+            try:
+                sti, issue_full = await self.tracker.get_issue(access, key)
+                if sti == 200 and isinstance(issue_full, dict):
+                    return key, issue_full
+            except Exception:
+                # Silently handle errors to not slow down processing
+                pass
             return key, None
         
-        # Process in larger batches for better parallelism
-        # Increased batch size for faster processing
-        batch_size = 30
+        # Adaptive batch size for low-resource servers
+        # Smaller batches reduce memory and CPU usage
+        batch_size = 15  # Reduced from 30 to 15 for better resource management
         result: list[dict] = []
         
+        # Process batches with early exit optimization
         for i in range(0, len(issue_keys), batch_size):
             # Early exit if we have enough results
             if len(result) >= limit:
                 break
+            
+            # Calculate remaining needed
+            remaining_needed = limit - len(result)
+            if remaining_needed <= 0:
+                break
                 
             batch_keys = issue_keys[i:i + batch_size]
-            batch_results = await asyncio.gather(*[fetch_issue(key) for key in batch_keys], return_exceptions=True)
+            # Use asyncio.gather with return_exceptions for better error handling
+            batch_results = await asyncio.gather(
+                *[fetch_issue(key) for key in batch_keys],
+                return_exceptions=True
+            )
             
             for result_item in batch_results:
                 # Early exit check
@@ -532,30 +560,37 @@ class TrackerService:
                 if not checklist_items:
                     continue
 
+                # Optimize checklist item processing
                 matched_items = []
+                login_lower = login  # Cache lowercase login
                 for ci in checklist_items:
-                    ass = ci.get("assignee") or {}
-                    if (ass.get("login") or "").lower() != login:
-                        continue
+                    # Early skip if checked and we only want unchecked
                     if only_unchecked and ci.get("checked") is True:
                         continue
+                    
+                    # Fast path: check assignee login
+                    ass = ci.get("assignee")
+                    if not ass or (ass.get("login") or "").lower() != login_lower:
+                        continue
+                    
+                    # Build item dict efficiently
                     matched_items.append(
                         {
-                            "id": str(ci.get("id")),
-                            "text": ci.get("text") or ci.get("textHtml") or "",
+                            "id": str(ci.get("id", "")),
+                            "text": (ci.get("text") or ci.get("textHtml") or "").strip(),
                             "checked": bool(ci.get("checked", False)),
                         }
                     )
 
                 if matched_items:
-                    # Find original issue summary
-                    orig_issue = next((it for it in issues if it.get("key") == key), {})
-                    # Extract updated date from issue
+                    # Use O(1) dict lookup instead of O(n) linear search
+                    orig_issue = issues_by_key.get(key, {})
+                    # Extract updated date from issue (prioritize full issue data)
                     updated_at = issue_full.get("updatedAt") or issue_full.get("updated") or orig_issue.get("updatedAt") or orig_issue.get("updated")
                     result.append(
                         {
                             "key": key,
-                            "summary": orig_issue.get("summary") or issue_full.get("summary"),
+                            "summary": orig_issue.get("summary") or issue_full.get("summary") or "",
                             "url": f"https://tracker.yandex.ru/{key}",
                             "updatedAt": updated_at,
                             "items": matched_items,
@@ -623,7 +658,17 @@ _service: Optional[TrackerService] = None
 @app.on_event("startup")
 async def startup():
     global _http, _storage, _oauth, _tracker, _service
-    _http = httpx.AsyncClient(timeout=settings.http_timeout_seconds)
+    # Optimize HTTP client for low-resource servers:
+    # - Connection pooling with limits
+    # - Keep-alive connections
+    # - Reduced timeout for faster failures
+    limits = httpx.Limits(max_keepalive_connections=10, max_connections=20, keepalive_expiry=30.0)
+    timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=5.0)
+    _http = httpx.AsyncClient(
+        timeout=timeout,
+        limits=limits,
+        http2=True,  # HTTP/2 for better performance
+    )
 
     if settings.database_url:
         _storage = TokenStorage(settings.database_url)
