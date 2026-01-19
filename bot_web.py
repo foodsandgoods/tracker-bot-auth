@@ -8,6 +8,8 @@ import uvicorn
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
 from aiogram.types import Message
+from aiogram.types import InlineKeyboardMarkup, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 BASE_URL = (os.getenv("BASE_URL") or "").rstrip("/")  # auth-service url
@@ -31,7 +33,59 @@ def _fmt_item(item: dict) -> str:
     if len(text) > 120:
         text = text[:117] + "..."
     return f"{mark} {text} (id: {item_id})"
+async def _api_get(path: str, params: dict) -> tuple[int, dict]:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(f"{BASE_URL}{path}", params=params)
+    data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
+    return r.status_code, data
 
+
+async def _api_post(path: str, params: dict) -> tuple[int, dict]:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(f"{BASE_URL}{path}", params=params)
+    data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
+    return r.status_code, data
+
+
+def _kb_settings_main() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Очереди", callback_data="st:queues")
+    kb.button(text="Период", callback_data="st:days")
+    kb.button(text="Закрыть", callback_data="st:close")
+    kb.adjust(2, 1)
+    return kb.as_markup()
+
+
+def _kb_settings_queues(queues: list[str]) -> InlineKeyboardMarkup:
+    qs = {q.upper() for q in queues}
+    kb = InlineKeyboardBuilder()
+    for q in ["INV", "DOC", "HR"]:
+        mark = "✅" if q in qs else "⬜"
+        kb.button(text=f"{mark} {q}", callback_data=f"st:qtoggle:{q}")
+    kb.button(text="Назад", callback_data="st:back")
+    kb.adjust(3, 1)
+    return kb.as_markup()
+
+
+def _kb_settings_days(days: int) -> InlineKeyboardMarkup:
+    options = [7, 15, 30, 90, 180]
+    kb = InlineKeyboardBuilder()
+    for d in options:
+        mark = "✅" if int(days) == d else "⬜"
+        kb.button(text=f"{mark} {d}д", callback_data=f"st:dset:{d}")
+    kb.button(text="Назад", callback_data="st:back")
+    kb.adjust(3, 2)
+    return kb.as_markup()
+
+
+def _render_settings_text(queues: list[str], days: int) -> str:
+    q = ", ".join(queues) if queues else "(все очереди)"
+    return (
+        "Настройки поиска чеклистов:\n"
+        f"• Очереди: {q}\n"
+        f"• Период: {days} дней\n\n"
+        "Выбери, что изменить:"
+    )
 
 @router.message(Command("start"))
 async def start(m: Message):
@@ -209,3 +263,116 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+@router.message(Command("settings"))
+async def settings_cmd(m: Message):
+    if not BASE_URL:
+        await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
+        return
+
+    tg_id = m.from_user.id
+    sc, data = await _api_get("/tg/settings", {"tg": tg_id})
+    if sc != 200:
+        await m.answer(f"Ошибка {sc}: {data}")
+        return
+
+    queues = data.get("queues", [])
+    days = int(data.get("days", 30))
+    await m.answer(_render_settings_text(queues, days), reply_markup=_kb_settings_main())
+
+@router.callback_query()
+async def settings_callbacks(c: CallbackQuery):
+    if not BASE_URL:
+        await c.answer("BASE_URL не задан", show_alert=True)
+        return
+
+    if not c.data or not c.data.startswith("st:"):
+        return
+
+    tg_id = c.from_user.id
+
+    # всегда читаем актуальные настройки
+    sc, data = await _api_get("/tg/settings", {"tg": tg_id})
+    if sc != 200:
+        await c.answer(f"Ошибка {sc}", show_alert=True)
+        return
+
+    queues = data.get("queues", [])
+    days = int(data.get("days", 30))
+
+    parts = c.data.split(":", 2)
+
+    action = parts[1] if len(parts) > 1 else ""
+    arg = parts[2] if len(parts) > 2 else ""
+
+    if action == "close":
+        # удалить клавиатуру и “закрыть”
+        if c.message:
+            await c.message.edit_reply_markup(reply_markup=None)
+        await c.answer("Ок")
+        return
+
+    if action == "back":
+        if c.message:
+            await c.message.edit_text(_render_settings_text(queues, days), reply_markup=_kb_settings_main())
+        await c.answer()
+        return
+
+    if action == "queues":
+        if c.message:
+            await c.message.edit_text(
+                "Настройки → Очереди (нажми чтобы включить/выключить):",
+                reply_markup=_kb_settings_queues(queues),
+            )
+        await c.answer()
+        return
+
+    if action == "days":
+        if c.message:
+            await c.message.edit_text(
+                "Настройки → Период (за сколько дней искать обновлённые задачи):",
+                reply_markup=_kb_settings_days(days),
+            )
+        await c.answer()
+        return
+
+    if action == "qtoggle":
+        q = arg.upper()
+        qs = [x.upper() for x in queues]
+        if q in qs:
+            qs = [x for x in qs if x != q]
+        else:
+            qs.append(q)
+
+        sc2, data2 = await _api_post("/tg/settings/queues", {"tg": tg_id, "queues": ",".join(qs)})
+        if sc2 != 200:
+            await c.answer(f"Ошибка {sc2}", show_alert=True)
+            return
+
+        queues2 = data2.get("queues", [])
+        days2 = int(data2.get("days", days))
+        if c.message:
+            await c.message.edit_reply_markup(reply_markup=_kb_settings_queues(queues2))
+        await c.answer("Сохранено")
+        return
+
+    if action == "dset":
+        try:
+            d = int(arg)
+        except Exception:
+            await c.answer("Некорректное число", show_alert=True)
+            return
+
+        sc2, data2 = await _api_post("/tg/settings/days", {"tg": tg_id, "days": d})
+        if sc2 != 200:
+            await c.answer(f"Ошибка {sc2}", show_alert=True)
+            return
+
+        queues2 = data2.get("queues", queues)
+        days2 = int(data2.get("days", d))
+        if c.message:
+            await c.message.edit_reply_markup(reply_markup=_kb_settings_days(days2))
+        await c.answer("Сохранено")
+        return
+
+    await c.answer()
