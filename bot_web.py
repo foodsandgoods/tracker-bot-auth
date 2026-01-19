@@ -363,39 +363,48 @@ async def cl_my(m: Message):
         await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
         return
 
-    tg_id = m.from_user.id
-    # Get limit from settings
-    sc, data = await _api_get("/tg/settings", {"tg": tg_id})
-    limit = int(data.get("limit", 10)) if sc == 200 else 10
-    
-    # Optimize HTTP client for checklist requests
-    limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-    timeout = httpx.Timeout(connect=10.0, read=45.0, write=10.0)  # Longer read timeout for checklist processing
-    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
-        r = await client.get(f"{BASE_URL}/tracker/checklist/assigned", params={"tg": tg_id, "limit": limit})
+    try:
+        tg_id = m.from_user.id
+        # Get limit from settings
+        sc, data = await _api_get("/tg/settings", {"tg": tg_id})
+        limit = int(data.get("limit", 10)) if sc == 200 else 10
+        
+        # Optimize HTTP client for checklist requests
+        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
+        timeout = httpx.Timeout(connect=10.0, read=45.0, write=10.0)  # Longer read timeout for checklist processing
+        async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+            r = await client.get(f"{BASE_URL}/tracker/checklist/assigned", params={"tg": tg_id, "limit": limit})
 
-    data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
+        try:
+            data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
+        except Exception as e:
+            await m.answer(f"Ошибка парсинга ответа: {str(e)[:200]}")
+            return
 
-    if r.status_code != 200:
-        await m.answer(f"Ошибка {r.status_code}: {data}")
-        return
+        if r.status_code != 200:
+            await m.answer(f"Ошибка {r.status_code}: {str(data)[:500]}")
+            return
 
-    issues = data.get("issues", [])
-    if not issues:
-        settings = data.get("settings") or {}
-        days = settings.get("days", 30)
-        await m.answer(f"Не нашёл задач, где ты назначен исполнителем пункта чеклиста (в выборке за {days} дней).")
-        return
+        issues = data.get("issues", [])
+        if not issues:
+            settings = data.get("settings") or {}
+            days = settings.get("days", 30)
+            await m.answer(f"Не нашёл задач, где ты назначен исполнителем пункта чеклиста (в выборке за {days} дней).")
+            return
 
-    lines = ["Задачи с чеклистами, где ты исполнитель пункта:"]
-    for iss in issues:
-        updated = _fmt_date(iss.get("updatedAt"))
-        date_str = f" (обновлено: {updated})" if updated else ""
-        lines.append(f"\n{iss.get('key')} — {iss.get('summary')}{date_str}\n{iss.get('url')}")
-        for item in iss.get("items", []):
-            lines.append("  " + _fmt_item(item))
+        lines = ["Задачи с чеклистами, где ты исполнитель пункта:"]
+        for iss in issues:
+            updated = _fmt_date(iss.get("updatedAt"))
+            date_str = f" (обновлено: {updated})" if updated else ""
+            lines.append(f"\n{iss.get('key')} — {iss.get('summary')}{date_str}\n{iss.get('url')}")
+            for item in iss.get("items", []):
+                lines.append("  " + _fmt_item(item))
 
-    await m.answer("\n".join(lines))
+        await m.answer("\n".join(lines))
+    except httpx.TimeoutException:
+        await m.answer("⏱ Превышено время ожидания ответа от сервера. Попробуйте позже.")
+    except Exception as e:
+        await m.answer(f"❌ Произошла ошибка: {str(e)[:300]}")
 
 
 @router.message(Command("cl_my_open"))
@@ -404,40 +413,49 @@ async def cl_my_open(m: Message):
         await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
         return
 
-    tg_id = m.from_user.id
-    # Get limit from settings
-    sc, data = await _api_get("/tg/settings", {"tg": tg_id})
-    limit = int(data.get("limit", 10)) if sc == 200 else 10
-    
-    # Optimize HTTP client for checklist requests
-    limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-    timeout = httpx.Timeout(connect=10.0, read=45.0, write=10.0)  # Longer read timeout for checklist processing
-    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
-        r = await client.get(f"{BASE_URL}/tracker/checklist/assigned_unchecked", params={"tg": tg_id, "limit": limit})
+    try:
+        tg_id = m.from_user.id
+        # Get limit from settings
+        sc, data = await _api_get("/tg/settings", {"tg": tg_id})
+        limit = int(data.get("limit", 10)) if sc == 200 else 10
+        
+        # Optimize HTTP client for checklist requests
+        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
+        timeout = httpx.Timeout(connect=10.0, read=45.0, write=10.0)  # Longer read timeout for checklist processing
+        async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+            r = await client.get(f"{BASE_URL}/tracker/checklist/assigned_unchecked", params={"tg": tg_id, "limit": limit})
 
-    data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
+        try:
+            data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
+        except Exception as e:
+            await m.answer(f"Ошибка парсинга ответа: {str(e)[:200]}")
+            return
 
-    if r.status_code != 200:
-        await m.answer(f"Ошибка {r.status_code}: {data}")
-        return
+        if r.status_code != 200:
+            await m.answer(f"Ошибка {r.status_code}: {str(data)[:500]}")
+            return
 
-    issues = data.get("issues", [])
-    if not issues:
-        settings = data.get("settings") or {}
-        days = settings.get("days", 30)
-        await m.answer(f"Не нашёл неотмеченных пунктов чеклиста на тебе (в выборке за {days} дней).")
-        return
+        issues = data.get("issues", [])
+        if not issues:
+            settings = data.get("settings") or {}
+            days = settings.get("days", 30)
+            await m.answer(f"Не нашёл неотмеченных пунктов чеклиста на тебе (в выборке за {days} дней).")
+            return
 
-    lines = ["Неотмеченные пункты чеклиста, где ты исполнитель:"]
-    for iss in issues:
-        updated = _fmt_date(iss.get("updatedAt"))
-        date_str = f" (обновлено: {updated})" if updated else ""
-        lines.append(f"\n{iss.get('key')} — {iss.get('summary')}{date_str}\n{iss.get('url')}")
-        for item in iss.get("items", []):
-            lines.append("  " + _fmt_item(item))
+        lines = ["Неотмеченные пункты чеклиста, где ты исполнитель:"]
+        for iss in issues:
+            updated = _fmt_date(iss.get("updatedAt"))
+            date_str = f" (обновлено: {updated})" if updated else ""
+            lines.append(f"\n{iss.get('key')} — {iss.get('summary')}{date_str}\n{iss.get('url')}")
+            for item in iss.get("items", []):
+                lines.append("  " + _fmt_item(item))
 
-    lines.append("\nЧтобы отметить пункт: /cl_done ISSUE-KEY ITEM_ID")
-    await m.answer("\n".join(lines))
+        lines.append("\nЧтобы отметить пункт: /cl_done ISSUE-KEY ITEM_ID")
+        await m.answer("\n".join(lines))
+    except httpx.TimeoutException:
+        await m.answer("⏱ Превышено время ожидания ответа от сервера. Попробуйте позже.")
+    except Exception as e:
+        await m.answer(f"❌ Произошла ошибка: {str(e)[:300]}")
 
 
 @router.message(Command("cl_done"))
