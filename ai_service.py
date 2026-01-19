@@ -92,6 +92,51 @@ def _build_prompt(issue_data: dict) -> str:
     return prompt
 
 
+def _extract_content_from_response(data: dict) -> Optional[str]:
+    """Extract content from API response in different formats"""
+    content = None
+    
+    # Вариант 1: стандартный OpenAI формат - choices[0].message.content
+    if "choices" in data and len(data["choices"]) > 0:
+        choice = data["choices"][0]
+        if isinstance(choice, dict):
+            if "message" in choice:
+                message = choice["message"]
+                if isinstance(message, dict):
+                    content = message.get("content", "")
+                    if not content and "text" in message:
+                        content = message.get("text", "")
+            elif "text" in choice:
+                content = choice.get("text", "")
+            elif "delta" in choice:
+                delta = choice["delta"]
+                if isinstance(delta, dict) and "content" in delta:
+                    content = delta.get("content", "")
+            elif "content" in choice:
+                content = choice.get("content", "")
+    
+    # Вариант 2: прямой ответ в корне
+    if not content and "text" in data:
+        content = data.get("text", "")
+    
+    # Вариант 3: ответ в поле result (YandexGPT формат)
+    if not content and "result" in data:
+        result = data["result"]
+        if isinstance(result, dict):
+            if "alternatives" in result and len(result["alternatives"]) > 0:
+                content = result["alternatives"][0].get("message", {}).get("text", "")
+            elif "text" in result:
+                content = result.get("text", "")
+        elif isinstance(result, str):
+            content = result
+    
+    # Вариант 4: контент в корне ответа
+    if not content and "content" in data:
+        content = data.get("content", "")
+    
+    return content
+
+
 async def generate_summary(issue_data: dict) -> tuple[Optional[str], Optional[str]]:
     """Generate summary for issue using GPTunneL API
     Returns: (summary_text, error_message)
@@ -101,14 +146,11 @@ async def generate_summary(issue_data: dict) -> tuple[Optional[str], Optional[st
     
     prompt = _build_prompt(issue_data)
     
-    # Пробуем оба варианта авторизации (Bearer и просто ключ)
+    # Согласно документации gptunnel.ru: Authorization: <API_KEY> (без Bearer)
     headers = {
-        "Authorization": f"Bearer {GPTUNNEL_API_KEY}",
+        "Authorization": GPTUNNEL_API_KEY,
         "Content-Type": "application/json"
     }
-    
-    # Если Bearer не работает, попробуем без Bearer
-    # (некоторые API требуют просто ключ в заголовке)
     
     payload = {
         "model": GPTUNNEL_MODEL,
@@ -139,32 +181,25 @@ async def generate_summary(issue_data: dict) -> tuple[Optional[str], Optional[st
                 except:
                     error_detail = error_text
                 
-                # Если 401 - проблема с авторизацией, пробуем без Bearer
+                # Если 401 - проблема с авторизацией, пробуем с Bearer (на случай если документация устарела)
                 if r.status_code == 401:
                     headers_alt = {
-                        "Authorization": GPTUNNEL_API_KEY,
+                        "Authorization": f"Bearer {GPTUNNEL_API_KEY}",
                         "Content-Type": "application/json"
                     }
                     try:
                         r2 = await client.post(GPTUNNEL_API_URL, headers=headers_alt, json=payload)
                         if r2.status_code == 200:
                             data2 = r2.json()
-                            print(f"GPTunneL API response (alt auth): {str(data2)[:1000]}")
+                            print(f"GPTunneL API response (Bearer auth): {str(data2)[:1000]}")
                             # Используем ту же логику извлечения контента
-                            content = None
-                            if "choices" in data2 and len(data2["choices"]) > 0:
-                                choice = data2["choices"][0]
-                                if isinstance(choice, dict):
-                                    if "message" in choice:
-                                        content = choice["message"].get("content", "")
-                                    elif "text" in choice:
-                                        content = choice.get("text", "")
+                            content = _extract_content_from_response(data2)
                             if content:
                                 if len(content) > 200:
                                     content = content[:197] + "..."
                                 return content.strip(), None
                     except Exception as e:
-                        print(f"Alt auth attempt failed: {e}")
+                        print(f"Bearer auth attempt failed: {e}")
                         pass
                 
                 error_msg = f"HTTP {r.status_code}: {error_detail}"
@@ -176,43 +211,27 @@ async def generate_summary(issue_data: dict) -> tuple[Optional[str], Optional[st
             except Exception as e:
                 return None, f"Ошибка парсинга JSON ответа: {str(e)}"
             
-            # Логируем полный ответ для отладки (первые 1000 символов)
-            response_str = str(data)[:1000]
+            # Логируем полный ответ для отладки (первые 2000 символов)
+            response_str = str(data)[:2000]
             print(f"GPTunneL API response: {response_str}")
             
-            # Проверяем разные варианты структуры ответа
-            content = None
-            
-            # Вариант 1: стандартный OpenAI формат
-            if "choices" in data and len(data["choices"]) > 0:
-                choice = data["choices"][0]
-                if isinstance(choice, dict):
-                    # Проверяем разные варианты структуры
-                    if "message" in choice:
-                        content = choice["message"].get("content", "")
-                    elif "text" in choice:
-                        content = choice.get("text", "")
-                    elif "delta" in choice and "content" in choice["delta"]:
-                        content = choice["delta"].get("content", "")
-            
-            # Вариант 2: прямой ответ в корне
-            if not content and "text" in data:
-                content = data.get("text", "")
-            
-            # Вариант 3: ответ в поле result
-            if not content and "result" in data:
-                result = data["result"]
-                if isinstance(result, dict):
-                    if "alternatives" in result and len(result["alternatives"]) > 0:
-                        content = result["alternatives"][0].get("message", {}).get("text", "")
-                    elif "text" in result:
-                        content = result.get("text", "")
-                elif isinstance(result, str):
-                    content = result
+            # Извлекаем контент используя универсальную функцию
+            content = _extract_content_from_response(data)
             
             if not content:
-                # Логируем структуру ответа для диагностики
-                return None, f"API вернул пустой ответ. Структура ответа: {list(data.keys()) if isinstance(data, dict) else type(data)}"
+                # Логируем детальную структуру для диагностики
+                choice_info = ""
+                if "choices" in data and len(data["choices"]) > 0:
+                    choice = data["choices"][0]
+                    choice_info = f", choice keys: {list(choice.keys()) if isinstance(choice, dict) else 'not dict'}"
+                    if isinstance(choice, dict) and "message" in choice:
+                        msg = choice["message"]
+                        choice_info += f", message keys: {list(msg.keys()) if isinstance(msg, dict) else 'not dict'}"
+                        if isinstance(msg, dict):
+                            choice_info += f", message content type: {type(msg.get('content', None))}"
+                            choice_info += f", message content value: {repr(msg.get('content', ''))[:100]}"
+                
+                return None, f"API вернул пустой ответ. Структура: {list(data.keys()) if isinstance(data, dict) else type(data)}{choice_info}"
             
             # Обрезаем до 200 символов если превышает
             if len(content) > 200:
