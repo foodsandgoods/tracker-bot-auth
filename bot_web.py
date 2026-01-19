@@ -762,9 +762,22 @@ async def run_bot():
 
     bot = Bot(token=BOT_TOKEN)
     await setup_bot_commands(bot)
+    
+    # Очищаем старые обновления перед запуском polling
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        print(f"Warning: Could not delete webhook: {e}")
+    
     dp = Dispatcher()
     dp.include_router(router)
-    await dp.start_polling(bot)
+    
+    # Используем close_bot_session=False чтобы избежать конфликтов
+    try:
+        await dp.start_polling(bot, close_bot_session=False, allowed_updates=["message", "callback_query"])
+    except Exception as e:
+        print(f"Bot polling error: {e}")
+        raise
 
 
 async def run_web():
@@ -774,7 +787,18 @@ async def run_web():
 
 
 async def main():
-    await asyncio.gather(run_web(), run_bot())
+    # Запускаем веб-сервер и бота параллельно
+    try:
+        await asyncio.gather(run_web(), run_bot())
+    except KeyboardInterrupt:
+        print("Shutting down...")
+    except Exception as e:
+        print(f"Error in main: {e}")
+        # Продолжаем работу веб-сервера даже если бот упал
+        try:
+            await run_web()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
