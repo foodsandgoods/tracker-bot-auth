@@ -1,3 +1,4 @@
+import asyncio
 import os
 import secrets
 from dataclasses import dataclass
@@ -487,46 +488,67 @@ class TrackerService:
             return {"http_status": 200, "body": {"status_code": st, "response": payload, "query": query}}
 
         issues = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
-        result: list[dict] = []
-
-        for it in issues:
-            key = it.get("key")
-            if not key:
-                continue
-
+        
+        # Extract keys first
+        issue_keys = [it.get("key") for it in issues if it.get("key")]
+        
+        # Fetch all issues in parallel for better performance
+        async def fetch_issue(key: str) -> tuple[str, dict | None]:
             sti, issue_full = await self.tracker.get_issue(access, key)
-            if sti != 200 or not isinstance(issue_full, dict):
-                continue
-
-            checklist_items = self._extract_checklist_items(issue_full)
-            if not checklist_items:
-                continue
-
-            matched_items = []
-            for ci in checklist_items:
-                ass = ci.get("assignee") or {}
-                if (ass.get("login") or "").lower() != login:
+            if sti == 200 and isinstance(issue_full, dict):
+                return key, issue_full
+            return key, None
+        
+        # Process in batches to avoid overwhelming the API
+        batch_size = 20
+        result: list[dict] = []
+        
+        for i in range(0, len(issue_keys), batch_size):
+            batch_keys = issue_keys[i:i + batch_size]
+            batch_results = await asyncio.gather(*[fetch_issue(key) for key in batch_keys], return_exceptions=True)
+            
+            for result_item in batch_results:
+                # Handle exceptions from gather
+                if isinstance(result_item, Exception):
                     continue
-                if only_unchecked and ci.get("checked") is True:
+                key, issue_full = result_item
+                if issue_full is None:
                     continue
-                matched_items.append(
-                    {
-                        "id": str(ci.get("id")),
-                        "text": ci.get("text") or ci.get("textHtml") or "",
-                        "checked": bool(ci.get("checked", False)),
-                    }
-                )
+                
+                checklist_items = self._extract_checklist_items(issue_full)
+                if not checklist_items:
+                    continue
 
-            if matched_items:
-                result.append(
-                    {
-                        "key": key,
-                        "summary": it.get("summary") or issue_full.get("summary"),
-                        "url": f"https://tracker.yandex.ru/{key}",
-                        "items": matched_items,
-                    }
-                )
+                matched_items = []
+                for ci in checklist_items:
+                    ass = ci.get("assignee") or {}
+                    if (ass.get("login") or "").lower() != login:
+                        continue
+                    if only_unchecked and ci.get("checked") is True:
+                        continue
+                    matched_items.append(
+                        {
+                            "id": str(ci.get("id")),
+                            "text": ci.get("text") or ci.get("textHtml") or "",
+                            "checked": bool(ci.get("checked", False)),
+                        }
+                    )
 
+                if matched_items:
+                    # Find original issue summary
+                    orig_issue = next((it for it in issues if it.get("key") == key), {})
+                    result.append(
+                        {
+                            "key": key,
+                            "summary": orig_issue.get("summary") or issue_full.get("summary"),
+                            "url": f"https://tracker.yandex.ru/{key}",
+                            "items": matched_items,
+                        }
+                    )
+
+                if len(result) >= limit:
+                    break
+            
             if len(result) >= limit:
                 break
 
