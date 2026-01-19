@@ -19,6 +19,9 @@ PORT = int(os.getenv("PORT", "10000"))
 router = Router()
 app = FastAPI()
 
+# Cache for last checklist results (per user)
+_last_checklist_cache = {}  # tg_id -> {"issues": [...], "item_mapping": {num: (issue_key, item_id)}}
+
 
 @app.get("/ping")
 async def ping():
@@ -28,7 +31,7 @@ async def ping():
 # =========================
 # Helpers
 # =========================
-def _fmt_item(item: dict, num: int = None) -> str:
+def _fmt_item(item: dict) -> str:
     checked = item.get("checked", False)
     mark = "✅" if checked else "⬜"
     text = (item.get("text") or "").strip()
@@ -36,8 +39,7 @@ def _fmt_item(item: dict, num: int = None) -> str:
     text = text.replace("\n", " ").strip()
     if len(text) > 100:
         text = text[:97] + "..."
-    num_str = f"{num}. " if num is not None else ""
-    return f"{num_str}{mark} {text}"
+    return f"{mark} {text}"
 
 
 def _fmt_date(date_str: str | None) -> str:
@@ -263,12 +265,24 @@ async def settings_callbacks(c: CallbackQuery):
                     # Update message to show item as checked
                     if c.message:
                         text = c.message.text or ""
-                        # Replace the specific item's unchecked mark with checked
+                        # Replace "⬜" with "✅" for this specific item (find by button number context)
+                        # Since we removed numbering from items, we'll replace the first unchecked item
+                        # that appears before the button number in the text
+                        import re
                         if item_num:
-                            # Replace "N. ⬜" with "N. ✅" for this specific item
-                            import re
-                            pattern = rf"{re.escape(item_num)}\. ⬜"
-                            new_text = re.sub(pattern, f"{item_num}. ✅", text, count=1)
+                            # Find the line with this item (it should be near the button number)
+                            # Pattern: find "⬜" that appears before the button number context
+                            lines = text.split('\n')
+                            new_lines = []
+                            found = False
+                            for line in lines:
+                                if not found and "⬜" in line and item_num in text[text.find(line):text.find(line)+200]:
+                                    # Replace first ⬜ in this line
+                                    new_lines.append(line.replace("⬜", "✅", 1))
+                                    found = True
+                                else:
+                                    new_lines.append(line)
+                            new_text = '\n'.join(new_lines) if found else text.replace("⬜", "✅", 1)
                         else:
                             # Fallback: replace first unchecked
                             new_text = text.replace("⬜", "✅", 1)
@@ -452,15 +466,27 @@ async def cl_my(m: Message):
         lines = ["Задачи с чеклистами, где ты исполнитель пункта:"]
         issue_counter = 1
         item_counter = 1
+        item_mapping = {}  # Store mapping: counter -> (issue_key, item_id)
+        
         for iss in issues:
             updated = _fmt_date(iss.get("updatedAt"))
             date_str = f" (обновлено: {updated})" if updated else ""
             # Add issue number before ISSUE-KEY
             lines.append(f"\n{issue_counter}. {iss.get('key')} — {iss.get('summary')}{date_str}\n{iss.get('url')}")
             for item in iss.get("items", []):
-                lines.append("  " + _fmt_item(item, item_counter))
+                lines.append("  " + _fmt_item(item))
+                # Store mapping for /done command
+                issue_key = iss.get('key')
+                item_id = item.get('id')
+                item_mapping[item_counter] = (issue_key, item_id)
                 item_counter += 1
             issue_counter += 1
+
+        # Save to cache
+        _last_checklist_cache[tg_id] = {
+            "issues": issues,
+            "item_mapping": item_mapping
+        }
 
         await m.answer("\n".join(lines))
     except httpx.TimeoutException:
@@ -518,8 +544,8 @@ async def cl_my_open(m: Message):
             
             for item in iss.get("items", []):
                 if not item.get("checked", False):  # Only show unchecked items
-                    lines.append("  " + _fmt_item(item, item_counter))
-                    # Store mapping for callback
+                    lines.append("  " + _fmt_item(item))
+                    # Store mapping for callback and /done command
                     issue_key = iss.get('key')
                     item_id = item.get('id')
                     item_mapping[item_counter] = (issue_key, item_id)
@@ -537,6 +563,12 @@ async def cl_my_open(m: Message):
         lines.append(f"\n\nНажмите кнопку с номером, чтобы отметить пункт")
         kb.adjust(3)  # 3 buttons per row
         
+        # Save to cache
+        _last_checklist_cache[tg_id] = {
+            "issues": issues,
+            "item_mapping": item_mapping
+        }
+        
         # Split message if too long (Telegram limit is 4096 chars)
         message_text = "\n".join(lines)
         if len(message_text) > 4000:
@@ -551,6 +583,56 @@ async def cl_my_open(m: Message):
         await m.answer("⏱ Превышено время ожидания ответа от сервера. Попробуйте позже.")
     except Exception as e:
         await m.answer(f"❌ Произошла ошибка: {str(e)[:300]}")
+
+
+@router.message(Command("done"))
+async def done_cmd(m: Message):
+    """Mark checklist item by number from last /cl_my or /cl_my_open result"""
+    if not BASE_URL:
+        await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
+        return
+
+    parts = (m.text or "").split()
+    if len(parts) != 2:
+        await m.answer("Использование: /done N\nгде N — номер пункта из последнего списка (/cl_my или /cl_my_open)")
+        return
+
+    try:
+        item_num = int(parts[1])
+    except ValueError:
+        await m.answer("Номер должен быть числом. Использование: /done N")
+        return
+
+    tg_id = m.from_user.id
+    
+    # Get from cache
+    cache = _last_checklist_cache.get(tg_id)
+    if not cache or not cache.get("item_mapping"):
+        await m.answer("❌ Кэш пуст. Сначала выполните /cl_my или /cl_my_open")
+        return
+
+    item_mapping = cache.get("item_mapping", {})
+    if item_num not in item_mapping:
+        await m.answer(f"❌ Пункт с номером {item_num} не найден в последнем списке")
+        return
+
+    issue_key, item_id = item_mapping[item_num]
+
+    try:
+        sc, data = await _api_post("/tracker/checklist/check", {
+            "tg": str(tg_id),
+            "issue": issue_key,
+            "item": item_id,
+            "checked": True
+        })
+
+        if sc == 200:
+            await m.answer(f"✅ Отмечен пункт {item_num} в задаче {issue_key}")
+        else:
+            error_msg = data.get("error", "Не удалось отметить") if isinstance(data, dict) else str(data)[:100]
+            await m.answer(f"❌ Ошибка {sc}: {error_msg}")
+    except Exception as e:
+        await m.answer(f"❌ Произошла ошибка: {str(e)[:200]}")
 
 
 @router.message(Command("cl_done"))
@@ -599,6 +681,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="settings", description="⚙️ Настройки"),
         BotCommand(command="cl_my", description="✅ Мои задачи с чеклистами"),
         BotCommand(command="cl_my_open", description="📝 Неотмеченные пункты"),
+        BotCommand(command="done", description="✅ Отметить пункт по номеру"),
     ]
     await bot.set_my_commands(commands)
 
