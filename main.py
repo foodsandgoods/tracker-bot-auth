@@ -704,7 +704,7 @@ class TrackerService:
         # Генерируем summary с помощью ИИ
         try:
             from ai_service import generate_summary
-            summary_text = await generate_summary(issue_data)
+            summary_text, error_msg = await generate_summary(issue_data)
         except ImportError as e:
             return {
                 "http_status": 500,
@@ -717,9 +717,10 @@ class TrackerService:
             }
         
         if not summary_text:
+            error_detail = error_msg or "Неизвестная ошибка"
             return {
                 "http_status": 500,
-                "body": {"error": "Не удалось сгенерировать резюме. Проверьте настройки GPTunneL API."}
+                "body": {"error": f"Не удалось сгенерировать резюме: {error_detail}"}
             }
         
         return {

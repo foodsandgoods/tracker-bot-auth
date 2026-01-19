@@ -92,17 +92,23 @@ def _build_prompt(issue_data: dict) -> str:
     return prompt
 
 
-async def generate_summary(issue_data: dict) -> Optional[str]:
-    """Generate summary for issue using GPTunneL API"""
+async def generate_summary(issue_data: dict) -> tuple[Optional[str], Optional[str]]:
+    """Generate summary for issue using GPTunneL API
+    Returns: (summary_text, error_message)
+    """
     if not GPTUNNEL_API_KEY:
-        return None
+        return None, "GPTUNNEL_API_KEY не установлен"
     
     prompt = _build_prompt(issue_data)
     
+    # Пробуем оба варианта авторизации (Bearer и просто ключ)
     headers = {
         "Authorization": f"Bearer {GPTUNNEL_API_KEY}",
         "Content-Type": "application/json"
     }
+    
+    # Если Bearer не работает, попробуем без Bearer
+    # (некоторые API требуют просто ключ в заголовке)
     
     payload = {
         "model": GPTUNNEL_MODEL,
@@ -126,21 +132,55 @@ async def generate_summary(issue_data: dict) -> Optional[str]:
             r = await client.post(GPTUNNEL_API_URL, headers=headers, json=payload)
             
             if r.status_code != 200:
-                print(f"GPTunneL API error: {r.status_code} - {r.text}")
-                return None
+                error_text = r.text[:500] if r.text else "Нет текста ошибки"
+                try:
+                    error_json = r.json()
+                    error_detail = str(error_json)
+                except:
+                    error_detail = error_text
+                
+                # Если 401 - проблема с авторизацией, пробуем без Bearer
+                if r.status_code == 401:
+                    headers_alt = {
+                        "Authorization": GPTUNNEL_API_KEY,
+                        "Content-Type": "application/json"
+                    }
+                    try:
+                        r2 = await client.post(GPTUNNEL_API_URL, headers=headers_alt, json=payload)
+                        if r2.status_code == 200:
+                            data = r2.json()
+                            if "choices" in data and len(data["choices"]) > 0:
+                                content = data["choices"][0].get("message", {}).get("content", "")
+                                if len(content) > 200:
+                                    content = content[:197] + "..."
+                                return content.strip(), None
+                    except:
+                        pass
+                
+                error_msg = f"HTTP {r.status_code}: {error_detail}"
+                print(f"GPTunneL API error: {error_msg}")
+                return None, error_msg
             
-            data = r.json()
+            try:
+                data = r.json()
+            except Exception as e:
+                return None, f"Ошибка парсинга JSON ответа: {str(e)}"
+            
             if "choices" in data and len(data["choices"]) > 0:
                 content = data["choices"][0].get("message", {}).get("content", "")
+                if not content:
+                    return None, "API вернул пустой ответ"
                 # Обрезаем до 200 символов если превышает
                 if len(content) > 200:
                     content = content[:197] + "..."
-                return content.strip()
+                return content.strip(), None
             
-            return None
+            return None, f"Неожиданный формат ответа API: {data}"
     except httpx.TimeoutException:
-        print("GPTunneL API timeout")
-        return None
+        error_msg = "Превышено время ожидания ответа от GPTunneL API (30 сек)"
+        print(f"GPTunneL API timeout")
+        return None, error_msg
     except Exception as e:
+        error_msg = f"Ошибка при запросе к GPTunneL API: {str(e)}"
         print(f"GPTunneL API error: {e}")
-        return None
+        return None, error_msg
