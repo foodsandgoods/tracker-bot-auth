@@ -148,13 +148,23 @@ async def generate_summary(issue_data: dict) -> tuple[Optional[str], Optional[st
                     try:
                         r2 = await client.post(GPTUNNEL_API_URL, headers=headers_alt, json=payload)
                         if r2.status_code == 200:
-                            data = r2.json()
-                            if "choices" in data and len(data["choices"]) > 0:
-                                content = data["choices"][0].get("message", {}).get("content", "")
+                            data2 = r2.json()
+                            print(f"GPTunneL API response (alt auth): {str(data2)[:1000]}")
+                            # Используем ту же логику извлечения контента
+                            content = None
+                            if "choices" in data2 and len(data2["choices"]) > 0:
+                                choice = data2["choices"][0]
+                                if isinstance(choice, dict):
+                                    if "message" in choice:
+                                        content = choice["message"].get("content", "")
+                                    elif "text" in choice:
+                                        content = choice.get("text", "")
+                            if content:
                                 if len(content) > 200:
                                     content = content[:197] + "..."
                                 return content.strip(), None
-                    except:
+                    except Exception as e:
+                        print(f"Alt auth attempt failed: {e}")
                         pass
                 
                 error_msg = f"HTTP {r.status_code}: {error_detail}"
@@ -166,16 +176,48 @@ async def generate_summary(issue_data: dict) -> tuple[Optional[str], Optional[st
             except Exception as e:
                 return None, f"Ошибка парсинга JSON ответа: {str(e)}"
             
-            if "choices" in data and len(data["choices"]) > 0:
-                content = data["choices"][0].get("message", {}).get("content", "")
-                if not content:
-                    return None, "API вернул пустой ответ"
-                # Обрезаем до 200 символов если превышает
-                if len(content) > 200:
-                    content = content[:197] + "..."
-                return content.strip(), None
+            # Логируем полный ответ для отладки (первые 1000 символов)
+            response_str = str(data)[:1000]
+            print(f"GPTunneL API response: {response_str}")
             
-            return None, f"Неожиданный формат ответа API: {data}"
+            # Проверяем разные варианты структуры ответа
+            content = None
+            
+            # Вариант 1: стандартный OpenAI формат
+            if "choices" in data and len(data["choices"]) > 0:
+                choice = data["choices"][0]
+                if isinstance(choice, dict):
+                    # Проверяем разные варианты структуры
+                    if "message" in choice:
+                        content = choice["message"].get("content", "")
+                    elif "text" in choice:
+                        content = choice.get("text", "")
+                    elif "delta" in choice and "content" in choice["delta"]:
+                        content = choice["delta"].get("content", "")
+            
+            # Вариант 2: прямой ответ в корне
+            if not content and "text" in data:
+                content = data.get("text", "")
+            
+            # Вариант 3: ответ в поле result
+            if not content and "result" in data:
+                result = data["result"]
+                if isinstance(result, dict):
+                    if "alternatives" in result and len(result["alternatives"]) > 0:
+                        content = result["alternatives"][0].get("message", {}).get("text", "")
+                    elif "text" in result:
+                        content = result.get("text", "")
+                elif isinstance(result, str):
+                    content = result
+            
+            if not content:
+                # Логируем структуру ответа для диагностики
+                return None, f"API вернул пустой ответ. Структура ответа: {list(data.keys()) if isinstance(data, dict) else type(data)}"
+            
+            # Обрезаем до 200 символов если превышает
+            if len(content) > 200:
+                content = content[:197] + "..."
+            return content.strip(), None
     except httpx.TimeoutException:
         error_msg = "Превышено время ожидания ответа от GPTunneL API (30 сек)"
         print(f"GPTunneL API timeout")
