@@ -450,12 +450,17 @@ async def cl_my(m: Message):
             return
 
         lines = ["Задачи с чеклистами, где ты исполнитель пункта:"]
+        issue_counter = 1
+        item_counter = 1
         for iss in issues:
             updated = _fmt_date(iss.get("updatedAt"))
             date_str = f" (обновлено: {updated})" if updated else ""
-            lines.append(f"\n{iss.get('key')} — {iss.get('summary')}{date_str}\n{iss.get('url')}")
+            # Add issue number before ISSUE-KEY
+            lines.append(f"\n{issue_counter}. {iss.get('key')} — {iss.get('summary')}{date_str}\n{iss.get('url')}")
             for item in iss.get("items", []):
-                lines.append("  " + _fmt_item(item))
+                lines.append("  " + _fmt_item(item, item_counter))
+                item_counter += 1
+            issue_counter += 1
 
         await m.answer("\n".join(lines))
     except httpx.TimeoutException:
@@ -501,13 +506,15 @@ async def cl_my_open(m: Message):
 
         lines = ["Неотмеченные пункты чеклиста, где ты исполнитель:"]
         kb = InlineKeyboardBuilder()
+        issue_counter = 1
         item_counter = 1
         item_mapping = {}  # Store mapping: counter -> (issue_key, item_id)
         
         for iss in issues:
             updated = _fmt_date(iss.get("updatedAt"))
             date_str = f" (обновлено: {updated})" if updated else ""
-            lines.append(f"\n{iss.get('key')} — {iss.get('summary')}{date_str}\n{iss.get('url')}")
+            # Add issue number before ISSUE-KEY
+            lines.append(f"\n{issue_counter}. {iss.get('key')} — {iss.get('summary')}{date_str}\n{iss.get('url')}")
             
             for item in iss.get("items", []):
                 if not item.get("checked", False):  # Only show unchecked items
@@ -520,6 +527,7 @@ async def cl_my_open(m: Message):
                     button_text = f"✅ {item_counter}"
                     kb.button(text=button_text, callback_data=f"check:{issue_key}:{item_id}:{item_counter}")
                     item_counter += 1
+            issue_counter += 1
         
         if item_counter == 1:
             # No unchecked items
