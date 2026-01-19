@@ -4,7 +4,8 @@ import httpx
 
 GPTUNNEL_API_KEY = os.getenv("GPTUNNEL_API_KEY", "")
 GPTUNNEL_API_URL = "https://gptunnel.ru/v1/chat/completions"
-GPTUNNEL_MODEL = "gpt-5-nano"  # GPT 5 Nano
+# Попробуем разные варианты названия модели
+GPTUNNEL_MODEL = os.getenv("GPTUNNEL_MODEL", "gpt-5-nano")  # GPT 5 Nano, можно переопределить через env
 
 
 def _build_prompt(issue_data: dict) -> str:
@@ -152,6 +153,21 @@ async def generate_summary(issue_data: dict) -> tuple[Optional[str], Optional[st
         "Content-Type": "application/json"
     }
     
+    # Ограничиваем длину промпта, чтобы избежать проблем с токенами
+    # Обрезаем описание и другие поля если промпт слишком длинный
+    max_prompt_length = 3000  # Максимальная длина промпта
+    if len(prompt) > max_prompt_length:
+        # Обрезаем описание задачи
+        desc_start = prompt.find("Описание:\n")
+        if desc_start > 0:
+            desc_end = prompt.find("\n\nЧеклист:", desc_start)
+            if desc_end > 0:
+                desc_section = prompt[desc_start:desc_end]
+                if len(desc_section) > 500:
+                    # Обрезаем описание до 500 символов
+                    new_desc = prompt[:desc_start] + "Описание:\n" + prompt[desc_start+10:desc_start+510] + "...\n\nЧеклист:" + prompt[desc_end+2:]
+                    prompt = new_desc
+    
     payload = {
         "model": GPTUNNEL_MODEL,
         "messages": [
@@ -165,9 +181,11 @@ async def generate_summary(issue_data: dict) -> tuple[Optional[str], Optional[st
             }
         ],
         "useWalletBalance": True,
-        "max_tokens": 150,  # Ограничиваем для краткости (200 символов ≈ 50-70 токенов, но берем с запасом)
+        "max_tokens": 200,  # Увеличиваем лимит токенов для ответа
         "temperature": 0.7
     }
+    
+    print(f"Request payload: model={GPTUNNEL_MODEL}, prompt_length={len(prompt)}, max_tokens={payload['max_tokens']}")
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -218,20 +236,49 @@ async def generate_summary(issue_data: dict) -> tuple[Optional[str], Optional[st
             # Извлекаем контент используя универсальную функцию
             content = _extract_content_from_response(data)
             
+            # Проверяем finish_reason для диагностики
+            finish_reason = None
+            if "choices" in data and len(data["choices"]) > 0:
+                choice = data["choices"][0]
+                if isinstance(choice, dict):
+                    finish_reason = choice.get("finish_reason")
+            
             if not content:
                 # Логируем детальную структуру для диагностики
                 choice_info = ""
                 if "choices" in data and len(data["choices"]) > 0:
                     choice = data["choices"][0]
                     choice_info = f", choice keys: {list(choice.keys()) if isinstance(choice, dict) else 'not dict'}"
-                    if isinstance(choice, dict) and "message" in choice:
-                        msg = choice["message"]
-                        choice_info += f", message keys: {list(msg.keys()) if isinstance(msg, dict) else 'not dict'}"
-                        if isinstance(msg, dict):
-                            choice_info += f", message content type: {type(msg.get('content', None))}"
-                            choice_info += f", message content value: {repr(msg.get('content', ''))[:100]}"
+                    if isinstance(choice, dict):
+                        choice_info += f", finish_reason: {choice.get('finish_reason', 'not set')}"
+                        if "message" in choice:
+                            msg = choice["message"]
+                            choice_info += f", message keys: {list(msg.keys()) if isinstance(msg, dict) else 'not dict'}"
+                            if isinstance(msg, dict):
+                                choice_info += f", message content type: {type(msg.get('content', None))}"
+                                choice_info += f", message content value: {repr(msg.get('content', ''))[:100]}"
                 
-                return None, f"API вернул пустой ответ. Структура: {list(data.keys()) if isinstance(data, dict) else type(data)}{choice_info}"
+                error_msg = f"API вернул пустой ответ"
+                if finish_reason:
+                    error_msg += f". Finish reason: {finish_reason}"
+                    if finish_reason == "length":
+                        error_msg += " (ответ обрезан из-за лимита токенов - попробуйте увеличить max_tokens)"
+                    elif finish_reason == "content_filter":
+                        error_msg += " (ответ отфильтрован модерацией)"
+                    elif finish_reason == "stop":
+                        error_msg += " (модель остановилась, но контент пустой - возможно модель недоступна или не поддерживает запрос)"
+                    else:
+                        error_msg += f" (неизвестная причина: {finish_reason})"
+                else:
+                    error_msg += " (finish_reason не указан)"
+                
+                # Проверяем, может быть модель недоступна
+                model_in_response = data.get("model", "")
+                if model_in_response and model_in_response != GPTUNNEL_MODEL:
+                    error_msg += f". Модель в ответе: {model_in_response} (ожидалась: {GPTUNNEL_MODEL})"
+                
+                error_msg += f". Структура: {list(data.keys()) if isinstance(data, dict) else type(data)}{choice_info}"
+                return None, error_msg
             
             # Обрезаем до 200 символов если превышает
             if len(content) > 200:
