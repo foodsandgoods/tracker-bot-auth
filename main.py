@@ -359,20 +359,45 @@ class TrackerClient:
     async def get_issue_with_changelog(self, access_token: str, issue_key: str) -> tuple[int, Any]:
         """Get issue with changelog and comments"""
         url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}"
-        # Пробуем получить задачу с расширенными данными
-        # Если не поддерживается, вернемся к обычному запросу
-        try:
-            params = {"expand": "changelog,comments"}
-            r = await self.http.get(url, headers=self._headers(access_token), params=params)
-            if r.status_code == 200:
-                return r.status_code, _safe_json(r)
-            # Если expand не поддерживается, пробуем без него
-        except Exception:
-            pass
         
-        # Fallback: обычный запрос без expand
+        # Получаем основную информацию о задаче
         r = await self.http.get(url, headers=self._headers(access_token))
-        return r.status_code, _safe_json(r)
+        if r.status_code != 200:
+            return r.status_code, _safe_json(r)
+        
+        issue_data = _safe_json(r)
+        if not isinstance(issue_data, dict):
+            return r.status_code, issue_data
+        
+        # Получаем комментарии отдельным запросом
+        try:
+            comments_url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/comments"
+            r_comments = await self.http.get(comments_url, headers=self._headers(access_token))
+            if r_comments.status_code == 200:
+                comments_data = _safe_json(r_comments)
+                if isinstance(comments_data, list):
+                    issue_data["comments"] = comments_data
+                elif isinstance(comments_data, dict) and "values" in comments_data:
+                    issue_data["comments"] = comments_data.get("values", [])
+        except Exception as e:
+            print(f"Failed to fetch comments: {e}")
+            issue_data["comments"] = []
+        
+        # Получаем историю изменений отдельным запросом
+        try:
+            changelog_url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/changelog"
+            r_changelog = await self.http.get(changelog_url, headers=self._headers(access_token))
+            if r_changelog.status_code == 200:
+                changelog_data = _safe_json(r_changelog)
+                if isinstance(changelog_data, list):
+                    issue_data["changelog"] = changelog_data
+                elif isinstance(changelog_data, dict) and "values" in changelog_data:
+                    issue_data["changelog"] = changelog_data.get("values", [])
+        except Exception as e:
+            print(f"Failed to fetch changelog: {e}")
+            issue_data["changelog"] = []
+        
+        return 200, issue_data
 
     async def patch_issue(self, access_token: str, issue_key: str, patch: dict) -> tuple[int, Any]:
         url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}"
