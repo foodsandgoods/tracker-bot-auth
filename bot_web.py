@@ -7,8 +7,7 @@ import uvicorn
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
-from aiogram.types import Message
-from aiogram.types import InlineKeyboardMarkup, CallbackQuery
+from aiogram.types import Message, InlineKeyboardMarkup, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -24,6 +23,9 @@ async def ping():
     return "pong"
 
 
+# =========================
+# Helpers
+# =========================
 def _fmt_item(item: dict) -> str:
     checked = item.get("checked", False)
     mark = "✅" if checked else "⬜"
@@ -33,6 +35,8 @@ def _fmt_item(item: dict) -> str:
     if len(text) > 120:
         text = text[:117] + "..."
     return f"{mark} {text} (id: {item_id})"
+
+
 async def _api_get(path: str, params: dict) -> tuple[int, dict]:
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(f"{BASE_URL}{path}", params=params)
@@ -87,12 +91,26 @@ def _render_settings_text(queues: list[str], days: int) -> str:
         "Выбери, что изменить:"
     )
 
+
+async def _get_settings(tg_id: int) -> tuple[list[str], int] | tuple[None, None]:
+    sc, data = await _api_get("/tg/settings", {"tg": tg_id})
+    if sc != 200:
+        return None, None
+    queues = data.get("queues", []) or []
+    days = int(data.get("days", 30))
+    return queues, days
+
+
+# =========================
+# Bot handlers
+# =========================
 @router.message(Command("start"))
 async def start(m: Message):
     await m.answer(
         "Привет! Я работаю с Yandex Tracker.\n\n"
         "/connect — привязать аккаунт\n"
-        "/me — проверить доступ\n\n"
+        "/me — проверить доступ\n"
+        "/settings — настройки очередей и периода\n\n"
         "Чеклисты:\n"
         "/cl_my — задачи, где ты назначен исполнителем пункта чеклиста\n"
         "/cl_my_open — только неотмеченные пункты\n"
@@ -144,126 +162,6 @@ async def me(m: Message):
         await m.answer(f"Tracker вернул {sc}: {data.get('response')}")
 
 
-@router.message(Command("cl_my"))
-async def cl_my(m: Message):
-    if not BASE_URL:
-        await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
-        return
-
-    tg_id = m.from_user.id
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.get(f"{BASE_URL}/tracker/checklist/assigned", params={"tg": tg_id, "limit": 10})
-
-    data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
-
-    if r.status_code != 200:
-        await m.answer(f"Ошибка {r.status_code}: {data}")
-        return
-
-    issues = data.get("issues", [])
-    if not issues:
-        await m.answer("Не нашёл задач, где ты назначен исполнителем пункта чеклиста (в выборке за 30 дней).")
-        return
-
-    lines = ["Задачи с чеклистами, где ты исполнитель пункта:"]
-    for iss in issues:
-        lines.append(f"\n{iss.get('key')} — {iss.get('summary')}\n{iss.get('url')}")
-        for item in iss.get("items", []):
-            lines.append("  " + _fmt_item(item))
-
-    await m.answer("\n".join(lines))
-
-
-@router.message(Command("cl_my_open"))
-async def cl_my_open(m: Message):
-    if not BASE_URL:
-        await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
-        return
-
-    tg_id = m.from_user.id
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.get(f"{BASE_URL}/tracker/checklist/assigned_unchecked", params={"tg": tg_id, "limit": 10})
-
-    data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
-
-    if r.status_code != 200:
-        await m.answer(f"Ошибка {r.status_code}: {data}")
-        return
-
-    issues = data.get("issues", [])
-    if not issues:
-        await m.answer("Не нашёл неотмеченных пунктов чеклиста на тебе (в выборке за 30 дней).")
-        return
-
-    lines = ["Неотмеченные пункты чеклиста, где ты исполнитель:"]
-    for iss in issues:
-        lines.append(f"\n{iss.get('key')} — {iss.get('summary')}\n{iss.get('url')}")
-        for item in iss.get("items", []):
-            # здесь items уже только unchecked, но отметку оставим наглядно
-            lines.append("  " + _fmt_item(item))
-
-    lines.append("\nЧтобы отметить пункт: /cl_done ISSUE-KEY ITEM_ID")
-    await m.answer("\n".join(lines))
-
-
-@router.message(Command("cl_done"))
-async def cl_done(m: Message):
-    if not BASE_URL:
-        await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
-        return
-
-    parts = (m.text or "").split()
-    if len(parts) != 3:
-        await m.answer("Использование: /cl_done ISSUE-KEY ITEM_ID")
-        return
-
-    _cmd, issue_key, item_id = parts
-    tg_id = m.from_user.id
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(
-            f"{BASE_URL}/tracker/checklist/check",
-            params={"tg": tg_id, "issue": issue_key, "item": item_id, "checked": True},
-        )
-
-    data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
-
-    if r.status_code != 200:
-        await m.answer(f"Ошибка {r.status_code}: {data}")
-        return
-
-    sc = data.get("status_code")
-    if sc in (200, 204):
-        await m.answer(f"Готово: отметил пункт чеклиста {item_id} в задаче {issue_key}")
-    else:
-        # часто тут будет 404/405 если отличается путь/метод — тогда пришли мне этот ответ
-        await m.answer(f"Tracker вернул {sc}: {data.get('response')}")
-        await m.answer("Если это 404/405 — пришли сюда ответ целиком, я поправлю метод/URL под твою версию API.")
-
-
-async def run_bot():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set")
-
-    bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher()
-    dp.include_router(router)
-    await dp.start_polling(bot)
-
-
-async def run_web():
-    config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
-    server = uvicorn.Server(config)
-    await server.serve()
-
-
-async def main():
-    await asyncio.gather(run_web(), run_bot())
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
 @router.message(Command("settings"))
 async def settings_cmd(m: Message):
     if not BASE_URL:
@@ -276,37 +174,35 @@ async def settings_cmd(m: Message):
         await m.answer(f"Ошибка {sc}: {data}")
         return
 
-    queues = data.get("queues", [])
+    queues = data.get("queues", []) or []
     days = int(data.get("days", 30))
     await m.answer(_render_settings_text(queues, days), reply_markup=_kb_settings_main())
 
+
 @router.callback_query()
 async def settings_callbacks(c: CallbackQuery):
+    if not c.data or not c.data.startswith("st:"):
+        return
+
     if not BASE_URL:
         await c.answer("BASE_URL не задан", show_alert=True)
         return
 
-    if not c.data or not c.data.startswith("st:"):
-        return
-
     tg_id = c.from_user.id
 
-    # всегда читаем актуальные настройки
     sc, data = await _api_get("/tg/settings", {"tg": tg_id})
     if sc != 200:
         await c.answer(f"Ошибка {sc}", show_alert=True)
         return
 
-    queues = data.get("queues", [])
+    queues = data.get("queues", []) or []
     days = int(data.get("days", 30))
 
     parts = c.data.split(":", 2)
-
     action = parts[1] if len(parts) > 1 else ""
     arg = parts[2] if len(parts) > 2 else ""
 
     if action == "close":
-        # удалить клавиатуру и “закрыть”
         if c.message:
             await c.message.edit_reply_markup(reply_markup=None)
         await c.answer("Ок")
@@ -349,8 +245,7 @@ async def settings_callbacks(c: CallbackQuery):
             await c.answer(f"Ошибка {sc2}", show_alert=True)
             return
 
-        queues2 = data2.get("queues", [])
-        days2 = int(data2.get("days", days))
+        queues2 = data2.get("queues", []) or []
         if c.message:
             await c.message.edit_reply_markup(reply_markup=_kb_settings_queues(queues2))
         await c.answer("Сохранено")
@@ -368,7 +263,6 @@ async def settings_callbacks(c: CallbackQuery):
             await c.answer(f"Ошибка {sc2}", show_alert=True)
             return
 
-        queues2 = data2.get("queues", queues)
         days2 = int(data2.get("days", d))
         if c.message:
             await c.message.edit_reply_markup(reply_markup=_kb_settings_days(days2))
@@ -376,3 +270,129 @@ async def settings_callbacks(c: CallbackQuery):
         return
 
     await c.answer()
+
+
+@router.message(Command("cl_my"))
+async def cl_my(m: Message):
+    if not BASE_URL:
+        await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
+        return
+
+    tg_id = m.from_user.id
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.get(f"{BASE_URL}/tracker/checklist/assigned", params={"tg": tg_id, "limit": 10})
+
+    data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
+
+    if r.status_code != 200:
+        await m.answer(f"Ошибка {r.status_code}: {data}")
+        return
+
+    issues = data.get("issues", [])
+    if not issues:
+        settings = data.get("settings") or {}
+        days = settings.get("days", 30)
+        await m.answer(f"Не нашёл задач, где ты назначен исполнителем пункта чеклиста (в выборке за {days} дней).")
+        return
+
+    lines = ["Задачи с чеклистами, где ты исполнитель пункта:"]
+    for iss in issues:
+        lines.append(f"\n{iss.get('key')} — {iss.get('summary')}\n{iss.get('url')}")
+        for item in iss.get("items", []):
+            lines.append("  " + _fmt_item(item))
+
+    await m.answer("\n".join(lines))
+
+
+@router.message(Command("cl_my_open"))
+async def cl_my_open(m: Message):
+    if not BASE_URL:
+        await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
+        return
+
+    tg_id = m.from_user.id
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.get(f"{BASE_URL}/tracker/checklist/assigned_unchecked", params={"tg": tg_id, "limit": 10})
+
+    data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
+
+    if r.status_code != 200:
+        await m.answer(f"Ошибка {r.status_code}: {data}")
+        return
+
+    issues = data.get("issues", [])
+    if not issues:
+        settings = data.get("settings") or {}
+        days = settings.get("days", 30)
+        await m.answer(f"Не нашёл неотмеченных пунктов чеклиста на тебе (в выборке за {days} дней).")
+        return
+
+    lines = ["Неотмеченные пункты чеклиста, где ты исполнитель:"]
+    for iss in issues:
+        lines.append(f"\n{iss.get('key')} — {iss.get('summary')}\n{iss.get('url')}")
+        for item in iss.get("items", []):
+            lines.append("  " + _fmt_item(item))
+
+    lines.append("\nЧтобы отметить пункт: /cl_done ISSUE-KEY ITEM_ID")
+    await m.answer("\n".join(lines))
+
+
+@router.message(Command("cl_done"))
+async def cl_done(m: Message):
+    if not BASE_URL:
+        await m.answer("Ошибка: BASE_URL не задан (адрес auth-сервиса).")
+        return
+
+    parts = (m.text or "").split()
+    if len(parts) != 3:
+        await m.answer("Использование: /cl_done ISSUE-KEY ITEM_ID")
+        return
+
+    _cmd, issue_key, item_id = parts
+    tg_id = m.from_user.id
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{BASE_URL}/tracker/checklist/check",
+            params={"tg": tg_id, "issue": issue_key, "item": item_id, "checked": True},
+        )
+
+    data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
+
+    if r.status_code != 200:
+        await m.answer(f"Ошибка {r.status_code}: {data}")
+        return
+
+    sc = data.get("status_code")
+    if sc in (200, 204):
+        await m.answer(f"Готово: отметил пункт чеклиста {item_id} в задаче {issue_key}")
+    else:
+        await m.answer(f"Tracker вернул {sc}: {data.get('response')}")
+        await m.answer("Если это 404/405 — пришли сюда ответ целиком, я поправлю метод/URL под твою версию API.")
+
+
+# =========================
+# Run web + bot
+# =========================
+async def run_bot():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set")
+
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
+    await dp.start_polling(bot)
+
+
+async def run_web():
+    config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
+async def main():
+    await asyncio.gather(run_web(), run_bot())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
