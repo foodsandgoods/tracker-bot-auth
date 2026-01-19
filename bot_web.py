@@ -232,7 +232,7 @@ async def menu(m: Message):
         "/settings — настройки очередей, периода и лимита\n\n"
         "✅ Чеклисты:\n"
         "/cl_my — задачи, где ты назначен исполнителем пункта чеклиста\n"
-        "/cl_my_open — только неотмеченные пункты\n"
+        "/cl_my_open — ожидают мое согласование\n"
         "/cl_done ISSUE-KEY ITEM_ID — отметить пункт чеклиста"
     )
     await m.answer(menu_text)
@@ -532,11 +532,11 @@ async def cl_my_open(m: Message):
         issues = data.get("issues", [])
         if not issues:
             days = data.get("settings", {}).get("days", 30)
-            await m.answer(f"Не нашёл неотмеченных пунктов чеклиста на тебе (в выборке за {days} дней).")
+            await m.answer(f"Не нашёл пунктов, ожидающих твоего согласования (в выборке за {days} дней).")
             return
 
         lines, kb, item_mapping = _build_checklist_lines(
-            issues, "Неотмеченные пункты чеклиста, где ты исполнитель:", 
+            issues, "Ожидают мое согласование:", 
             include_checked=False, add_buttons=True
         )
         
@@ -650,7 +650,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="me", description="👤 Проверить доступ"),
         BotCommand(command="settings", description="⚙️ Настройки"),
         BotCommand(command="cl_my", description="✅ Мои задачи с чеклистами"),
-        BotCommand(command="cl_my_open", description="📝 Неотмеченные пункты"),
+        BotCommand(command="cl_my_open", description="⬜ Ожидают мое согласование"),
         BotCommand(command="done", description="✅ Отметить пункт по номеру"),
     ]
     await bot.set_my_commands(commands)
