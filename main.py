@@ -131,8 +131,16 @@ class TokenStorage:
                         tg_id BIGINT PRIMARY KEY,
                         queues_csv TEXT NOT NULL DEFAULT '',
                         days INT NOT NULL DEFAULT 30,
+                        limit_results INT NOT NULL DEFAULT 10,
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
+                    """
+                )
+                # Add limit_results column if it doesn't exist (for existing databases)
+                await cur.execute(
+                    """
+                    ALTER TABLE tg_settings
+                    ADD COLUMN IF NOT EXISTS limit_results INT NOT NULL DEFAULT 10;
                     """
                 )
             await conn.commit()
@@ -216,9 +224,9 @@ class TokenStorage:
         await self.ensure_settings_row(tg_id)
         async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT queues_csv, days FROM tg_settings WHERE tg_id=%s", (tg_id,))
+                await cur.execute("SELECT queues_csv, days, limit_results FROM tg_settings WHERE tg_id=%s", (tg_id,))
                 row = await cur.fetchone()
-        return row or {"queues_csv": "", "days": 30}
+        return row or {"queues_csv": "", "days": 30, "limit_results": 10}
 
     async def set_queues(self, tg_id: int, queues_csv: str) -> None:
         q = _normalize_queues_csv(queues_csv)
@@ -249,6 +257,22 @@ class TokenStorage:
                         updated_at = NOW();
                     """,
                     (tg_id, days),
+                )
+            await conn.commit()
+
+    async def set_limit(self, tg_id: int, limit: int) -> None:
+        limit = max(1, min(int(limit), 100))
+        async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO tg_settings (tg_id, limit_results, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (tg_id) DO UPDATE SET
+                        limit_results = EXCLUDED.limit_results,
+                        updated_at = NOW();
+                    """,
+                    (tg_id, limit),
                 )
             await conn.commit()
 
@@ -404,7 +428,7 @@ class TrackerService:
 
     async def settings_get(self, tg_id: int) -> dict:
         s = await self.storage.get_settings(tg_id)
-        return {"http_status": 200, "body": {"queues": _queues_list(s.get("queues_csv", "")), "days": s.get("days", 30)}}
+        return {"http_status": 200, "body": {"queues": _queues_list(s.get("queues_csv", "")), "days": s.get("days", 30), "limit": s.get("limit_results", 10)}}
 
     async def settings_set_queues(self, tg_id: int, queues_csv: str) -> dict:
         await self.storage.set_queues(tg_id, queues_csv)
@@ -412,6 +436,10 @@ class TrackerService:
 
     async def settings_set_days(self, tg_id: int, days: int) -> dict:
         await self.storage.set_days(tg_id, days)
+        return await self.settings_get(tg_id)
+
+    async def settings_set_limit(self, tg_id: int, limit: int) -> dict:
+        await self.storage.set_limit(tg_id, limit)
         return await self.settings_get(tg_id)
 
     def _build_candidate_query(self, queues: list[str], days: int) -> str:
@@ -442,6 +470,9 @@ class TrackerService:
         s = await self.storage.get_settings(tg_id)
         queues = _queues_list(s.get("queues_csv", ""))
         days = int(s.get("days", 30))
+        # Use limit from settings if not provided as parameter
+        if limit == 10:  # default value
+            limit = int(s.get("limit_results", 10))
 
         query = self._build_candidate_query(queues, days)
         st, payload = await self.tracker.search_issues(access, query=query, limit=50)
@@ -685,6 +716,16 @@ async def tg_settings_days(tg: int, days: int):
         return cfg_err
     assert _service is not None
     result = await _service.settings_set_days(tg, days)
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.post("/tg/settings/limit")
+async def tg_settings_limit(tg: int, limit: int):
+    cfg_err = _require(settings)
+    if cfg_err:
+        return cfg_err
+    assert _service is not None
+    result = await _service.settings_set_limit(tg, limit)
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 

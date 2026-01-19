@@ -55,8 +55,9 @@ def _kb_settings_main() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="Очереди", callback_data="st:queues")
     kb.button(text="Период", callback_data="st:days")
+    kb.button(text="Лимит", callback_data="st:limit")
     kb.button(text="Закрыть", callback_data="st:close")
-    kb.adjust(2, 1)
+    kb.adjust(2, 1, 1)
     return kb.as_markup()
 
 
@@ -82,23 +83,36 @@ def _kb_settings_days(days: int) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def _render_settings_text(queues: list[str], days: int) -> str:
+def _kb_settings_limit(limit: int) -> InlineKeyboardMarkup:
+    options = [5, 10, 15, 20, 30, 50]
+    kb = InlineKeyboardBuilder()
+    for l in options:
+        mark = "✅" if int(limit) == l else "⬜"
+        kb.button(text=f"{mark} {l}", callback_data=f"st:lset:{l}")
+    kb.button(text="Назад", callback_data="st:back")
+    kb.adjust(3, 3)
+    return kb.as_markup()
+
+
+def _render_settings_text(queues: list[str], days: int, limit: int) -> str:
     q = ", ".join(queues) if queues else "(все очереди)"
     return (
         "Настройки поиска чеклистов:\n"
         f"• Очереди: {q}\n"
-        f"• Период: {days} дней\n\n"
+        f"• Период: {days} дней\n"
+        f"• Лимит результатов: {limit}\n\n"
         "Выбери, что изменить:"
     )
 
 
-async def _get_settings(tg_id: int) -> tuple[list[str], int] | tuple[None, None]:
+async def _get_settings(tg_id: int) -> tuple[list[str], int, int] | tuple[None, None, None]:
     sc, data = await _api_get("/tg/settings", {"tg": tg_id})
     if sc != 200:
-        return None, None
+        return None, None, None
     queues = data.get("queues", []) or []
     days = int(data.get("days", 30))
-    return queues, days
+    limit = int(data.get("limit", 10))
+    return queues, days, limit
 
 
 # =========================
@@ -176,7 +190,8 @@ async def settings_cmd(m: Message):
 
     queues = data.get("queues", []) or []
     days = int(data.get("days", 30))
-    await m.answer(_render_settings_text(queues, days), reply_markup=_kb_settings_main())
+    limit = int(data.get("limit", 10))
+    await m.answer(_render_settings_text(queues, days, limit), reply_markup=_kb_settings_main())
 
 
 @router.callback_query()
@@ -197,6 +212,7 @@ async def settings_callbacks(c: CallbackQuery):
 
     queues = data.get("queues", []) or []
     days = int(data.get("days", 30))
+    limit = int(data.get("limit", 10))
 
     parts = c.data.split(":", 2)
     action = parts[1] if len(parts) > 1 else ""
@@ -210,7 +226,7 @@ async def settings_callbacks(c: CallbackQuery):
 
     if action == "back":
         if c.message:
-            await c.message.edit_text(_render_settings_text(queues, days), reply_markup=_kb_settings_main())
+            await c.message.edit_text(_render_settings_text(queues, days, limit), reply_markup=_kb_settings_main())
         await c.answer()
         return
 
@@ -228,6 +244,15 @@ async def settings_callbacks(c: CallbackQuery):
             await c.message.edit_text(
                 "Настройки → Период (за сколько дней искать обновлённые задачи):",
                 reply_markup=_kb_settings_days(days),
+            )
+        await c.answer()
+        return
+
+    if action == "limit":
+        if c.message:
+            await c.message.edit_text(
+                "Настройки → Лимит результатов (сколько задач выводить):",
+                reply_markup=_kb_settings_limit(limit),
             )
         await c.answer()
         return
@@ -269,6 +294,24 @@ async def settings_callbacks(c: CallbackQuery):
         await c.answer("Сохранено")
         return
 
+    if action == "lset":
+        try:
+            l = int(arg)
+        except Exception:
+            await c.answer("Некорректное число", show_alert=True)
+            return
+
+        sc2, data2 = await _api_post("/tg/settings/limit", {"tg": tg_id, "limit": l})
+        if sc2 != 200:
+            await c.answer(f"Ошибка {sc2}", show_alert=True)
+            return
+
+        limit2 = int(data2.get("limit", l))
+        if c.message:
+            await c.message.edit_reply_markup(reply_markup=_kb_settings_limit(limit2))
+        await c.answer("Сохранено")
+        return
+
     await c.answer()
 
 
@@ -279,8 +322,12 @@ async def cl_my(m: Message):
         return
 
     tg_id = m.from_user.id
+    # Get limit from settings
+    sc, data = await _api_get("/tg/settings", {"tg": tg_id})
+    limit = int(data.get("limit", 10)) if sc == 200 else 10
+    
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.get(f"{BASE_URL}/tracker/checklist/assigned", params={"tg": tg_id, "limit": 15})
+        r = await client.get(f"{BASE_URL}/tracker/checklist/assigned", params={"tg": tg_id, "limit": limit})
 
     data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
 
@@ -311,8 +358,12 @@ async def cl_my_open(m: Message):
         return
 
     tg_id = m.from_user.id
+    # Get limit from settings
+    sc, data = await _api_get("/tg/settings", {"tg": tg_id})
+    limit = int(data.get("limit", 10)) if sc == 200 else 10
+    
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.get(f"{BASE_URL}/tracker/checklist/assigned_unchecked", params={"tg": tg_id, "limit": 15})
+        r = await client.get(f"{BASE_URL}/tracker/checklist/assigned_unchecked", params={"tg": tg_id, "limit": limit})
 
     data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
 
