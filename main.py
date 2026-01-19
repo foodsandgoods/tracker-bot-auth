@@ -480,9 +480,9 @@ class TrackerService:
             limit = int(s.get("limit_results", 10))
 
         query = self._build_candidate_query(queues, days)
-        # Optimized search limit for low-resource servers:
-        # Reduced multiplier and max limit to minimize API calls
-        search_limit = min(max(30, limit * 3), 100)  # Between 30 and 100 issues (reduced from 200)
+        # Increase search limit to get more results from all queues
+        # Need more issues to find matches across all selected queues
+        search_limit = min(max(50, limit * 5), 150)  # Between 50 and 150 issues
         st, payload = await self.tracker.search_issues(access, query=query, limit=search_limit)
         if st != 200:
             return {"http_status": 200, "body": {"status_code": st, "response": payload, "query": query}}
@@ -506,8 +506,8 @@ class TrackerService:
         issues_by_key = {it.get("key"): it for it in issues if it.get("key")}
         issue_keys = list(issues_by_key.keys())
         
-        # Further limit processing for low-resource servers
-        max_keys_to_process = min(len(issue_keys), 80)  # Reduced from 150 to 80
+        # Process more issues to get results from all queues
+        max_keys_to_process = min(len(issue_keys), 120)  # Increased to get more from all queues
         issue_keys = issue_keys[:max_keys_to_process]
         
         # Fetch all issues in parallel for better performance
@@ -521,33 +521,26 @@ class TrackerService:
                 pass
             return key, None
         
-        # Adaptive batch size for low-resource servers
-        # Smaller batches reduce memory and CPU usage
-        batch_size = 15  # Reduced from 30 to 15 for better resource management
+        # Optimized batch size - balance between speed and resource usage
+        batch_size = 20  # Increased for better parallelism
         result: list[dict] = []
         
-        # Process batches with early exit optimization
+        # Process batches - process more to ensure we get results from all queues
         for i in range(0, len(issue_keys), batch_size):
-            # Early exit if we have enough results
-            if len(result) >= limit:
-                break
-            
-            # Calculate remaining needed
-            remaining_needed = limit - len(result)
-            if remaining_needed <= 0:
+            # Process more batches to get results from all queues
+            # Only exit if we have significantly more results than needed
+            if len(result) >= limit * 2:  # Process 2x to get diversity from all queues
                 break
                 
             batch_keys = issue_keys[i:i + batch_size]
-            # Use asyncio.gather with return_exceptions for better error handling
             batch_results = await asyncio.gather(
                 *[fetch_issue(key) for key in batch_keys],
                 return_exceptions=True
             )
             
             for result_item in batch_results:
-                # Early exit check
-                if len(result) >= limit:
-                    break
+                # Don't exit early - we need to process more to get results from all queues
+                # The final filtering will happen after all processing
                     
                 # Handle exceptions from gather
                 if isinstance(result_item, Exception):
@@ -596,6 +589,34 @@ class TrackerService:
                             "items": matched_items,
                         }
                     )
+        
+        # Limit results to requested amount, but keep diversity from all queues
+        if len(result) > limit:
+            # Try to keep results from different queues
+            result_by_queue: dict[str, list[dict]] = {}
+            for r in result:
+                queue = r["key"].split("-")[0] if "-" in r["key"] else "UNKNOWN"
+                if queue not in result_by_queue:
+                    result_by_queue[queue] = []
+                result_by_queue[queue].append(r)
+            
+            # Take results from each queue proportionally
+            final_result = []
+            per_queue = max(1, limit // max(len(result_by_queue), 1))
+            for queue_results in result_by_queue.values():
+                final_result.extend(queue_results[:per_queue])
+                if len(final_result) >= limit:
+                    break
+            
+            # Fill remaining slots if needed
+            if len(final_result) < limit:
+                for r in result:
+                    if r not in final_result:
+                        final_result.append(r)
+                        if len(final_result) >= limit:
+                            break
+            
+            result = final_result[:limit]
 
         return {
             "http_status": 200,
