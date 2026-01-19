@@ -8,7 +8,7 @@ import uvicorn
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, CallbackQuery
+from aiogram.types import Message, InlineKeyboardMarkup, CallbackQuery, BotCommand
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -147,14 +147,25 @@ async def _get_settings(tg_id: int) -> tuple[list[str], int, int] | tuple[None, 
 async def start(m: Message):
     await m.answer(
         "Привет! Я работаю с Yandex Tracker.\n\n"
+        "Используй /menu для просмотра всех команд."
+    )
+
+
+@router.message(Command("menu"))
+async def menu(m: Message):
+    menu_text = (
+        "📋 Меню команд:\n\n"
+        "🔗 Подключение:\n"
         "/connect — привязать аккаунт\n"
-        "/me — проверить доступ\n"
-        "/settings — настройки очередей и периода\n\n"
-        "Чеклисты:\n"
+        "/me — проверить доступ\n\n"
+        "⚙️ Настройки:\n"
+        "/settings — настройки очередей, периода и лимита\n\n"
+        "✅ Чеклисты:\n"
         "/cl_my — задачи, где ты назначен исполнителем пункта чеклиста\n"
         "/cl_my_open — только неотмеченные пункты\n"
         "/cl_done ISSUE-KEY ITEM_ID — отметить пункт чеклиста"
     )
+    await m.answer(menu_text)
 
 
 @router.message(Command("connect"))
@@ -454,11 +465,25 @@ async def cl_done(m: Message):
 # =========================
 # Run web + bot
 # =========================
+async def setup_bot_commands(bot: Bot):
+    """Set up bot commands menu"""
+    commands = [
+        BotCommand(command="menu", description="📋 Показать меню команд"),
+        BotCommand(command="connect", description="🔗 Привязать аккаунт"),
+        BotCommand(command="me", description="👤 Проверить доступ"),
+        BotCommand(command="settings", description="⚙️ Настройки"),
+        BotCommand(command="cl_my", description="✅ Мои задачи с чеклистами"),
+        BotCommand(command="cl_my_open", description="📝 Неотмеченные пункты"),
+    ]
+    await bot.set_my_commands(commands)
+
+
 async def run_bot():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
 
     bot = Bot(token=BOT_TOKEN)
+    await setup_bot_commands(bot)
     dp = Dispatcher()
     dp.include_router(router)
     await dp.start_polling(bot)
