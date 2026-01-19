@@ -537,11 +537,14 @@ class TrackerService:
                 if matched_items:
                     # Find original issue summary
                     orig_issue = next((it for it in issues if it.get("key") == key), {})
+                    # Extract updated date from issue
+                    updated_at = issue_full.get("updatedAt") or issue_full.get("updated") or orig_issue.get("updatedAt") or orig_issue.get("updated")
                     result.append(
                         {
                             "key": key,
                             "summary": orig_issue.get("summary") or issue_full.get("summary"),
                             "url": f"https://tracker.yandex.ru/{key}",
+                            "updatedAt": updated_at,
                             "items": matched_items,
                         }
                     )

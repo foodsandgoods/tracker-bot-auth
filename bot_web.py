@@ -1,5 +1,6 @@
 import os
 import asyncio
+from datetime import datetime
 
 import httpx
 from fastapi import FastAPI
@@ -35,6 +36,30 @@ def _fmt_item(item: dict) -> str:
     if len(text) > 120:
         text = text[:117] + "..."
     return f"{mark} {text} (id: {item_id})"
+
+
+def _fmt_date(date_str: str | None) -> str:
+    """Format ISO date string to readable format (DD.MM.YYYY HH:MM)"""
+    if not date_str:
+        return ""
+    try:
+        # Yandex Tracker typically uses ISO format: "2024-01-15T10:30:00.000+0300" or "2024-01-15T10:30:00Z"
+        # Remove timezone info if present and parse
+        clean_date = date_str.replace("Z", "+00:00")
+        # Handle format like "2024-01-15T10:30:00.000+0300" -> "2024-01-15T10:30:00+03:00"
+        if "+" in clean_date and len(clean_date.split("+")[1]) == 4:
+            tz_part = clean_date.split("+")[1]
+            clean_date = clean_date.replace(f"+{tz_part}", f"+{tz_part[:2]}:{tz_part[2:]}")
+        dt = datetime.fromisoformat(clean_date)
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        # Fallback: try simple format without timezone
+        try:
+            dt = datetime.strptime(date_str[:19], "%Y-%m-%dT%H:%M:%S")
+            return dt.strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            # Last resort: return first 16 chars if available
+            return date_str[:16] if len(date_str) > 16 else date_str
 
 
 async def _api_get(path: str, params: dict) -> tuple[int, dict]:
@@ -344,7 +369,9 @@ async def cl_my(m: Message):
 
     lines = ["Задачи с чеклистами, где ты исполнитель пункта:"]
     for iss in issues:
-        lines.append(f"\n{iss.get('key')} — {iss.get('summary')}\n{iss.get('url')}")
+        updated = _fmt_date(iss.get("updatedAt"))
+        date_str = f" (обновлено: {updated})" if updated else ""
+        lines.append(f"\n{iss.get('key')} — {iss.get('summary')}{date_str}\n{iss.get('url')}")
         for item in iss.get("items", []):
             lines.append("  " + _fmt_item(item))
 
@@ -380,7 +407,9 @@ async def cl_my_open(m: Message):
 
     lines = ["Неотмеченные пункты чеклиста, где ты исполнитель:"]
     for iss in issues:
-        lines.append(f"\n{iss.get('key')} — {iss.get('summary')}\n{iss.get('url')}")
+        updated = _fmt_date(iss.get("updatedAt"))
+        date_str = f" (обновлено: {updated})" if updated else ""
+        lines.append(f"\n{iss.get('key')} — {iss.get('summary')}{date_str}\n{iss.get('url')}")
         for item in iss.get("items", []):
             lines.append("  " + _fmt_item(item))
 
