@@ -18,7 +18,7 @@ import httpx
 from fastapi import FastAPI
 import uvicorn
 
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, CallbackQuery, BotCommand
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -178,6 +178,27 @@ def fmt_date(date_str: Optional[str]) -> str:
         return date_str[:16] if len(date_str) > 16 else date_str
 
 
+def escape_md(text: str) -> str:
+    """Escape special characters for Telegram Markdown."""
+    for ch in ('_', '*', '`', '['):
+        text = text.replace(ch, f'\\{ch}')
+    return text
+
+
+def fmt_issue_link(issue: dict, prefix: str = "") -> str:
+    """Format issue as Markdown hyperlink: [KEY: Summary (date)](url)"""
+    key = issue.get("key", "")
+    summary = escape_md((issue.get("summary") or "")[:60])
+    url = issue.get("url") or f"https://tracker.yandex.ru/{key}"
+    date_str = fmt_date(issue.get("updatedAt"))
+    
+    if date_str:
+        text = f"{prefix}[{key}: {summary} ({date_str})]({url})"
+    else:
+        text = f"{prefix}[{key}: {summary}]({url})"
+    return text
+
+
 def parse_response(r: httpx.Response) -> dict:
     """Parse HTTP response to dict."""
     if "application/json" in r.headers.get("content-type", ""):
@@ -306,11 +327,7 @@ def build_checklist_response(
     item_num = 1
     
     for idx, issue in enumerate(issues, 1):
-        date_str = fmt_date(issue.get("updatedAt"))
-        lines.append(f"\n{idx}. {issue.get('key')} — {issue.get('summary')}")
-        if date_str:
-            lines[-1] += f" ({date_str})"
-        lines.append(issue.get("url", ""))
+        lines.append(f"\n{idx}. {fmt_issue_link(issue)}")
         
         for item in issue.get("items", []):
             is_checked = item.get("checked", False)
@@ -404,12 +421,12 @@ async def cmd_cl_my(m: Message):
         await m.answer(f"Нет задач за {days} дней")
         return
     
-    text, _, item_mapping = build_checklist_response(issues, "📋 Мои чеклисты:")
+    text, _, item_mapping = build_checklist_response(issues, "📋 *Мои чеклисты:*")
     state.checklist_cache.set(f"cl:{tg_id}", item_mapping)
     
     # Split long messages
     for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-        await m.answer(chunk)
+        await m.answer(chunk, parse_mode="Markdown")
 
 
 @router.message(Command("mentions"))
@@ -431,20 +448,16 @@ async def cmd_mentions(m: Message):
         await m.answer(f"📣 Нет упоминаний за {days} дней")
         return
 
-    lines = ["📣 Требующие ответа:"]
+    lines = ["📣 *Требующие ответа:*"]
     for idx, issue in enumerate(issues, 1):
-        date_str = fmt_date(issue.get("updatedAt"))
         status = "✅" if issue.get("has_responded") else "⏳"
-        lines.append(f"\n{idx}. {status} {issue.get('key')} — {issue.get('summary')}")
-        if date_str:
-            lines[-1] += f" ({date_str})"
-        lines.append(issue.get("url", ""))
+        lines.append(f"\n{idx}. {fmt_issue_link(issue, prefix=f'{status} ')}")
     
-    lines.append("\n✅ — вы ответили\n⏳ — ожидает ответа")
+    lines.append("\n_✅ — вы ответили, ⏳ — ожидает ответа_")
     
     text = "\n".join(lines)
     for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-        await m.answer(chunk)
+        await m.answer(chunk, parse_mode="Markdown")
 
 
 @router.message(Command("cl_my_open"))
@@ -466,15 +479,15 @@ async def cmd_cl_my_open(m: Message):
         return
     
     text, keyboard, item_mapping = build_checklist_response(
-        issues, "❔ Ожидают согласование:", include_checked=False, add_buttons=True
+        issues, "❔ *Ожидают согласование:*", include_checked=False, add_buttons=True
     )
     state.checklist_cache.set(f"cl:{tg_id}", item_mapping)
     
     if len(text) > 4000:
-        await m.answer(text[:4000], reply_markup=keyboard)
-        await m.answer(text[4000:])
+        await m.answer(text[:4000], reply_markup=keyboard, parse_mode="Markdown")
+        await m.answer(text[4000:], parse_mode="Markdown")
     else:
-        await m.answer(text, reply_markup=keyboard)
+        await m.answer(text, reply_markup=keyboard, parse_mode="Markdown")
 
 
 @router.message(Command("done"))
@@ -664,22 +677,28 @@ async def handle_summary_callback(c: CallbackQuery):
         state.summary_cache.data.pop(issue_key, None)
         await c.answer("🔄 Обновляю...")
         
+        # Send loading message as reply (more reliable than edit)
+        loading_msg = None
         try:
             if c.message:
-                await c.message.edit_text(f"🤖 Генерирую резюме для {issue_key}...")
-        except Exception:
-            pass  # Ignore "message not modified" error
+                loading_msg = await c.message.reply(f"🤖 Генерирую резюме для {issue_key}...")
+        except Exception as e:
+            logger.error(f"Failed to send loading message: {e}")
         
         sc, data = await api_request("GET", f"/tracker/issue/{issue_key}/summary", {"tg": tg_id}, HTTP_TIMEOUT_LONG)
+        logger.info(f"Summary refresh for {issue_key}: status={sc}")
         
         if sc != 200:
             error_map = {401: "Ошибка авторизации. /connect", 404: f"{issue_key} не найден"}
-            error_text = f"❌ {error_map.get(sc, data.get('error', f'Ошибка {sc}'))}"[:500]
+            err_detail = data.get('error', f'Ошибка {sc}') if isinstance(data, dict) else f'Ошибка {sc}'
+            error_text = f"❌ {error_map.get(sc, err_detail)}"[:500]
             try:
-                if c.message:
-                    await c.message.edit_text(error_text, reply_markup=kb_summary_actions(issue_key))
-            except Exception:
-                pass
+                if loading_msg:
+                    await loading_msg.edit_text(error_text, reply_markup=kb_summary_actions(issue_key))
+                elif c.message:
+                    await c.message.reply(error_text, reply_markup=kb_summary_actions(issue_key))
+            except Exception as e:
+                logger.error(f"Failed to send error: {e}")
             return
         
         summary = data.get("summary", "")
@@ -689,16 +708,21 @@ async def handle_summary_callback(c: CallbackQuery):
             state.summary_cache.set(issue_key, {"summary": summary, "url": url})
             text = f"📋 {issue_key}:\n\n{summary}\n\n🔗 {url}"
             try:
-                if c.message:
-                    await c.message.edit_text(text[:4000], reply_markup=kb_summary_actions(issue_key))
-            except Exception:
-                pass
+                if loading_msg:
+                    await loading_msg.edit_text(text[:4000], reply_markup=kb_summary_actions(issue_key))
+                elif c.message:
+                    await c.message.reply(text[:4000], reply_markup=kb_summary_actions(issue_key))
+            except Exception as e:
+                logger.error(f"Failed to send summary: {e}")
         else:
             try:
-                if c.message:
-                    await c.message.edit_text("❌ Не удалось сгенерировать резюме", reply_markup=kb_summary_actions(issue_key))
-            except Exception:
-                pass
+                msg = "❌ Не удалось сгенерировать резюме"
+                if loading_msg:
+                    await loading_msg.edit_text(msg, reply_markup=kb_summary_actions(issue_key))
+                elif c.message:
+                    await c.message.reply(msg, reply_markup=kb_summary_actions(issue_key))
+            except Exception as e:
+                logger.error(f"Failed to send error: {e}")
         return
     
     if action == "comment":
@@ -743,8 +767,15 @@ async def handle_summary_callback(c: CallbackQuery):
         
         for idx, item in enumerate(items[:15], 1):
             mark = "✅" if item.get("checked") else "⬜"
-            text = (item.get("text") or "")[:50]
-            lines.append(f"{mark} {text}")
+            text = (item.get("text") or "")[:40]
+            
+            # Get assignee display name
+            assignee = item.get("assignee") or {}
+            assignee_name = assignee.get("display") or assignee.get("login") or ""
+            if assignee_name:
+                lines.append(f"{mark} {text} — _{assignee_name}_")
+            else:
+                lines.append(f"{mark} {text}")
             
             if not item.get("checked"):
                 item_id = item.get("id")
@@ -884,9 +915,9 @@ async def handle_settings_callback(c: CallbackQuery):
 # =============================================================================
 # Text Message Handler (for comments)
 # =============================================================================
-@router.message()
+@router.message(F.text & ~F.text.startswith("/"))
 async def handle_text_message(m: Message):
-    """Handle plain text messages (for comments)."""
+    """Handle plain text messages (for comments), excluding commands."""
     if not m.text or not m.from_user:
         return
     
@@ -895,7 +926,7 @@ async def handle_text_message(m: Message):
     # Check if user is awaiting comment input
     issue_key = state.pending_comment.get(tg_id)
     if not issue_key:
-        # No pending comment, ignore or show help
+        # No pending comment, ignore
         return
     
     # Clear pending state
