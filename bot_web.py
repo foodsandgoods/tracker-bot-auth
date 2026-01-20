@@ -664,15 +664,22 @@ async def handle_summary_callback(c: CallbackQuery):
         state.summary_cache.data.pop(issue_key, None)
         await c.answer("🔄 Обновляю...")
         
-        if c.message:
-            await c.message.edit_text("🤖 Генерирую резюме...")
+        try:
+            if c.message:
+                await c.message.edit_text(f"🤖 Генерирую резюме для {issue_key}...")
+        except Exception:
+            pass  # Ignore "message not modified" error
         
         sc, data = await api_request("GET", f"/tracker/issue/{issue_key}/summary", {"tg": tg_id}, HTTP_TIMEOUT_LONG)
         
         if sc != 200:
             error_map = {401: "Ошибка авторизации. /connect", 404: f"{issue_key} не найден"}
-            if c.message:
-                await c.message.edit_text(f"❌ {error_map.get(sc, data.get('error', 'Ошибка'))}"[:500])
+            error_text = f"❌ {error_map.get(sc, data.get('error', f'Ошибка {sc}'))}"[:500]
+            try:
+                if c.message:
+                    await c.message.edit_text(error_text, reply_markup=kb_summary_actions(issue_key))
+            except Exception:
+                pass
             return
         
         summary = data.get("summary", "")
@@ -681,11 +688,17 @@ async def handle_summary_callback(c: CallbackQuery):
         if summary:
             state.summary_cache.set(issue_key, {"summary": summary, "url": url})
             text = f"📋 {issue_key}:\n\n{summary}\n\n🔗 {url}"
-            if c.message:
-                await c.message.edit_text(text[:4000], reply_markup=kb_summary_actions(issue_key))
+            try:
+                if c.message:
+                    await c.message.edit_text(text[:4000], reply_markup=kb_summary_actions(issue_key))
+            except Exception:
+                pass
         else:
-            if c.message:
-                await c.message.edit_text("❌ Не удалось сгенерировать резюме")
+            try:
+                if c.message:
+                    await c.message.edit_text("❌ Не удалось сгенерировать резюме", reply_markup=kb_summary_actions(issue_key))
+            except Exception:
+                pass
         return
     
     if action == "comment":
@@ -710,27 +723,21 @@ async def handle_summary_callback(c: CallbackQuery):
         return
     
     if action == "checklist":
-        # Get checklists for issue
+        # Get checklists for specific issue
         await c.answer("📋 Загружаю...")
         
-        sc, data = await api_request("GET", "/tracker/checklist/assigned", {"tg": tg_id, "limit": 50})
+        sc, data = await api_request("GET", f"/tracker/issue/{issue_key}/checklist", {"tg": tg_id})
         if sc != 200:
-            await c.answer(f"❌ Ошибка {sc}", show_alert=True)
+            error_msg = data.get("error", f"Ошибка {sc}") if isinstance(data, dict) else f"Ошибка {sc}"
+            await c.answer(f"❌ {error_msg}"[:100], show_alert=True)
             return
         
-        # Find this issue's checklists
-        issues = data.get("issues") or []
-        found = None
-        for iss in issues:
-            if iss.get("key") == issue_key:
-                found = iss
-                break
+        items = data.get("checklist_items") or []
         
-        if not found or not found.get("checklist_items"):
-            await c.answer("Нет чеклистов в этой задаче", show_alert=True)
+        if not items:
+            await c.answer("📋 Нет чеклистов в этой задаче", show_alert=True)
             return
         
-        items = found.get("checklist_items") or []
         lines = [f"📋 *{issue_key}* — чеклисты:\n"]
         kb = InlineKeyboardBuilder()
         
@@ -746,12 +753,15 @@ async def handle_summary_callback(c: CallbackQuery):
         
         kb.adjust(5)
         
-        if c.message:
-            await c.message.reply(
-                "\n".join(lines),
-                parse_mode="Markdown",
-                reply_markup=kb.as_markup() if kb.buttons else None
-            )
+        try:
+            if c.message:
+                await c.message.reply(
+                    "\n".join(lines),
+                    parse_mode="Markdown",
+                    reply_markup=kb.as_markup() if kb.buttons else None
+                )
+        except Exception as e:
+            logger.error(f"Failed to send checklist: {e}")
         await c.answer()
         return
     

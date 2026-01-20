@@ -769,6 +769,25 @@ class TrackerService:
         
         return {"http_status": 200, "body": issue_data}
 
+    async def get_issue_checklist(self, tg_id: int, issue_key: str) -> dict:
+        """Get checklist items for a specific issue."""
+        access, err = await self._get_valid_access_token(tg_id)
+        if err:
+            return err
+        
+        st, issue_data = await self.tracker.get_issue(access, issue_key)
+        if st != 200:
+            return {"http_status": st, "body": issue_data}
+        
+        items = self._extract_checklist_items(issue_data)
+        return {
+            "http_status": 200,
+            "body": {
+                "issue_key": issue_key,
+                "checklist_items": items
+            }
+        }
+
     async def get_summons(self, tg_id: int, limit: int = 10) -> dict:
         """Get issues where user was mentioned (summoned) - field 'Нужен ответ пользователя'"""
         u = await self.user_by_tg(tg_id)
@@ -1148,6 +1167,17 @@ async def checklist_check(tg: int, issue: str, item: str, checked: bool = True):
         return cfg_err
     assert _service is not None
     result = await _service.checklist_item_check(tg, issue_key=issue, item_id=item, checked=checked)
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.get("/tracker/issue/{issue_key}/checklist")
+async def issue_checklist(tg: int, issue_key: str):
+    """Get checklist items for a specific issue."""
+    cfg_err = _require(settings)
+    if cfg_err:
+        return cfg_err
+    assert _service is not None
+    result = await _service.get_issue_checklist(tg, issue_key)
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
