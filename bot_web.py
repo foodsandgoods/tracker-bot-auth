@@ -220,8 +220,9 @@ def kb_settings_main() -> InlineKeyboardMarkup:
     kb.button(text="Очереди", callback_data="st:queues")
     kb.button(text="Период", callback_data="st:days")
     kb.button(text="Лимит", callback_data="st:limit")
+    kb.button(text="🔔 Напоминание", callback_data="st:reminder")
     kb.button(text="Закрыть", callback_data="st:close")
-    kb.adjust(2, 1, 1)
+    kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 
@@ -253,22 +254,41 @@ def kb_settings_limit(limit: int) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def render_settings_text(queues: List[str], days: int, limit: int) -> str:
+def kb_settings_reminder(reminder: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    options = [(0, "Откл"), (1, "1ч"), (3, "3ч"), (6, "6ч")]
+    for val, label in options:
+        kb.button(text=f"{'✅' if reminder == val else '⬜'} {label}", callback_data=f"st:rset:{val}")
+    kb.button(text="Назад", callback_data="st:back")
+    kb.adjust(4, 1)
+    return kb.as_markup()
+
+
+def render_settings_text(queues: List[str], days: int, limit: int, reminder: int = 0) -> str:
     q = ", ".join(queues) if queues else "(все)"
-    return f"⚙️ Настройки:\n• Очереди: {q}\n• Период: {days} дней\n• Лимит: {limit}\n\nВыбери параметр:"
+    r = {0: "Откл", 1: "1ч", 3: "3ч", 6: "6ч"}.get(reminder, "Откл")
+    return (
+        f"⚙️ Настройки:\n"
+        f"• Очереди: {q}\n"
+        f"• Период: {days} дней\n"
+        f"• Лимит: {limit}\n"
+        f"• 🔔 Напоминание: {r}\n\n"
+        "Выбери параметр:"
+    )
 
 # =============================================================================
 # Checklist Helpers
 # =============================================================================
-async def get_settings(tg_id: int) -> Optional[Tuple[List[str], int, int]]:
-    """Get user settings."""
+async def get_settings(tg_id: int) -> Optional[Tuple[List[str], int, int, int]]:
+    """Get user settings: (queues, days, limit, reminder)."""
     sc, data = await api_request("GET", "/tg/settings", {"tg": tg_id})
     if sc != 200:
         return None
     return (
         data.get("queues") or [],
         int(data.get("days", 30)),
-        int(data.get("limit", 10))
+        int(data.get("limit", 10)),
+        int(data.get("reminder", 0))
     )
 
 
@@ -324,6 +344,7 @@ async def cmd_menu(m: Message):
         "✅ /cl\\_my — мои чеклисты\n"
         "⬜ /cl\\_my\\_open — ожидают согласование\n"
         "✔️ /done N — отметить пункт\n\n"
+        "📣 /mentions — требующие ответа\n"
         "🤖 /summary ISSUE — резюме (ИИ)",
         parse_mode="Markdown"
     )
@@ -360,8 +381,8 @@ async def cmd_settings(m: Message):
     if not settings:
         await m.answer("❌ Не удалось получить настройки")
         return
-    queues, days, limit = settings
-    await m.answer(render_settings_text(queues, days, limit), reply_markup=kb_settings_main())
+    queues, days, limit, reminder = settings
+    await m.answer(render_settings_text(queues, days, limit, reminder), reply_markup=kb_settings_main())
 
 
 @router.message(Command("cl_my"))
@@ -386,6 +407,41 @@ async def cmd_cl_my(m: Message):
     state.checklist_cache.set(f"cl:{tg_id}", item_mapping)
     
     # Split long messages
+    for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
+        await m.answer(chunk)
+
+
+@router.message(Command("mentions"))
+@require_base_url
+async def cmd_mentions(m: Message):
+    """Get issues where user was mentioned (summoned)."""
+    tg_id = m.from_user.id
+    settings = await get_settings(tg_id)
+    limit = settings[2] if settings else 10
+    
+    sc, data = await api_request("GET", "/tracker/summons", {"tg": tg_id, "limit": limit}, HTTP_TIMEOUT_LONG)
+    if sc != 200:
+        await m.answer(f"❌ Ошибка {sc}: {data.get('error', data)}"[:500])
+        return
+    
+    issues = data.get("issues", [])
+    if not issues:
+        days = data.get("settings", {}).get("days", 30)
+        await m.answer(f"📣 Нет упоминаний за {days} дней")
+        return
+    
+    lines = ["📣 Требующие ответа:"]
+    for idx, issue in enumerate(issues, 1):
+        date_str = fmt_date(issue.get("updatedAt"))
+        status = "✅" if issue.get("has_responded") else "⏳"
+        lines.append(f"\n{idx}. {status} {issue.get('key')} — {issue.get('summary')}")
+        if date_str:
+            lines[-1] += f" ({date_str})"
+        lines.append(issue.get("url", ""))
+    
+    lines.append("\n✅ — вы ответили\n⏳ — ожидает ответа")
+    
+    text = "\n".join(lines)
     for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
         await m.answer(chunk)
 
@@ -594,6 +650,7 @@ async def handle_settings_callback(c: CallbackQuery):
     queues = data.get("queues") or []
     days = int(data.get("days", 30))
     limit = int(data.get("limit", 10))
+    reminder = int(data.get("reminder", 0))
     
     if action == "close":
         if c.message:
@@ -603,7 +660,7 @@ async def handle_settings_callback(c: CallbackQuery):
     
     if action == "back":
         if c.message:
-            await c.message.edit_text(render_settings_text(queues, days, limit), reply_markup=kb_settings_main())
+            await c.message.edit_text(render_settings_text(queues, days, limit, reminder), reply_markup=kb_settings_main())
         await c.answer()
         return
     
@@ -622,6 +679,18 @@ async def handle_settings_callback(c: CallbackQuery):
     if action == "limit":
         if c.message:
             await c.message.edit_text("Лимит:", reply_markup=kb_settings_limit(limit))
+        await c.answer()
+        return
+    
+    if action == "reminder":
+        if c.message:
+            await c.message.edit_text(
+                "🔔 Напоминание (09:00-19:00):\n\n"
+                "Бот будет присылать список:\n"
+                "• Неотмеченные пункты чеклистов\n"
+                "• Упоминания без ответа",
+                reply_markup=kb_settings_reminder(reminder)
+            )
         await c.answer()
         return
     
@@ -659,6 +728,18 @@ async def handle_settings_callback(c: CallbackQuery):
         await c.answer("✅" if sc2 == 200 else f"❌ {sc2}")
         return
     
+    if action == "rset":
+        try:
+            h = int(arg)
+        except ValueError:
+            await c.answer("❌ Ошибка", show_alert=True)
+            return
+        sc2, data2 = await api_request("POST", "/tg/settings/reminder", {"tg": tg_id, "hours": h})
+        if sc2 == 200 and c.message:
+            await c.message.edit_reply_markup(reply_markup=kb_settings_reminder(int(data2.get("reminder", h))))
+        await c.answer("✅" if sc2 == 200 else f"❌ {sc2}")
+        return
+    
     await c.answer()
 
 # =============================================================================
@@ -674,6 +755,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="cl_my", description="✅ Мои чеклисты"),
         BotCommand(command="cl_my_open", description="⬜ Ожидают согласование"),
         BotCommand(command="done", description="✔️ Отметить пункт"),
+        BotCommand(command="mentions", description="📣 Требующие ответа"),
         BotCommand(command="summary", description="🤖 Резюме (ИИ)"),
     ])
 
@@ -746,6 +828,107 @@ async def keep_alive():
             continue
 
 
+# Track last reminder time per user
+_last_reminder: Dict[int, float] = {}
+
+
+async def reminder_worker():
+    """Send periodic reminders to users with reminder enabled (09:00-19:00)."""
+    await asyncio.sleep(60)  # Wait for services to start
+    
+    while not state.shutdown_event.is_set():
+        try:
+            # Check if we're in working hours (09:00-19:00)
+            now = datetime.now()
+            if not (9 <= now.hour < 19):
+                # Outside working hours, wait and check again
+                await asyncio.sleep(300)  # 5 min
+                continue
+            
+            if not state.bot or not BASE_URL:
+                await asyncio.sleep(60)
+                continue
+            
+            # Get users with reminder enabled
+            sc, data = await api_request("GET", "/tg/users_with_reminder", {})
+            if sc != 200 or not data.get("users"):
+                await asyncio.sleep(300)
+                continue
+            
+            for user in data["users"]:
+                if state.shutdown_event.is_set():
+                    break
+                
+                tg_id = user.get("tg_id")
+                reminder_hours = user.get("reminder_hours", 0)
+                
+                if not tg_id or reminder_hours <= 0:
+                    continue
+                
+                # Check if enough time passed since last reminder
+                last_time = _last_reminder.get(tg_id, 0)
+                if time.time() - last_time < reminder_hours * 3600:
+                    continue
+                
+                # Build reminder message
+                lines = ["🔔 *Напоминание:*\n"]
+                has_items = False
+                
+                # Get unchecked checklists
+                try:
+                    sc1, data1 = await api_request("GET", "/tracker/checklist/assigned_unchecked", {"tg": tg_id, "limit": 5}, HTTP_TIMEOUT_LONG)
+                    if sc1 == 200:
+                        issues = data1.get("issues", [])
+                        if issues:
+                            has_items = True
+                            lines.append("⬜ *Ожидают согласование:*")
+                            for issue in issues[:3]:
+                                lines.append(f"• {issue.get('key')} — {issue.get('summary')[:50]}")
+                            if len(issues) > 3:
+                                lines.append(f"...и ещё {len(issues) - 3}")
+                            lines.append("")
+                except Exception:
+                    pass
+                
+                # Get mentions without response
+                try:
+                    sc2, data2 = await api_request("GET", "/tracker/summons", {"tg": tg_id, "limit": 5}, HTTP_TIMEOUT_LONG)
+                    if sc2 == 200:
+                        issues = [i for i in data2.get("issues", []) if not i.get("has_responded")]
+                        if issues:
+                            has_items = True
+                            lines.append("📣 *Требуют ответа:*")
+                            for issue in issues[:3]:
+                                lines.append(f"• {issue.get('key')} — {issue.get('summary')[:50]}")
+                            if len(issues) > 3:
+                                lines.append(f"...и ещё {len(issues) - 3}")
+                except Exception:
+                    pass
+                
+                # Send reminder only if there are items
+                if has_items:
+                    try:
+                        text = "\n".join(lines)
+                        await state.bot.send_message(tg_id, text, parse_mode="Markdown")
+                        _last_reminder[tg_id] = time.time()
+                        logger.info(f"Sent reminder to {tg_id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to send reminder to {tg_id}: {e}")
+                
+                # Small delay between users
+                await asyncio.sleep(1)
+        
+        except Exception as e:
+            logger.error(f"Reminder worker error: {e}")
+        
+        # Wait before next check cycle
+        try:
+            await asyncio.wait_for(state.shutdown_event.wait(), timeout=300)  # 5 min
+            break
+        except asyncio.TimeoutError:
+            continue
+
+
 async def shutdown():
     """Graceful shutdown."""
     logger.info("Shutting down...")
@@ -781,6 +964,7 @@ async def main():
         "web": asyncio.create_task(run_web()),
         "bot": asyncio.create_task(run_bot()),
         "keepalive": asyncio.create_task(keep_alive()),
+        "reminder": asyncio.create_task(reminder_worker()),
     }
     
     try:
@@ -801,6 +985,8 @@ async def main():
                         tasks[name] = asyncio.create_task(run_bot())
                     elif name == "keepalive":
                         tasks[name] = asyncio.create_task(keep_alive())
+                    elif name == "reminder":
+                        tasks[name] = asyncio.create_task(reminder_worker())
     except asyncio.CancelledError:
         pass
     finally:

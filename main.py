@@ -144,6 +144,13 @@ class TokenStorage:
                     ADD COLUMN IF NOT EXISTS limit_results INT NOT NULL DEFAULT 10;
                     """
                 )
+                # Add reminder_hours column (0 = off, 1/3/6 = hours)
+                await cur.execute(
+                    """
+                    ALTER TABLE tg_settings
+                    ADD COLUMN IF NOT EXISTS reminder_hours INT NOT NULL DEFAULT 0;
+                    """
+                )
             await conn.commit()
 
     async def upsert_token(
@@ -225,9 +232,9 @@ class TokenStorage:
         await self.ensure_settings_row(tg_id)
         async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT queues_csv, days, limit_results FROM tg_settings WHERE tg_id=%s", (tg_id,))
+                await cur.execute("SELECT queues_csv, days, limit_results, reminder_hours FROM tg_settings WHERE tg_id=%s", (tg_id,))
                 row = await cur.fetchone()
-        return row or {"queues_csv": "", "days": 30, "limit_results": 10}
+        return row or {"queues_csv": "", "days": 30, "limit_results": 10, "reminder_hours": 0}
 
     async def set_queues(self, tg_id: int, queues_csv: str) -> None:
         q = _normalize_queues_csv(queues_csv)
@@ -276,6 +283,32 @@ class TokenStorage:
                     (tg_id, limit),
                 )
             await conn.commit()
+
+    async def set_reminder(self, tg_id: int, hours: int) -> None:
+        hours = hours if hours in (0, 1, 3, 6) else 0
+        async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO tg_settings (tg_id, reminder_hours, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (tg_id) DO UPDATE SET
+                        reminder_hours = EXCLUDED.reminder_hours,
+                        updated_at = NOW();
+                    """,
+                    (tg_id, hours),
+                )
+            await conn.commit()
+
+    async def get_users_with_reminder(self) -> list[dict]:
+        """Get all users with reminder enabled (reminder_hours > 0)"""
+        async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT tg_id, reminder_hours FROM tg_settings WHERE reminder_hours > 0"
+                )
+                rows = await cur.fetchall()
+        return rows or []
 
 
 # =========================
@@ -472,7 +505,12 @@ class TrackerService:
 
     async def settings_get(self, tg_id: int) -> dict:
         s = await self.storage.get_settings(tg_id)
-        return {"http_status": 200, "body": {"queues": _queues_list(s.get("queues_csv", "")), "days": s.get("days", 30), "limit": s.get("limit_results", 10)}}
+        return {"http_status": 200, "body": {
+            "queues": _queues_list(s.get("queues_csv", "")), 
+            "days": s.get("days", 30), 
+            "limit": s.get("limit_results", 10),
+            "reminder": s.get("reminder_hours", 0)
+        }}
 
     async def settings_set_queues(self, tg_id: int, queues_csv: str) -> dict:
         await self.storage.set_queues(tg_id, queues_csv)
@@ -485,6 +523,13 @@ class TrackerService:
     async def settings_set_limit(self, tg_id: int, limit: int) -> dict:
         await self.storage.set_limit(tg_id, limit)
         return await self.settings_get(tg_id)
+
+    async def settings_set_reminder(self, tg_id: int, hours: int) -> dict:
+        await self.storage.set_reminder(tg_id, hours)
+        return await self.settings_get(tg_id)
+
+    async def get_users_with_reminder(self) -> list[dict]:
+        return await self.storage.get_users_with_reminder()
 
     def _build_candidate_query(self, queues: list[str], days: int) -> str:
         base = f"Updated: >= now()-{int(days)}d"
@@ -717,6 +762,82 @@ class TrackerService:
         
         return {"http_status": 200, "body": issue_data}
 
+    async def get_summons(self, tg_id: int, limit: int = 10) -> dict:
+        """Get issues where user was mentioned (summoned) in issue or comments"""
+        u = await self.user_by_tg(tg_id)
+        if u["http_status"] != 200:
+            return u
+        login = (u["body"].get("tracker_login") or "").lower()
+        if not login:
+            return {"http_status": 500, "body": {"error": "tracker_login is empty"}}
+
+        access, err = await self._get_valid_access_token(tg_id)
+        if err:
+            return err
+
+        s = await self.storage.get_settings(tg_id)
+        queues = _queues_list(s.get("queues_csv", ""))
+        days = int(s.get("days", 30))
+        if limit == 10:
+            limit = int(s.get("limit_results", 10))
+
+        # Search for issues where user is mentioned (summoned)
+        # Yandex Tracker uses "Followers: me()" or we search by login mention
+        base_query = f"Updated: >= now()-{days}d"
+        if queues:
+            queue_conditions = [f"Queue: {x}" for x in queues]
+            q = " OR ".join(queue_conditions)
+            base_query = f"({q}) AND {base_query}"
+        
+        # Search for issues where user was summoned
+        summon_query = f'"{login}" Summons: notEmpty() {base_query}'
+        
+        st, payload = await self.tracker.search_issues(access, query=summon_query, limit=min(limit * 2, 50))
+        
+        issues = []
+        if st == 200:
+            raw_issues = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
+            
+            for issue in raw_issues[:limit]:
+                issue_key = issue.get("key")
+                if not issue_key:
+                    continue
+                
+                # Check if user has responded (commented on the issue after being summoned)
+                has_responded = False
+                try:
+                    comments_url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/comments"
+                    headers = {"Authorization": f"OAuth {access}", "X-Org-Id": self.tracker.settings.yandex_org_id}
+                    r = await self.tracker.http.get(comments_url, headers=headers)
+                    if r.status_code == 200:
+                        comments = _safe_json(r)
+                        if isinstance(comments, list):
+                            for comment in comments:
+                                author = comment.get("createdBy", {})
+                                if (author.get("login") or "").lower() == login:
+                                    has_responded = True
+                                    break
+                except Exception:
+                    pass
+                
+                issues.append({
+                    "key": issue_key,
+                    "summary": issue.get("summary") or "",
+                    "url": f"https://tracker.yandex.ru/{issue_key}",
+                    "updatedAt": issue.get("updatedAt") or issue.get("updated"),
+                    "has_responded": has_responded
+                })
+
+        return {
+            "http_status": 200,
+            "body": {
+                "status_code": 200,
+                "issues": issues,
+                "settings": {"queues": queues, "days": days},
+                "login": login
+            }
+        }
+
     async def issue_summary(self, tg_id: int, issue_key: str) -> dict:
         """Generate AI summary for issue"""
         # Получаем данные задачи
@@ -925,6 +1046,36 @@ async def tg_settings_limit(tg: int, limit: int):
         return cfg_err
     assert _service is not None
     result = await _service.settings_set_limit(tg, limit)
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.post("/tg/settings/reminder")
+async def tg_settings_reminder(tg: int, hours: int):
+    cfg_err = _require(settings)
+    if cfg_err:
+        return cfg_err
+    assert _service is not None
+    result = await _service.settings_set_reminder(tg, hours)
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.get("/tg/users_with_reminder")
+async def tg_users_with_reminder():
+    cfg_err = _require(settings)
+    if cfg_err:
+        return cfg_err
+    assert _service is not None
+    users = await _service.get_users_with_reminder()
+    return JSONResponse({"users": users}, status_code=200)
+
+
+@app.get("/tracker/summons")
+async def tracker_summons(tg: int, limit: int = 10):
+    cfg_err = _require(settings)
+    if cfg_err:
+        return cfg_err
+    assert _service is not None
+    result = await _service.get_summons(tg, limit=limit)
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
