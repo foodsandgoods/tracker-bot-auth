@@ -1,0 +1,17 @@
+# Конфигурация для Amvera Cloud
+# Документация: https://docs.amvera.ru
+
+meta:
+  environment: python
+  toolchain:
+    name: pip
+    version: "3.11"
+
+build:
+  pip:
+    requirementsPath: requirements.txt
+
+run:
+  persistentRecurse: true
+  command: python bot_web.py
+  containerPort: 10000
