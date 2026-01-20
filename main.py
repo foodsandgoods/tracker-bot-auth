@@ -438,6 +438,13 @@ class TrackerClient:
         r = await self.http.patch(url, headers=headers, json=patch)
         return r.status_code, _safe_json(r)
 
+    async def add_comment(self, access_token: str, issue_key: str, text: str) -> tuple[int, Any]:
+        """Add a comment to an issue."""
+        url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/comments"
+        headers = {**self._headers(access_token), "Content-Type": "application/json"}
+        r = await self.http.post(url, headers=headers, json={"text": text})
+        return r.status_code, _safe_json(r)
+
 
 # =========================
 # Service layer
@@ -883,6 +890,25 @@ class TrackerService:
             }
         }
 
+    async def add_comment(self, tg_id: int, issue_key: str, text: str) -> dict:
+        """Add a comment to an issue."""
+        access, err = await self._get_valid_access_token(tg_id)
+        if err:
+            return err
+        
+        st, resp = await self.tracker.add_comment(access, issue_key, text)
+        if st not in (200, 201):
+            return {"http_status": st, "body": resp}
+        
+        return {
+            "http_status": 200,
+            "body": {
+                "status": "ok",
+                "issue_key": issue_key,
+                "comment_id": resp.get("id") if isinstance(resp, dict) else None
+            }
+        }
+
 
 # =========================
 # FastAPI wiring
@@ -1081,6 +1107,17 @@ async def tracker_summons(tg: int, limit: int = 10):
         return cfg_err
     assert _service is not None
     result = await _service.get_summons(tg, limit=limit)
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.post("/tracker/issue/{issue_key}/comment")
+async def tracker_add_comment(issue_key: str, tg: int, text: str):
+    """Add a comment to an issue."""
+    cfg_err = _require(settings)
+    if cfg_err:
+        return cfg_err
+    assert _service is not None
+    result = await _service.add_comment(tg, issue_key, text)
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 

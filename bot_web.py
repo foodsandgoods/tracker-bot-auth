@@ -100,6 +100,7 @@ class AppState:
         self.shutdown_event = asyncio.Event()
         self.checklist_cache = TTLCache(maxsize=100, ttl=1800)  # 30 min
         self.summary_cache = TTLCache(maxsize=50, ttl=3600)  # 1 hour
+        self.pending_comment: Dict[int, str] = {}  # tg_id -> issue_key (awaiting comment text)
 
 state = AppState()
 
@@ -342,7 +343,7 @@ async def cmd_menu(m: Message):
         "👤 /me — проверить доступ\n"
         "⚙️ /settings — настройки\n\n"
         "✅ /cl\\_my — мои чеклисты\n"
-        "⬜ /cl\\_my\\_open — ожидают согласование\n"
+        "❔ /cl\\_my\\_open — ожидают согласование\n"
         "✔️ /done N — отметить пункт\n\n"
         "📣 /mentions — требующие ответа\n"
         "🤖 /summary ISSUE — резюме (ИИ)",
@@ -429,7 +430,7 @@ async def cmd_mentions(m: Message):
         days = data.get("settings", {}).get("days", 30)
         await m.answer(f"📣 Нет упоминаний за {days} дней")
         return
-    
+
     lines = ["📣 Требующие ответа:"]
     for idx, issue in enumerate(issues, 1):
         date_str = fmt_date(issue.get("updatedAt"))
@@ -465,7 +466,7 @@ async def cmd_cl_my_open(m: Message):
         return
     
     text, keyboard, item_mapping = build_checklist_response(
-        issues, "⬜ Ожидают согласование:", include_checked=False, add_buttons=True
+        issues, "❔ Ожидают согласование:", include_checked=False, add_buttons=True
     )
     state.checklist_cache.set(f"cl:{tg_id}", item_mapping)
     
@@ -490,13 +491,13 @@ async def cmd_done(m: Message):
     except ValueError:
         await m.answer("❌ N должно быть числом")
         return
-    
+
     tg_id = m.from_user.id
     item_mapping = state.checklist_cache.get(f"cl:{tg_id}")
     if not item_mapping or num not in item_mapping:
         await m.answer("❌ Сначала выполните /cl_my или /cl_my_open")
         return
-    
+
     issue_key, item_id = item_mapping[num]
     sc, data = await api_request("POST", "/tracker/checklist/check", {
         "tg": tg_id, "issue": issue_key, "item": item_id, "checked": True
@@ -516,7 +517,7 @@ async def cmd_cl_done(m: Message):
     if len(parts) != 3:
         await m.answer("Использование: /cl_done ISSUE-KEY ITEM_ID")
         return
-    
+
     _, issue_key, item_id = parts
     sc, data = await api_request("POST", "/tracker/checklist/check", {
         "tg": m.from_user.id, "issue": issue_key, "item": item_id, "checked": True
@@ -528,6 +529,16 @@ async def cmd_cl_done(m: Message):
         await m.answer(f"❌ Ошибка {sc}: {data}"[:200])
 
 
+def kb_summary_actions(issue_key: str) -> InlineKeyboardMarkup:
+    """Build keyboard for summary actions."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔄 Обновить", callback_data=f"sum:refresh:{issue_key}")
+    kb.button(text="💬 Комментарий", callback_data=f"sum:comment:{issue_key}")
+    kb.button(text="📋 Чеклисты", callback_data=f"sum:checklist:{issue_key}")
+    kb.adjust(3)
+    return kb.as_markup()
+
+
 @router.message(Command("summary"))
 @require_base_url
 async def cmd_summary(m: Message):
@@ -536,14 +547,17 @@ async def cmd_summary(m: Message):
     if len(parts) != 2:
         await m.answer("Использование: /summary ISSUE-KEY")
         return
-    
+
     issue_key = parts[1].upper().strip()
     tg_id = m.from_user.id
     
-    # Check cache
+    # Check cache (but still show buttons)
     cached = state.summary_cache.get(issue_key)
     if cached:
-        await m.answer(f"📋 {issue_key} (кэш):\n\n{cached['summary']}\n\n🔗 {cached['url']}")
+        await m.answer(
+            f"📋 {issue_key} (кэш):\n\n{cached['summary']}\n\n🔗 {cached['url']}",
+            reply_markup=kb_summary_actions(issue_key)
+        )
         return
     
     loading = await m.answer("🤖 Генерирую резюме...")
@@ -561,15 +575,15 @@ async def cmd_summary(m: Message):
     if not summary:
         await loading.edit_text("❌ Не удалось сгенерировать резюме")
         return
-    
+
     state.summary_cache.set(issue_key, {"summary": summary, "url": url})
     
     text = f"📋 {issue_key}:\n\n{summary}\n\n🔗 {url}"
     if len(text) > 4000:
         await loading.edit_text(text[:4000])
-        await m.answer(text[4000:])
+        await m.answer(text[4000:], reply_markup=kb_summary_actions(issue_key))
     else:
-        await loading.edit_text(text)
+        await loading.edit_text(text, reply_markup=kb_summary_actions(issue_key))
 
 # =============================================================================
 # Callback Handlers
@@ -589,6 +603,11 @@ async def handle_callback(c: CallbackQuery):
         await handle_settings_callback(c)
         return
     
+    # Summary action callbacks
+    if data.startswith("sum:"):
+        await handle_summary_callback(c)
+        return
+
     await c.answer()
 
 
@@ -598,10 +617,10 @@ async def handle_check_callback(c: CallbackQuery):
     if len(parts) < 4:
         await c.answer("❌ Ошибка", show_alert=True)
         return
-    
+
     _, issue_key, item_id, item_num = parts[:4]
     tg_id = c.from_user.id
-    
+
     sc, data = await api_request("POST", "/tracker/checklist/check", {
         "tg": tg_id, "issue": issue_key, "item": item_id, "checked": True
     })
@@ -609,7 +628,7 @@ async def handle_check_callback(c: CallbackQuery):
     if sc != 200:
         await c.answer(f"❌ {data.get('error', 'Ошибка')}"[:100], show_alert=True)
         return
-    
+
     await c.answer("✅ Отмечено!")
     
     # Update message
@@ -628,6 +647,115 @@ async def handle_check_callback(c: CallbackQuery):
                 await c.message.edit_text(text, reply_markup=new_markup)
             except Exception:
                 pass
+
+
+async def handle_summary_callback(c: CallbackQuery):
+    """Handle summary action callbacks."""
+    parts = c.data.split(":", 2)
+    if len(parts) < 3:
+        await c.answer("❌ Ошибка", show_alert=True)
+        return
+    
+    _, action, issue_key = parts
+    tg_id = c.from_user.id
+    
+    if action == "refresh":
+        # Clear cache and regenerate
+        state.summary_cache.data.pop(issue_key, None)
+        await c.answer("🔄 Обновляю...")
+        
+        if c.message:
+            await c.message.edit_text("🤖 Генерирую резюме...")
+        
+        sc, data = await api_request("GET", f"/tracker/issue/{issue_key}/summary", {"tg": tg_id}, HTTP_TIMEOUT_LONG)
+        
+        if sc != 200:
+            error_map = {401: "Ошибка авторизации. /connect", 404: f"{issue_key} не найден"}
+            if c.message:
+                await c.message.edit_text(f"❌ {error_map.get(sc, data.get('error', 'Ошибка'))}"[:500])
+            return
+        
+        summary = data.get("summary", "")
+        url = data.get("issue_url", f"https://tracker.yandex.ru/{issue_key}")
+        
+        if summary:
+            state.summary_cache.set(issue_key, {"summary": summary, "url": url})
+            text = f"📋 {issue_key}:\n\n{summary}\n\n🔗 {url}"
+            if c.message:
+                await c.message.edit_text(text[:4000], reply_markup=kb_summary_actions(issue_key))
+        else:
+            if c.message:
+                await c.message.edit_text("❌ Не удалось сгенерировать резюме")
+        return
+    
+    if action == "comment":
+        # Set pending comment state
+        state.pending_comment[tg_id] = issue_key
+        await c.answer()
+        if c.message:
+            kb = InlineKeyboardBuilder()
+            kb.button(text="❌ Отмена", callback_data=f"sum:cancel_comment:{issue_key}")
+            await c.message.reply(
+                f"💬 Напишите комментарий для *{issue_key}*:\n\n_Отправьте текст следующим сообщением_",
+                parse_mode="Markdown",
+                reply_markup=kb.as_markup()
+            )
+        return
+    
+    if action == "cancel_comment":
+        state.pending_comment.pop(tg_id, None)
+        await c.answer("Отменено")
+        if c.message:
+            await c.message.delete()
+        return
+    
+    if action == "checklist":
+        # Get checklists for issue
+        await c.answer("📋 Загружаю...")
+        
+        sc, data = await api_request("GET", "/tracker/checklist/assigned", {"tg": tg_id, "limit": 50})
+        if sc != 200:
+            await c.answer(f"❌ Ошибка {sc}", show_alert=True)
+            return
+        
+        # Find this issue's checklists
+        issues = data.get("issues") or []
+        found = None
+        for iss in issues:
+            if iss.get("key") == issue_key:
+                found = iss
+                break
+        
+        if not found or not found.get("checklist_items"):
+            await c.answer("Нет чеклистов в этой задаче", show_alert=True)
+            return
+        
+        items = found.get("checklist_items") or []
+        lines = [f"📋 *{issue_key}* — чеклисты:\n"]
+        kb = InlineKeyboardBuilder()
+        
+        for idx, item in enumerate(items[:15], 1):
+            mark = "✅" if item.get("checked") else "⬜"
+            text = (item.get("text") or "")[:50]
+            lines.append(f"{mark} {text}")
+            
+            if not item.get("checked"):
+                item_id = item.get("id")
+                if item_id:
+                    kb.button(text=f"✓{idx}", callback_data=f"chk:{issue_key}:{item_id}:{idx}")
+        
+        kb.adjust(5)
+        
+        if c.message:
+            await c.message.reply(
+                "\n".join(lines),
+                parse_mode="Markdown",
+                reply_markup=kb.as_markup() if kb.buttons else None
+            )
+        await c.answer()
+        return
+    
+    await c.answer()
 
 
 async def handle_settings_callback(c: CallbackQuery):
@@ -651,25 +779,25 @@ async def handle_settings_callback(c: CallbackQuery):
     days = int(data.get("days", 30))
     limit = int(data.get("limit", 10))
     reminder = int(data.get("reminder", 0))
-    
+
     if action == "close":
         if c.message:
             await c.message.edit_reply_markup(reply_markup=None)
         await c.answer()
         return
-    
+
     if action == "back":
         if c.message:
             await c.message.edit_text(render_settings_text(queues, days, limit, reminder), reply_markup=kb_settings_main())
         await c.answer()
         return
-    
+
     if action == "queues":
         if c.message:
             await c.message.edit_text("Очереди:", reply_markup=kb_settings_queues(queues))
         await c.answer()
         return
-    
+
     if action == "days":
         if c.message:
             await c.message.edit_text("Период:", reply_markup=kb_settings_days(days))
@@ -693,7 +821,7 @@ async def handle_settings_callback(c: CallbackQuery):
             )
         await c.answer()
         return
-    
+
     if action == "qtoggle":
         q = arg.upper()
         qs = [x.upper() for x in queues]
@@ -703,7 +831,7 @@ async def handle_settings_callback(c: CallbackQuery):
             await c.message.edit_reply_markup(reply_markup=kb_settings_queues(data2.get("queues", [])))
         await c.answer("✅" if sc2 == 200 else f"❌ {sc2}")
         return
-    
+
     if action == "dset":
         try:
             d = int(arg)
@@ -715,7 +843,7 @@ async def handle_settings_callback(c: CallbackQuery):
             await c.message.edit_reply_markup(reply_markup=kb_settings_days(int(data2.get("days", d))))
         await c.answer("✅" if sc2 == 200 else f"❌ {sc2}")
         return
-    
+
     if action == "lset":
         try:
             n = int(arg)
@@ -727,7 +855,7 @@ async def handle_settings_callback(c: CallbackQuery):
             await c.message.edit_reply_markup(reply_markup=kb_settings_limit(int(data2.get("limit", n))))
         await c.answer("✅" if sc2 == 200 else f"❌ {sc2}")
         return
-    
+
     if action == "rset":
         try:
             h = int(arg)
@@ -739,8 +867,50 @@ async def handle_settings_callback(c: CallbackQuery):
             await c.message.edit_reply_markup(reply_markup=kb_settings_reminder(int(data2.get("reminder", h))))
         await c.answer("✅" if sc2 == 200 else f"❌ {sc2}")
         return
-    
+
     await c.answer()
+
+
+# =============================================================================
+# Text Message Handler (for comments)
+# =============================================================================
+@router.message()
+async def handle_text_message(m: Message):
+    """Handle plain text messages (for comments)."""
+    if not m.text or not m.from_user:
+        return
+    
+    tg_id = m.from_user.id
+    
+    # Check if user is awaiting comment input
+    issue_key = state.pending_comment.get(tg_id)
+    if not issue_key:
+        # No pending comment, ignore or show help
+        return
+    
+    # Clear pending state
+    state.pending_comment.pop(tg_id, None)
+    
+    comment_text = m.text.strip()
+    if not comment_text:
+        await m.answer("❌ Комментарий не может быть пустым")
+        return
+    
+    # Send comment
+    loading = await m.answer("💬 Отправляю комментарий...")
+    
+    sc, data = await api_request("POST", f"/tracker/issue/{issue_key}/comment", {
+        "tg": tg_id,
+        "text": comment_text
+    })
+    
+    if sc != 200:
+        error_msg = data.get("error", "Ошибка отправки")
+        await loading.edit_text(f"❌ {error_msg}"[:200])
+        return
+    
+    await loading.edit_text(f"✅ Комментарий добавлен к *{issue_key}*", parse_mode="Markdown")
+
 
 # =============================================================================
 # Bot Setup and Run
@@ -753,7 +923,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="me", description="👤 Проверить доступ"),
         BotCommand(command="settings", description="⚙️ Настройки"),
         BotCommand(command="cl_my", description="✅ Мои чеклисты"),
-        BotCommand(command="cl_my_open", description="⬜ Ожидают согласование"),
+        BotCommand(command="cl_my_open", description="❔ Ожидают согласование"),
         BotCommand(command="done", description="✔️ Отметить пункт"),
         BotCommand(command="mentions", description="📣 Требующие ответа"),
         BotCommand(command="summary", description="🤖 Резюме (ИИ)"),
@@ -886,7 +1056,7 @@ async def reminder_worker():
                         issues = data1.get("issues", [])
                         if issues:
                             has_items = True
-                            lines.append("⬜ *Ожидают согласование:*")
+                            lines.append("❔ *Ожидают согласование:*")
                             for issue in issues[:3]:
                                 lines.append(f"• {issue.get('key')} — {issue.get('summary')[:50]}")
                             if len(issues) > 3:
