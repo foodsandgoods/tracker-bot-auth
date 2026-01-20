@@ -101,6 +101,7 @@ class AppState:
         self.checklist_cache = TTLCache(maxsize=100, ttl=1800)  # 30 min
         self.summary_cache = TTLCache(maxsize=50, ttl=3600)  # 1 hour
         self.pending_comment: Dict[int, str] = {}  # tg_id -> issue_key (awaiting comment text)
+        self.pending_summary: Dict[int, bool] = {}  # tg_id -> awaiting issue key for summary
 
 state = AppState()
 
@@ -156,9 +157,13 @@ async def app_shutdown():
 # Helpers
 # =============================================================================
 def fmt_item(item: dict) -> str:
-    """Format checklist item for display."""
+    """Format checklist item with assignee."""
     mark = "✅" if item.get("checked") else "⬜"
-    text = (item.get("text") or "").strip().replace("\n", " ")[:100]
+    text = (item.get("text") or "").strip().replace("\n", " ")[:80]
+    assignee = item.get("assignee") or {}
+    name = assignee.get("display") or assignee.get("login") or ""
+    if name:
+        return f"{mark} {text} — _{name}_"
     return f"{mark} {text}"
 
 
@@ -188,16 +193,17 @@ def escape_md(text: str) -> str:
     return text
 
 
-def fmt_issue_link(issue: dict, prefix: str = "") -> str:
-    """Format issue as Markdown hyperlink: [KEY: Summary (date)](url)"""
+def fmt_issue_link(issue: dict, prefix: str = "", show_date: bool = True) -> str:
+    """Format issue as Markdown hyperlink with date outside: [KEY: Summary](url) (date)"""
     key = issue.get("key", "")
-    summary = escape_md((issue.get("summary") or "")[:60])
+    summary = escape_md((issue.get("summary") or "")[:55])
     url = issue.get("url") or f"https://tracker.yandex.ru/{key}"
-    date_str = fmt_date(issue.get("updatedAt"))
+    date_str = fmt_date(issue.get("updatedAt")) if show_date else ""
     
+    link = f"{prefix}[{key}: {summary}]({url})"
     if date_str:
-        return f"{prefix}[{key}: {summary} ({date_str})]({url})"
-    return f"{prefix}[{key}: {summary}]({url})"
+        return f"{link} ({date_str})"
+    return link
 
 
 def parse_response(r: httpx.Response) -> dict:
@@ -360,7 +366,7 @@ async def cmd_menu(m: Message):
         "🔗 /connect — привязать аккаунт\n"
         "👤 /me — проверить доступ\n"
         "⚙️ /settings — настройки\n\n"
-        "✅ /cl\\_my — мои чеклисты\n"
+        "✅ /cl\\_my — задачи с моим согласованием\n"
         "❔ /cl\\_my\\_open — ожидают согласование\n"
         "✔️ /done N — отметить пункт\n\n"
         "📣 /mentions — требующие ответа\n"
@@ -422,7 +428,7 @@ async def cmd_cl_my(m: Message):
         await m.answer(f"Нет задач за {days} дней")
         return
     
-    text, _, item_mapping = build_checklist_response(issues, "📋 *Мои чеклисты:*")
+    text, _, item_mapping = build_checklist_response(issues, "✅ *Задачи с моим согласованием:*")
     state.checklist_cache.set(f"cl:{tg_id}", item_mapping)
     
     # Split long messages
@@ -553,19 +559,9 @@ def kb_summary_actions(issue_key: str) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-@router.message(Command("summary"))
-@require_base_url
-async def cmd_summary(m: Message):
-    """Generate AI summary for issue."""
-    parts = (m.text or "").split()
-    if len(parts) != 2:
-        await m.answer("Использование: /summary ISSUE-KEY")
-        return
-
-    issue_key = parts[1].upper().strip()
-    tg_id = m.from_user.id
-    
-    # Check cache (but still show buttons)
+async def process_summary(m: Message, issue_key: str, tg_id: int):
+    """Process summary request for an issue."""
+    # Check cache
     cached = state.summary_cache.get(issue_key)
     if cached:
         await m.answer(
@@ -578,7 +574,7 @@ async def cmd_summary(m: Message):
     
     try:
         sc, data = await api_request("GET", f"/tracker/issue/{issue_key}/summary", {"tg": tg_id}, HTTP_TIMEOUT_LONG)
-        logger.info(f"Summary request for {issue_key}: status={sc}, data_keys={list(data.keys()) if isinstance(data, dict) else type(data)}")
+        logger.info(f"Summary for {issue_key}: status={sc}")
     except Exception as e:
         logger.error(f"Summary request failed: {e}")
         await loading.edit_text(f"❌ Ошибка запроса: {str(e)[:100]}")
@@ -606,6 +602,25 @@ async def cmd_summary(m: Message):
         await m.answer(text[4000:], reply_markup=kb_summary_actions(issue_key))
     else:
         await loading.edit_text(text, reply_markup=kb_summary_actions(issue_key))
+
+
+@router.message(Command("summary"))
+@require_base_url
+async def cmd_summary(m: Message):
+    """Generate AI summary for issue."""
+    from aiogram.types import ForceReply
+    
+    parts = (m.text or "").split()
+    if len(parts) < 2:
+        state.pending_summary[m.from_user.id] = True
+        await m.answer(
+            "🤖 Введите ключ задачи (например: INV-123):",
+            reply_markup=ForceReply(input_field_placeholder="INV-123")
+        )
+        return
+
+    issue_key = parts[1].upper().strip()
+    await process_summary(m, issue_key, m.from_user.id)
 
 # =============================================================================
 # Callback Handlers
@@ -677,61 +692,44 @@ async def handle_summary_callback(c: CallbackQuery):
     if len(parts) < 3:
         await c.answer("❌ Ошибка", show_alert=True)
         return
-    
+
     _, action, issue_key = parts
     tg_id = c.from_user.id
-    
+
     if action == "refresh":
         # Clear cache and regenerate
         state.summary_cache.data.pop(issue_key, None)
         await c.answer("🔄 Обновляю...")
         
-        # Send loading message as reply (more reliable than edit)
-        loading_msg = None
+        # Send new message for result
+        loading_msg = await c.message.reply(f"🤖 Генерирую резюме для {issue_key}...") if c.message else None
+        
         try:
-            if c.message:
-                loading_msg = await c.message.reply(f"🤖 Генерирую резюме для {issue_key}...")
+            sc, data = await api_request("GET", f"/tracker/issue/{issue_key}/summary", {"tg": tg_id}, HTTP_TIMEOUT_LONG)
         except Exception as e:
-            logger.error(f"Failed to send loading message: {e}")
+            logger.error(f"Summary refresh error: {e}")
+            if loading_msg:
+                await loading_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+            return
         
-        sc, data = await api_request("GET", f"/tracker/issue/{issue_key}/summary", {"tg": tg_id}, HTTP_TIMEOUT_LONG)
-        logger.info(f"Summary refresh for {issue_key}: status={sc}")
-        
-        if sc != 200:
-            error_map = {401: "Ошибка авторизации. /connect", 404: f"{issue_key} не найден"}
-            err_detail = data.get('error', f'Ошибка {sc}') if isinstance(data, dict) else f'Ошибка {sc}'
-            error_text = f"❌ {error_map.get(sc, err_detail)}"[:500]
-            try:
-                if loading_msg:
-                    await loading_msg.edit_text(error_text, reply_markup=kb_summary_actions(issue_key))
-                elif c.message:
-                    await c.message.reply(error_text, reply_markup=kb_summary_actions(issue_key))
-            except Exception as e:
-                logger.error(f"Failed to send error: {e}")
+        if sc != 200 or not isinstance(data, dict):
+            err = data.get('error', f'Ошибка {sc}') if isinstance(data, dict) else f'Ошибка {sc}'
+            if loading_msg:
+                await loading_msg.edit_text(f"❌ {err}"[:300], reply_markup=kb_summary_actions(issue_key))
             return
         
         summary = data.get("summary", "")
         url = data.get("issue_url", f"https://tracker.yandex.ru/{issue_key}")
         
-        if summary:
-            state.summary_cache.set(issue_key, {"summary": summary, "url": url})
-            text = f"📋 {issue_key}:\n\n{summary}\n\n🔗 {url}"
-            try:
-                if loading_msg:
-                    await loading_msg.edit_text(text[:4000], reply_markup=kb_summary_actions(issue_key))
-                elif c.message:
-                    await c.message.reply(text[:4000], reply_markup=kb_summary_actions(issue_key))
-            except Exception as e:
-                logger.error(f"Failed to send summary: {e}")
-        else:
-            try:
-                msg = "❌ Не удалось сгенерировать резюме"
-                if loading_msg:
-                    await loading_msg.edit_text(msg, reply_markup=kb_summary_actions(issue_key))
-                elif c.message:
-                    await c.message.reply(msg, reply_markup=kb_summary_actions(issue_key))
-            except Exception as e:
-                logger.error(f"Failed to send error: {e}")
+        if not summary:
+            if loading_msg:
+                await loading_msg.edit_text("❌ Пустой ответ от AI", reply_markup=kb_summary_actions(issue_key))
+            return
+        
+        state.summary_cache.set(issue_key, {"summary": summary, "url": url})
+        text = f"📋 {issue_key}:\n\n{summary}\n\n🔗 {url}"
+        if loading_msg:
+            await loading_msg.edit_text(text[:4000], reply_markup=kb_summary_actions(issue_key))
         return
     
     if action == "comment":
@@ -766,7 +764,6 @@ async def handle_summary_callback(c: CallbackQuery):
             return
         
         items = data.get("checklist_items") or []
-        
         if not items:
             await c.answer("📋 Нет чеклистов в этой задаче", show_alert=True)
             return
@@ -777,12 +774,10 @@ async def handle_summary_callback(c: CallbackQuery):
         for idx, item in enumerate(items[:15], 1):
             mark = "✅" if item.get("checked") else "⬜"
             text = (item.get("text") or "")[:40]
-            
-            # Get assignee display name
             assignee = item.get("assignee") or {}
-            assignee_name = assignee.get("display") or assignee.get("login") or ""
-            if assignee_name:
-                lines.append(f"{mark} {text} — _{assignee_name}_")
+            name = assignee.get("display") or assignee.get("login") or ""
+            if name:
+                lines.append(f"{mark} {text} — _{name}_")
             else:
                 lines.append(f"{mark} {text}")
             
@@ -793,18 +788,14 @@ async def handle_summary_callback(c: CallbackQuery):
         
         kb.adjust(5)
         
-        try:
-            if c.message:
-                await c.message.reply(
-                    "\n".join(lines),
-                    parse_mode="Markdown",
-                    reply_markup=kb.as_markup() if kb.buttons else None
-                )
-        except Exception as e:
-            logger.error(f"Failed to send checklist: {e}")
+        if c.message:
+            try:
+                await c.message.reply("\n".join(lines), parse_mode="Markdown", reply_markup=kb.as_markup() if kb.buttons else None)
+            except Exception as e:
+                logger.error(f"Failed to send checklist: {e}")
         await c.answer()
         return
-    
+
     await c.answer()
 
 
@@ -922,48 +913,44 @@ async def handle_settings_callback(c: CallbackQuery):
 
 
 # =============================================================================
-# Text Message Handler (for comments)
+# Text Message Handler (for comments and summary input)
 # =============================================================================
 @router.message(F.text)
 async def handle_text_message(m: Message):
-    """Handle plain text messages (for comments), excluding commands."""
+    """Handle plain text messages for pending inputs."""
     if not m.text or not m.from_user:
         return
-    
-    # Skip commands - they are handled by Command handlers
+
+    # Skip commands
     if m.text.startswith("/"):
         return
-    
+
     tg_id = m.from_user.id
+    text = m.text.strip()
     
-    # Check if user is awaiting comment input
-    issue_key = state.pending_comment.get(tg_id)
-    if not issue_key:
-        # No pending comment, ignore
+    # Check if awaiting summary issue key
+    if state.pending_summary.pop(tg_id, None):
+        issue_key = text.upper().replace(" ", "")
+        if not issue_key or len(issue_key) < 3:
+            await m.answer("❌ Неверный формат. Введите ключ задачи (например: INV-123)")
+            return
+        # Process summary request
+        await process_summary(m, issue_key, tg_id)
         return
     
-    # Clear pending state
-    state.pending_comment.pop(tg_id, None)
-    
-    comment_text = m.text.strip()
-    if not comment_text:
-        await m.answer("❌ Комментарий не может быть пустым")
+    # Check if awaiting comment input
+    issue_key = state.pending_comment.pop(tg_id, None)
+    if issue_key:
+        if not text:
+            await m.answer("❌ Комментарий не может быть пустым")
+            return
+        loading = await m.answer("💬 Отправляю комментарий...")
+        sc, data = await api_request("POST", f"/tracker/issue/{issue_key}/comment", {"tg": tg_id, "text": text})
+        if sc != 200:
+            await loading.edit_text(f"❌ {data.get('error', 'Ошибка')}"[:200])
+        else:
+            await loading.edit_text(f"✅ Комментарий добавлен к *{issue_key}*", parse_mode="Markdown")
         return
-    
-    # Send comment
-    loading = await m.answer("💬 Отправляю комментарий...")
-    
-    sc, data = await api_request("POST", f"/tracker/issue/{issue_key}/comment", {
-        "tg": tg_id,
-        "text": comment_text
-    })
-    
-    if sc != 200:
-        error_msg = data.get("error", "Ошибка отправки")
-        await loading.edit_text(f"❌ {error_msg}"[:200])
-        return
-    
-    await loading.edit_text(f"✅ Комментарий добавлен к *{issue_key}*", parse_mode="Markdown")
 
 
 # =============================================================================
@@ -976,7 +963,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="connect", description="🔗 Привязать аккаунт"),
         BotCommand(command="me", description="👤 Проверить доступ"),
         BotCommand(command="settings", description="⚙️ Настройки"),
-        BotCommand(command="cl_my", description="✅ Мои чеклисты"),
+        BotCommand(command="cl_my", description="✅ Задачи с моим согласованием"),
         BotCommand(command="cl_my_open", description="❔ Ожидают согласование"),
         BotCommand(command="done", description="✔️ Отметить пункт"),
         BotCommand(command="mentions", description="📣 Требующие ответа"),
@@ -995,7 +982,7 @@ async def run_bot():
             await state.bot.session.close()
         except Exception:
             pass
-    
+
     bot = Bot(token=BOT_TOKEN)
     state.bot = bot
     await setup_bot_commands(bot)
@@ -1122,10 +1109,10 @@ async def reminder_worker():
                         if issues:
                             has_items = True
                             lines.append("❔ *Ожидают согласование:*")
-                            for issue in issues[:3]:
-                                lines.append(f"• {issue.get('key')} — {issue.get('summary')[:50]}")
+                            for idx, issue in enumerate(issues[:3], 1):
+                                lines.append(f"{idx}. {fmt_issue_link(issue, show_date=False)}")
                             if len(issues) > 3:
-                                lines.append(f"...и ещё {len(issues) - 3}")
+                                lines.append(f"_...и ещё {len(issues) - 3}_")
                             lines.append("")
                 except Exception:
                     pass
@@ -1138,10 +1125,10 @@ async def reminder_worker():
                         if issues:
                             has_items = True
                             lines.append("📣 *Требуют ответа:*")
-                            for issue in issues[:3]:
-                                lines.append(f"• {issue.get('key')} — {issue.get('summary')[:50]}")
+                            for idx, issue in enumerate(issues[:3], 1):
+                                lines.append(f"{idx}. {fmt_issue_link(issue, show_date=False)}")
                             if len(issues) > 3:
-                                lines.append(f"...и ещё {len(issues) - 3}")
+                                lines.append(f"_...и ещё {len(issues) - 3}_")
                 except Exception:
                     pass
                 
