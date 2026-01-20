@@ -127,7 +127,7 @@ async def close_http_client() -> None:
 # FastAPI App
 # =============================================================================
 app = FastAPI(title="Tracker Bot", docs_url=None, redoc_url=None)
-router = Router()
+router = Router(name="main_router")
 
 
 @app.get("/")
@@ -776,9 +776,14 @@ async def run_bot():
     except Exception as e:
         logger.warning(f"Could not delete webhook: {e}")
     
-    dp = Dispatcher()
-    state.dispatcher = dp
-    dp.include_router(router)
+    # Reuse existing dispatcher or create new one
+    # This prevents "Router is already attached" error on restart
+    if state.dispatcher is None:
+        dp = Dispatcher()
+        dp.include_router(router)
+        state.dispatcher = dp
+    else:
+        dp = state.dispatcher
     
     # Start polling with retry
     max_retries = 3

@@ -763,7 +763,7 @@ class TrackerService:
         return {"http_status": 200, "body": issue_data}
 
     async def get_summons(self, tg_id: int, limit: int = 10) -> dict:
-        """Get issues where user was mentioned (summoned) in issue or comments"""
+        """Get issues where user was mentioned (summoned) - field 'Нужен ответ пользователя'"""
         u = await self.user_by_tg(tg_id)
         if u["http_status"] != 200:
             return u
@@ -781,24 +781,27 @@ class TrackerService:
         if limit == 10:
             limit = int(s.get("limit_results", 10))
 
-        # Search for issues where user is mentioned (summoned)
-        # Yandex Tracker uses "Followers: me()" or we search by login mention
+        # Build base query with queues filter
         base_query = f"Updated: >= now()-{days}d"
         if queues:
             queue_conditions = [f"Queue: {x}" for x in queues]
             q = " OR ".join(queue_conditions)
             base_query = f"({q}) AND {base_query}"
         
-        # Search for issues where user was summoned
-        summon_query = f'"{login}" Summons: notEmpty() {base_query}'
+        # Search for issues where user is in "Нужен ответ пользователя" (summonees) field
+        # Yandex Tracker API: "Нужен ответ пользователя": me() or Summonees: login
+        summon_query = f'"Нужен ответ пользователя": me() AND {base_query}'
         
-        st, payload = await self.tracker.search_issues(access, query=summon_query, limit=min(limit * 2, 50))
+        st, payload = await self.tracker.search_issues(access, query=summon_query, limit=min(limit * 3, 100))
         
         issues = []
         if st == 200:
             raw_issues = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
             
-            for issue in raw_issues[:limit]:
+            for issue in raw_issues:
+                if len(issues) >= limit:
+                    break
+                    
                 issue_key = issue.get("key")
                 if not issue_key:
                     continue
@@ -812,7 +815,9 @@ class TrackerService:
                     if r.status_code == 200:
                         comments = _safe_json(r)
                         if isinstance(comments, list):
-                            for comment in comments:
+                            # Get summonees from issue to find when user was summoned
+                            summonees = issue.get("summonees") or []
+                            for comment in reversed(comments):  # Check from newest
                                 author = comment.get("createdBy", {})
                                 if (author.get("login") or "").lower() == login:
                                     has_responded = True
