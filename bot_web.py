@@ -179,8 +179,11 @@ def fmt_date(date_str: Optional[str]) -> str:
 
 
 def escape_md(text: str) -> str:
-    """Escape special characters for Telegram Markdown."""
-    for ch in ('_', '*', '`', '['):
+    """Escape/clean special characters for Telegram Markdown link text."""
+    # Remove brackets that would break markdown links
+    text = text.replace("[", "(").replace("]", ")")
+    # Escape other markdown chars
+    for ch in ('_', '*', '`'):
         text = text.replace(ch, f'\\{ch}')
     return text
 
@@ -193,10 +196,8 @@ def fmt_issue_link(issue: dict, prefix: str = "") -> str:
     date_str = fmt_date(issue.get("updatedAt"))
     
     if date_str:
-        text = f"{prefix}[{key}: {summary} ({date_str})]({url})"
-    else:
-        text = f"{prefix}[{key}: {summary}]({url})"
-    return text
+        return f"{prefix}[{key}: {summary} ({date_str})]({url})"
+    return f"{prefix}[{key}: {summary}]({url})"
 
 
 def parse_response(r: httpx.Response) -> dict:
@@ -575,18 +576,26 @@ async def cmd_summary(m: Message):
     
     loading = await m.answer("🤖 Генерирую резюме...")
     
-    sc, data = await api_request("GET", f"/tracker/issue/{issue_key}/summary", {"tg": tg_id}, HTTP_TIMEOUT_LONG)
-    
-    if sc != 200:
-        error_map = {401: "Ошибка авторизации. /connect", 404: f"{issue_key} не найден"}
-        await loading.edit_text(f"❌ {error_map.get(sc, data.get('error', 'Ошибка'))}"[:500])
+    try:
+        sc, data = await api_request("GET", f"/tracker/issue/{issue_key}/summary", {"tg": tg_id}, HTTP_TIMEOUT_LONG)
+        logger.info(f"Summary request for {issue_key}: status={sc}, data_keys={list(data.keys()) if isinstance(data, dict) else type(data)}")
+    except Exception as e:
+        logger.error(f"Summary request failed: {e}")
+        await loading.edit_text(f"❌ Ошибка запроса: {str(e)[:100]}")
         return
     
-    summary = data.get("summary", "")
-    url = data.get("issue_url", f"https://tracker.yandex.ru/{issue_key}")
+    if sc != 200:
+        error_msg = data.get('error', str(data)[:100]) if isinstance(data, dict) else str(data)[:100]
+        error_map = {401: "Ошибка авторизации. /connect", 404: f"{issue_key} не найден"}
+        await loading.edit_text(f"❌ {error_map.get(sc, error_msg)}"[:500])
+        return
+    
+    summary = data.get("summary", "") if isinstance(data, dict) else ""
+    url = data.get("issue_url", f"https://tracker.yandex.ru/{issue_key}") if isinstance(data, dict) else f"https://tracker.yandex.ru/{issue_key}"
     
     if not summary:
-        await loading.edit_text("❌ Не удалось сгенерировать резюме")
+        err_detail = data.get("error", "Пустой ответ") if isinstance(data, dict) else "Неверный формат"
+        await loading.edit_text(f"❌ Не удалось сгенерировать резюме: {err_detail}"[:500])
         return
 
     state.summary_cache.set(issue_key, {"summary": summary, "url": url})
