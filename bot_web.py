@@ -39,7 +39,7 @@ HTTP_LIMITS = httpx.Limits(max_keepalive_connections=3, max_connections=5)
 # Cache settings
 CACHE_MAX_SIZE = 50
 CACHE_TTL_SECONDS = 3600  # 1 hour
-KEEP_ALIVE_INTERVAL = 600  # 10 minutes
+KEEP_ALIVE_INTERVAL = 300  # 5 minutes - more frequent for Render free tier
 
 # =============================================================================
 # Logging Configuration (simplified)
@@ -915,10 +915,14 @@ async def handle_settings_callback(c: CallbackQuery):
 # =============================================================================
 # Text Message Handler (for comments)
 # =============================================================================
-@router.message(F.text & ~F.text.startswith("/"))
+@router.message(F.text)
 async def handle_text_message(m: Message):
     """Handle plain text messages (for comments), excluding commands."""
     if not m.text or not m.from_user:
+        return
+    
+    # Skip commands - they are handled by Command handlers
+    if m.text.startswith("/"):
         return
     
     tg_id = m.from_user.id
@@ -976,6 +980,13 @@ async def run_bot():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN not set")
     
+    # Close previous bot session if exists
+    if state.bot:
+        try:
+            await state.bot.session.close()
+        except Exception:
+            pass
+    
     bot = Bot(token=BOT_TOKEN)
     state.bot = bot
     await setup_bot_commands(bot)
@@ -983,33 +994,35 @@ async def run_bot():
     # Clear old updates
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
     except Exception as e:
         logger.warning(f"Could not delete webhook: {e}")
     
-    # Reuse existing dispatcher or create new one
-    # This prevents "Router is already attached" error on restart
+    # Always use the same dispatcher (created once with router)
     if state.dispatcher is None:
         dp = Dispatcher()
         dp.include_router(router)
         state.dispatcher = dp
-    else:
-        dp = state.dispatcher
+    dp = state.dispatcher
     
     # Start polling with retry
-    max_retries = 3
+    max_retries = 5
     for attempt in range(max_retries):
         try:
+            logger.info(f"Starting bot polling (attempt {attempt + 1}/{max_retries})...")
             await dp.start_polling(
                 bot,
                 close_bot_session=False,
                 allowed_updates=["message", "callback_query"],
-                drop_pending_updates=True
+                drop_pending_updates=True,
+                polling_timeout=30
             )
             break
         except Exception as e:
-            if "Conflict" in str(e) and attempt < max_retries - 1:
-                logger.info(f"Conflict, retry {attempt + 1}/{max_retries}")
+            error_str = str(e)
+            logger.error(f"Bot polling error: {error_str}")
+            if ("Conflict" in error_str or "terminated" in error_str) and attempt < max_retries - 1:
+                logger.info(f"Conflict detected, retry {attempt + 1}/{max_retries}")
                 await asyncio.sleep(5 * (attempt + 1))
                 try:
                     await bot.delete_webhook(drop_pending_updates=True)
@@ -1027,15 +1040,17 @@ async def run_web():
 
 
 async def keep_alive():
-    """Keep service alive on Render (pings every 10 min)."""
+    """Keep service alive on Render (pings every 5 min)."""
     await asyncio.sleep(10)  # Wait for server start
+    logger.info("Keep-alive worker started")
     
     while not state.shutdown_event.is_set():
         try:
             client = await get_http_client()
-            await client.get(f"http://localhost:{PORT}/ping")
-        except Exception:
-            pass
+            resp = await client.get(f"http://localhost:{PORT}/ping")
+            logger.debug(f"Keep-alive ping: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Keep-alive ping failed: {e}")
         
         try:
             await asyncio.wait_for(state.shutdown_event.wait(), timeout=KEEP_ALIVE_INTERVAL)
