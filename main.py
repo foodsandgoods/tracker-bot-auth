@@ -1,16 +1,32 @@
+"""
+FastAPI service for Yandex Tracker OAuth and API proxy.
+Optimized for Render.com free tier (512MB RAM, shared CPU).
+"""
 import asyncio
+import logging
 import os
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from functools import wraps
+from typing import Any, Callable, Optional, TypeVar
 from urllib.parse import urlencode
 
+import asyncpg
 import httpx
-import psycopg
-from psycopg.rows import dict_row
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, RedirectResponse
+
+# Configure logging - minimal, no tokens in logs
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# Type var for retry decorator
+T = TypeVar("T")
 
 
 # =========================
@@ -27,7 +43,9 @@ class Settings:
     yandex_auth_url: str = "https://oauth.yandex.ru/authorize"
     yandex_token_url: str = "https://oauth.yandex.ru/token"
 
-    http_timeout_seconds: float = 25.0
+    # Timeouts optimized for low-resource server
+    http_timeout_default: float = 20.0
+    http_timeout_long: float = 30.0  # For AI summary
 
 
 def load_settings() -> Settings:
@@ -38,6 +56,34 @@ def load_settings() -> Settings:
         yandex_org_id=os.getenv("YANDEX_ORG_ID") or "",
         database_url=os.getenv("DATABASE_URL") or "",
     )
+
+
+# =========================
+# Retry decorator with exponential backoff
+# =========================
+def with_retry(
+    max_attempts: int = 3,
+    base_delay: float = 0.5,
+    max_delay: float = 5.0,
+    retryable_exceptions: tuple = (httpx.TimeoutException, httpx.ConnectError),
+) -> Callable:
+    """Decorator for async functions with exponential backoff retry."""
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> T:
+            last_exception: Optional[Exception] = None
+            for attempt in range(max_attempts):
+                try:
+                    return await func(*args, **kwargs)
+                except retryable_exceptions as e:
+                    last_exception = e
+                    if attempt < max_attempts - 1:
+                        delay = min(base_delay * (2 ** attempt), max_delay)
+                        logger.warning(f"Retry {attempt + 1}/{max_attempts} for {func.__name__} after {delay:.1f}s: {e}")
+                        await asyncio.sleep(delay)
+            raise last_exception  # type: ignore
+        return wrapper
+    return decorator
 
 
 # =========================
@@ -74,12 +120,10 @@ def _parse_state(state: str) -> int:
 
 
 def _normalize_queues_csv(s: str) -> str:
-    # "INV, DOC;HR" -> "INV,DOC,HR"
     raw = s.replace(";", ",").replace(" ", "")
     parts = [p for p in raw.split(",") if p]
-    # верхний регистр, уникальные, сохраняем порядок
-    seen = set()
-    out = []
+    seen: set[str] = set()
+    out: list[str] = []
     for p in parts:
         p2 = p.upper()
         if p2 not in seen:
@@ -95,63 +139,81 @@ def _queues_list(csv: str) -> list[str]:
 
 
 # =========================
-# Storage (Postgres)
+# Storage (PostgreSQL with asyncpg pool)
 # =========================
 class TokenStorage:
+    """Database storage with connection pooling for efficiency."""
+    
     def __init__(self, database_url: str):
         self.database_url = database_url
+        self._pool: Optional[asyncpg.Pool] = None
+
+    async def init_pool(self) -> None:
+        """Initialize connection pool with conservative settings for 512MB RAM."""
+        if self._pool is not None:
+            return
+        self._pool = await asyncpg.create_pool(
+            self.database_url,
+            min_size=1,      # Minimal idle connections
+            max_size=5,      # Max connections (low for free tier)
+            max_inactive_connection_lifetime=60.0,  # Close idle connections faster
+            command_timeout=30.0,
+        )
+        logger.info("Database pool initialized (1-5 connections)")
+
+    async def close_pool(self) -> None:
+        """Close connection pool gracefully."""
+        if self._pool:
+            await self._pool.close()
+            self._pool = None
+            logger.info("Database pool closed")
+
+    async def _get_pool(self) -> asyncpg.Pool:
+        if self._pool is None:
+            await self.init_pool()
+        return self._pool  # type: ignore
 
     async def ensure_schema(self) -> None:
-        async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS oauth_tokens (
-                        tg_id BIGINT PRIMARY KEY,
-                        access_token TEXT NOT NULL,
-                        refresh_token TEXT,
-                        token_type TEXT,
-                        expires_in BIGINT,
-                        obtained_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    );
-                    """
-                )
-                await cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS tg_users (
-                        tg_id BIGINT PRIMARY KEY,
-                        tracker_login TEXT NOT NULL,
-                        tracker_uid TEXT,
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    );
-                    """
-                )
-                await cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS tg_settings (
-                        tg_id BIGINT PRIMARY KEY,
-                        queues_csv TEXT NOT NULL DEFAULT '',
-                        days INT NOT NULL DEFAULT 30,
-                        limit_results INT NOT NULL DEFAULT 10,
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    );
-                    """
-                )
-                # Add limit_results column if it doesn't exist (for existing databases)
-                await cur.execute(
-                    """
-                    ALTER TABLE tg_settings
-                    ADD COLUMN IF NOT EXISTS limit_results INT NOT NULL DEFAULT 10;
-                    """
-                )
-                # Add reminder_hours column (0 = off, 1/3/6 = hours)
-                await cur.execute(
-                    """
-                    ALTER TABLE tg_settings
-                    ADD COLUMN IF NOT EXISTS reminder_hours INT NOT NULL DEFAULT 0;
-                    """
-                )
-            await conn.commit()
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS oauth_tokens (
+                    tg_id BIGINT PRIMARY KEY,
+                    access_token TEXT NOT NULL,
+                    refresh_token TEXT,
+                    token_type TEXT,
+                    expires_in BIGINT,
+                    obtained_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS tg_users (
+                    tg_id BIGINT PRIMARY KEY,
+                    tracker_login TEXT NOT NULL,
+                    tracker_uid TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS tg_settings (
+                    tg_id BIGINT PRIMARY KEY,
+                    queues_csv TEXT NOT NULL DEFAULT '',
+                    days INT NOT NULL DEFAULT 30,
+                    limit_results INT NOT NULL DEFAULT 10,
+                    reminder_hours INT NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+            # Add columns if they don't exist (for existing databases)
+            await conn.execute("""
+                ALTER TABLE tg_settings
+                ADD COLUMN IF NOT EXISTS limit_results INT NOT NULL DEFAULT 10;
+            """)
+            await conn.execute("""
+                ALTER TABLE tg_settings
+                ADD COLUMN IF NOT EXISTS reminder_hours INT NOT NULL DEFAULT 0;
+            """)
+        logger.info("Database schema ensured")
 
     async def upsert_token(
         self,
@@ -161,158 +223,134 @@ class TokenStorage:
         token_type: Optional[str],
         expires_in: Optional[int],
     ) -> None:
-        async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    INSERT INTO oauth_tokens (tg_id, access_token, refresh_token, token_type, expires_in, obtained_at)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (tg_id) DO UPDATE SET
-                        access_token = EXCLUDED.access_token,
-                        refresh_token = EXCLUDED.refresh_token,
-                        token_type = EXCLUDED.token_type,
-                        expires_in = EXCLUDED.expires_in,
-                        obtained_at = EXCLUDED.obtained_at;
-                    """,
-                    (
-                        tg_id,
-                        access_token,
-                        refresh_token,
-                        token_type,
-                        expires_in,
-                        datetime.now(timezone.utc),
-                    ),
-                )
-            await conn.commit()
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO oauth_tokens (tg_id, access_token, refresh_token, token_type, expires_in, obtained_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (tg_id) DO UPDATE SET
+                    access_token = EXCLUDED.access_token,
+                    refresh_token = EXCLUDED.refresh_token,
+                    token_type = EXCLUDED.token_type,
+                    expires_in = EXCLUDED.expires_in,
+                    obtained_at = EXCLUDED.obtained_at;
+            """, tg_id, access_token, refresh_token, token_type, expires_in, datetime.now(timezone.utc))
 
     async def get_tokens(self, tg_id: int) -> Optional[dict]:
-        async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT access_token, refresh_token FROM oauth_tokens WHERE tg_id=%s", (tg_id,))
-                row = await cur.fetchone()
-        return row
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT access_token, refresh_token FROM oauth_tokens WHERE tg_id=$1",
+                tg_id
+            )
+        if row:
+            return dict(row)
+        return None
 
     async def upsert_user(self, tg_id: int, tracker_login: str, tracker_uid: Optional[str]) -> None:
-        async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    INSERT INTO tg_users (tg_id, tracker_login, tracker_uid, updated_at)
-                    VALUES (%s, %s, %s, NOW())
-                    ON CONFLICT (tg_id) DO UPDATE SET
-                        tracker_login = EXCLUDED.tracker_login,
-                        tracker_uid = EXCLUDED.tracker_uid,
-                        updated_at = NOW();
-                    """,
-                    (tg_id, tracker_login, tracker_uid),
-                )
-            await conn.commit()
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO tg_users (tg_id, tracker_login, tracker_uid, updated_at)
+                VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (tg_id) DO UPDATE SET
+                    tracker_login = EXCLUDED.tracker_login,
+                    tracker_uid = EXCLUDED.tracker_uid,
+                    updated_at = NOW();
+            """, tg_id, tracker_login, tracker_uid)
 
     async def get_user(self, tg_id: int) -> Optional[dict]:
-        async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT tracker_login, tracker_uid FROM tg_users WHERE tg_id=%s", (tg_id,))
-                row = await cur.fetchone()
-        return row
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT tracker_login, tracker_uid FROM tg_users WHERE tg_id=$1",
+                tg_id
+            )
+        if row:
+            return dict(row)
+        return None
 
     async def ensure_settings_row(self, tg_id: int) -> None:
-        async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    INSERT INTO tg_settings (tg_id)
-                    VALUES (%s)
-                    ON CONFLICT (tg_id) DO NOTHING;
-                    """,
-                    (tg_id,),
-                )
-            await conn.commit()
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO tg_settings (tg_id)
+                VALUES ($1)
+                ON CONFLICT (tg_id) DO NOTHING;
+            """, tg_id)
 
     async def get_settings(self, tg_id: int) -> dict:
         await self.ensure_settings_row(tg_id)
-        async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT queues_csv, days, limit_results, reminder_hours FROM tg_settings WHERE tg_id=%s", (tg_id,))
-                row = await cur.fetchone()
-        return row or {"queues_csv": "", "days": 30, "limit_results": 10, "reminder_hours": 0}
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT queues_csv, days, limit_results, reminder_hours FROM tg_settings WHERE tg_id=$1",
+                tg_id
+            )
+        if row:
+            return dict(row)
+        return {"queues_csv": "", "days": 30, "limit_results": 10, "reminder_hours": 0}
 
     async def set_queues(self, tg_id: int, queues_csv: str) -> None:
         q = _normalize_queues_csv(queues_csv)
-        async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    INSERT INTO tg_settings (tg_id, queues_csv, updated_at)
-                    VALUES (%s, %s, NOW())
-                    ON CONFLICT (tg_id) DO UPDATE SET
-                        queues_csv = EXCLUDED.queues_csv,
-                        updated_at = NOW();
-                    """,
-                    (tg_id, q),
-                )
-            await conn.commit()
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO tg_settings (tg_id, queues_csv, updated_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (tg_id) DO UPDATE SET
+                    queues_csv = EXCLUDED.queues_csv,
+                    updated_at = NOW();
+            """, tg_id, q)
 
     async def set_days(self, tg_id: int, days: int) -> None:
         days = max(1, min(int(days), 3650))
-        async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    INSERT INTO tg_settings (tg_id, days, updated_at)
-                    VALUES (%s, %s, NOW())
-                    ON CONFLICT (tg_id) DO UPDATE SET
-                        days = EXCLUDED.days,
-                        updated_at = NOW();
-                    """,
-                    (tg_id, days),
-                )
-            await conn.commit()
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO tg_settings (tg_id, days, updated_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (tg_id) DO UPDATE SET
+                    days = EXCLUDED.days,
+                    updated_at = NOW();
+            """, tg_id, days)
 
     async def set_limit(self, tg_id: int, limit: int) -> None:
         limit = max(1, min(int(limit), 100))
-        async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    INSERT INTO tg_settings (tg_id, limit_results, updated_at)
-                    VALUES (%s, %s, NOW())
-                    ON CONFLICT (tg_id) DO UPDATE SET
-                        limit_results = EXCLUDED.limit_results,
-                        updated_at = NOW();
-                    """,
-                    (tg_id, limit),
-                )
-            await conn.commit()
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO tg_settings (tg_id, limit_results, updated_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (tg_id) DO UPDATE SET
+                    limit_results = EXCLUDED.limit_results,
+                    updated_at = NOW();
+            """, tg_id, limit)
 
     async def set_reminder(self, tg_id: int, hours: int) -> None:
         hours = hours if hours in (0, 1, 3, 6) else 0
-        async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    INSERT INTO tg_settings (tg_id, reminder_hours, updated_at)
-                    VALUES (%s, %s, NOW())
-                    ON CONFLICT (tg_id) DO UPDATE SET
-                        reminder_hours = EXCLUDED.reminder_hours,
-                        updated_at = NOW();
-                    """,
-                    (tg_id, hours),
-                )
-            await conn.commit()
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO tg_settings (tg_id, reminder_hours, updated_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (tg_id) DO UPDATE SET
+                    reminder_hours = EXCLUDED.reminder_hours,
+                    updated_at = NOW();
+            """, tg_id, hours)
 
     async def get_users_with_reminder(self) -> list[dict]:
-        """Get all users with reminder enabled (reminder_hours > 0)"""
-        async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT tg_id, reminder_hours FROM tg_settings WHERE reminder_hours > 0"
-                )
-                rows = await cur.fetchall()
-        return rows or []
+        """Get all users with reminder enabled (reminder_hours > 0)."""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT tg_id, reminder_hours FROM tg_settings WHERE reminder_hours > 0"
+            )
+        return [dict(r) for r in rows] if rows else []
 
 
 # =========================
-# HTTP clients
+# HTTP clients with retry
 # =========================
 class OAuthClient:
     def __init__(self, http: httpx.AsyncClient, settings: Settings):
@@ -331,6 +369,7 @@ class OAuthClient:
         }
         return f"{self.settings.yandex_auth_url}?{urlencode(params)}"
 
+    @with_retry(max_attempts=2, base_delay=1.0)
     async def exchange_code(self, code: str) -> dict[str, Any]:
         redirect_uri = f"{self.settings.base_url}/oauth/callback"
         data = {
@@ -343,11 +382,12 @@ class OAuthClient:
         r = await self.http.post(self.settings.yandex_token_url, data=data)
         payload = _safe_json(r)
         if r.status_code != 200:
-            raise RuntimeError(f"Token exchange failed: {r.status_code} {payload}")
+            raise RuntimeError(f"Token exchange failed: {r.status_code}")
         if "access_token" not in payload:
-            raise RuntimeError(f"Token exchange response has no access_token: {payload}")
+            raise RuntimeError("Token exchange response has no access_token")
         return payload
 
+    @with_retry(max_attempts=2, base_delay=1.0)
     async def refresh(self, refresh_token: str) -> dict[str, Any]:
         data = {
             "grant_type": "refresh_token",
@@ -358,25 +398,32 @@ class OAuthClient:
         r = await self.http.post(self.settings.yandex_token_url, data=data)
         payload = _safe_json(r)
         if r.status_code != 200:
-            raise RuntimeError(f"Token refresh failed: {r.status_code} {payload}")
+            raise RuntimeError(f"Token refresh failed: {r.status_code}")
         if "access_token" not in payload:
-            raise RuntimeError(f"Refresh response has no access_token: {payload}")
+            raise RuntimeError("Refresh response has no access_token")
         return payload
 
 
 class TrackerClient:
+    """Yandex Tracker API client with retry support."""
+    
     def __init__(self, http: httpx.AsyncClient, settings: Settings):
         self.http = http
         self.settings = settings
 
     def _headers(self, access_token: str) -> dict[str, str]:
-        return {"Authorization": f"OAuth {access_token}", "X-Org-Id": self.settings.yandex_org_id}
+        return {
+            "Authorization": f"OAuth {access_token}",
+            "X-Org-Id": self.settings.yandex_org_id,
+        }
 
+    @with_retry(max_attempts=3, base_delay=0.5)
     async def myself(self, access_token: str) -> tuple[int, Any]:
         url = "https://api.tracker.yandex.net/v2/myself"
         r = await self.http.get(url, headers=self._headers(access_token))
         return r.status_code, _safe_json(r)
 
+    @with_retry(max_attempts=3, base_delay=0.5)
     async def search_issues(self, access_token: str, query: str, limit: int = 50) -> tuple[int, Any]:
         url = "https://api.tracker.yandex.net/v2/issues/_search"
         headers = {**self._headers(access_token), "Content-Type": "application/json"}
@@ -384,60 +431,56 @@ class TrackerClient:
         r = await self.http.post(url, headers=headers, params=params, json={"query": query})
         return r.status_code, _safe_json(r)
 
+    @with_retry(max_attempts=3, base_delay=0.5)
     async def get_issue(self, access_token: str, issue_key: str) -> tuple[int, Any]:
         url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}"
         r = await self.http.get(url, headers=self._headers(access_token))
         return r.status_code, _safe_json(r)
 
     async def get_issue_with_changelog(self, access_token: str, issue_key: str) -> tuple[int, Any]:
-        """Get issue with changelog and comments"""
-        url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}"
-        
-        # Получаем основную информацию о задаче
-        r = await self.http.get(url, headers=self._headers(access_token))
-        if r.status_code != 200:
-            return r.status_code, _safe_json(r)
-        
-        issue_data = _safe_json(r)
-        if not isinstance(issue_data, dict):
-            return r.status_code, issue_data
-        
-        # Получаем комментарии отдельным запросом
+        """Get issue with changelog and comments for summary generation."""
+        st, issue_data = await self.get_issue(access_token, issue_key)
+        if st != 200 or not isinstance(issue_data, dict):
+            return st, issue_data
+
+        # Fetch comments
         try:
             comments_url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/comments"
-            r_comments = await self.http.get(comments_url, headers=self._headers(access_token))
-            if r_comments.status_code == 200:
-                comments_data = _safe_json(r_comments)
-                if isinstance(comments_data, list):
-                    issue_data["comments"] = comments_data
-                elif isinstance(comments_data, dict) and "values" in comments_data:
-                    issue_data["comments"] = comments_data.get("values", [])
+            r = await self.http.get(comments_url, headers=self._headers(access_token))
+            if r.status_code == 200:
+                comments = _safe_json(r)
+                if isinstance(comments, list):
+                    issue_data["comments"] = comments
+                elif isinstance(comments, dict) and "values" in comments:
+                    issue_data["comments"] = comments.get("values", [])
         except Exception as e:
-            print(f"Failed to fetch comments: {e}")
+            logger.debug(f"Failed to fetch comments for {issue_key}: {e}")
             issue_data["comments"] = []
-        
-        # Получаем историю изменений отдельным запросом
+
+        # Fetch changelog
         try:
             changelog_url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/changelog"
-            r_changelog = await self.http.get(changelog_url, headers=self._headers(access_token))
-            if r_changelog.status_code == 200:
-                changelog_data = _safe_json(r_changelog)
-                if isinstance(changelog_data, list):
-                    issue_data["changelog"] = changelog_data
-                elif isinstance(changelog_data, dict) and "values" in changelog_data:
-                    issue_data["changelog"] = changelog_data.get("values", [])
+            r = await self.http.get(changelog_url, headers=self._headers(access_token))
+            if r.status_code == 200:
+                changelog = _safe_json(r)
+                if isinstance(changelog, list):
+                    issue_data["changelog"] = changelog
+                elif isinstance(changelog, dict) and "values" in changelog:
+                    issue_data["changelog"] = changelog.get("values", [])
         except Exception as e:
-            print(f"Failed to fetch changelog: {e}")
+            logger.debug(f"Failed to fetch changelog for {issue_key}: {e}")
             issue_data["changelog"] = []
-        
+
         return 200, issue_data
 
+    @with_retry(max_attempts=2, base_delay=0.5)
     async def patch_issue(self, access_token: str, issue_key: str, patch: dict) -> tuple[int, Any]:
         url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}"
         headers = {**self._headers(access_token), "Content-Type": "application/json"}
         r = await self.http.patch(url, headers=headers, json=patch)
         return r.status_code, _safe_json(r)
 
+    @with_retry(max_attempts=2, base_delay=0.5)
     async def add_comment(self, access_token: str, issue_key: str, text: str) -> tuple[int, Any]:
         """Add a comment to an issue."""
         url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/comments"
@@ -461,7 +504,12 @@ class TrackerService:
             return None, {"http_status": 401, "body": {"error": "No token. Use /connect first."}}
 
         access = tokens["access_token"]
-        st, me = await self.tracker.myself(access)
+        try:
+            st, me = await self.tracker.myself(access)
+        except Exception as e:
+            logger.warning(f"Token validation failed for tg_id={tg_id}: {e}")
+            return None, {"http_status": 503, "body": {"error": "Tracker API unavailable"}}
+
         if st != 401:
             if st == 200 and isinstance(me, dict):
                 login = me.get("login")
@@ -470,21 +518,33 @@ class TrackerService:
                     await self.storage.upsert_user(tg_id, login, str(uid) if uid is not None else None)
             return access, None
 
+        # Token expired, try refresh
         refresh_token = tokens.get("refresh_token")
         if not refresh_token:
             return None, {"http_status": 401, "body": {"error": "Expired token and no refresh_token. Reconnect."}}
 
-        new_payload = await self.oauth.refresh(refresh_token)
+        try:
+            new_payload = await self.oauth.refresh(refresh_token)
+        except Exception as e:
+            logger.warning(f"Token refresh failed for tg_id={tg_id}: {e}")
+            return None, {"http_status": 401, "body": {"error": "Token refresh failed. Reconnect."}}
+
         new_access = new_payload.get("access_token")
         new_refresh = new_payload.get("refresh_token") or refresh_token
-        await self.storage.upsert_token(tg_id, new_access, new_refresh, new_payload.get("token_type"), new_payload.get("expires_in"))
+        await self.storage.upsert_token(
+            tg_id, new_access, new_refresh,
+            new_payload.get("token_type"), new_payload.get("expires_in")
+        )
 
-        st2, me2 = await self.tracker.myself(new_access)
-        if st2 == 200 and isinstance(me2, dict):
-            login2 = me2.get("login")
-            uid2 = me2.get("trackerUid") or me2.get("passportUid") or me2.get("uid")
-            if login2:
-                await self.storage.upsert_user(tg_id, login2, str(uid2) if uid2 is not None else None)
+        try:
+            st2, me2 = await self.tracker.myself(new_access)
+            if st2 == 200 and isinstance(me2, dict):
+                login2 = me2.get("login")
+                uid2 = me2.get("trackerUid") or me2.get("passportUid") or me2.get("uid")
+                if login2:
+                    await self.storage.upsert_user(tg_id, login2, str(uid2) if uid2 is not None else None)
+        except Exception:
+            pass
 
         return new_access, None
 
@@ -507,14 +567,17 @@ class TrackerService:
         access, err = await self._get_valid_access_token(tg_id)
         if err:
             return err
-        st, payload = await self.tracker.myself(access)
+        try:
+            st, payload = await self.tracker.myself(access)
+        except Exception as e:
+            return {"http_status": 503, "body": {"error": f"Tracker API error: {e}"}}
         return {"http_status": 200, "body": {"status_code": st, "response": payload}}
 
     async def settings_get(self, tg_id: int) -> dict:
         s = await self.storage.get_settings(tg_id)
         return {"http_status": 200, "body": {
-            "queues": _queues_list(s.get("queues_csv", "")), 
-            "days": s.get("days", 30), 
+            "queues": _queues_list(s.get("queues_csv", "")),
+            "days": s.get("days", 30),
             "limit": s.get("limit_results", 10),
             "reminder": s.get("reminder_hours", 0)
         }}
@@ -542,11 +605,8 @@ class TrackerService:
         base = f"Updated: >= now()-{int(days)}d"
         if not queues:
             return base
-        # Yandex Tracker syntax: Queue: KEY OR Queue: KEY2 OR Queue: KEY3
-        # Each queue condition should be separate
         queue_conditions = [f"Queue: {x}" for x in queues]
         q = " OR ".join(queue_conditions)
-        # Wrap in parentheses to ensure proper precedence
         return f"({q}) AND {base}"
 
     @staticmethod
@@ -570,21 +630,22 @@ class TrackerService:
         s = await self.storage.get_settings(tg_id)
         queues = _queues_list(s.get("queues_csv", ""))
         days = int(s.get("days", 30))
-        # Use limit from settings if not provided as parameter
-        if limit == 10:  # default value
+        if limit == 10:
             limit = int(s.get("limit_results", 10))
 
         query = self._build_candidate_query(queues, days)
-        # Increase search limit to get more results from all queues
-        # Need more issues to find matches across all selected queues
-        search_limit = min(max(50, limit * 5), 150)  # Between 50 and 150 issues
-        st, payload = await self.tracker.search_issues(access, query=query, limit=search_limit)
+        search_limit = min(max(50, limit * 5), 150)
+
+        try:
+            st, payload = await self.tracker.search_issues(access, query=query, limit=search_limit)
+        except Exception as e:
+            return {"http_status": 503, "body": {"error": f"Search failed: {e}"}}
+
         if st != 200:
             return {"http_status": 200, "body": {"status_code": st, "response": payload, "query": query}}
 
         issues = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
-        
-        # Early exit if no issues found
+
         if not issues:
             return {
                 "http_status": 200,
@@ -596,121 +657,96 @@ class TrackerService:
                     "login": login,
                 },
             }
-        
-        # Create lookup dict for O(1) access instead of O(n) search
+
         issues_by_key = {it.get("key"): it for it in issues if it.get("key")}
-        issue_keys = list(issues_by_key.keys())
-        
-        # Process more issues to get results from all queues
-        max_keys_to_process = min(len(issue_keys), 120)  # Increased to get more from all queues
-        issue_keys = issue_keys[:max_keys_to_process]
-        
-        # Fetch all issues in parallel for better performance
+        issue_keys = list(issues_by_key.keys())[:min(len(issues_by_key), 120)]
+
         async def fetch_issue(key: str) -> tuple[str, dict | None]:
             try:
                 sti, issue_full = await self.tracker.get_issue(access, key)
                 if sti == 200 and isinstance(issue_full, dict):
                     return key, issue_full
             except Exception:
-                # Silently handle errors to not slow down processing
                 pass
             return key, None
-        
-        # Optimized batch size - balance between speed and resource usage
-        batch_size = 20  # Increased for better parallelism
+
+        batch_size = 20
         result: list[dict] = []
-        
-        # Process batches - process more to ensure we get results from all queues
+
         for i in range(0, len(issue_keys), batch_size):
-            # Process more batches to get results from all queues
-            # Only exit if we have significantly more results than needed
-            if len(result) >= limit * 2:  # Process 2x to get diversity from all queues
+            if len(result) >= limit * 2:
                 break
-                
+
             batch_keys = issue_keys[i:i + batch_size]
             batch_results = await asyncio.gather(
                 *[fetch_issue(key) for key in batch_keys],
                 return_exceptions=True
             )
-            
+
             for result_item in batch_results:
-                # Don't exit early - we need to process more to get results from all queues
-                # The final filtering will happen after all processing
-                    
-                # Handle exceptions from gather
                 if isinstance(result_item, Exception):
                     continue
                 key, issue_full = result_item
                 if issue_full is None:
                     continue
-                
+
                 checklist_items = self._extract_checklist_items(issue_full)
                 if not checklist_items:
                     continue
 
-                # Optimize checklist item processing
                 matched_items = []
-                login_lower = login  # Cache lowercase login
                 for ci in checklist_items:
-                    # Early skip if checked and we only want unchecked
                     if only_unchecked and ci.get("checked") is True:
                         continue
-                    
-                    # Fast path: check assignee login
+
                     ass = ci.get("assignee")
-                    if not ass or (ass.get("login") or "").lower() != login_lower:
+                    if not ass or (ass.get("login") or "").lower() != login:
                         continue
-                    
-                    # Build item dict efficiently
-                    matched_items.append(
-                        {
-                            "id": str(ci.get("id", "")),
-                            "text": (ci.get("text") or ci.get("textHtml") or "").strip(),
-                            "checked": bool(ci.get("checked", False)),
-                        }
-                    )
+
+                    matched_items.append({
+                        "id": str(ci.get("id", "")),
+                        "text": (ci.get("text") or ci.get("textHtml") or "").strip(),
+                        "checked": bool(ci.get("checked", False)),
+                        "assignee": {"display": ass.get("display"), "login": ass.get("login")},
+                    })
 
                 if matched_items:
-                    # Use O(1) dict lookup instead of O(n) linear search
                     orig_issue = issues_by_key.get(key, {})
-                    # Extract updated date from issue (prioritize full issue data)
-                    updated_at = issue_full.get("updatedAt") or issue_full.get("updated") or orig_issue.get("updatedAt") or orig_issue.get("updated")
-                    result.append(
-                        {
-                            "key": key,
-                            "summary": orig_issue.get("summary") or issue_full.get("summary") or "",
-                            "url": f"https://tracker.yandex.ru/{key}",
-                            "updatedAt": updated_at,
-                            "items": matched_items,
-                        }
+                    updated_at = (
+                        issue_full.get("updatedAt") or issue_full.get("updated") or
+                        orig_issue.get("updatedAt") or orig_issue.get("updated")
                     )
-        
-        # Limit results to requested amount, but keep diversity from all queues
+                    result.append({
+                        "key": key,
+                        "summary": orig_issue.get("summary") or issue_full.get("summary") or "",
+                        "url": f"https://tracker.yandex.ru/{key}",
+                        "updatedAt": updated_at,
+                        "items": matched_items,
+                    })
+
+        # Distribute results across queues for diversity
         if len(result) > limit:
-            # Try to keep results from different queues
             result_by_queue: dict[str, list[dict]] = {}
             for r in result:
                 queue = r["key"].split("-")[0] if "-" in r["key"] else "UNKNOWN"
                 if queue not in result_by_queue:
                     result_by_queue[queue] = []
                 result_by_queue[queue].append(r)
-            
-            # Take results from each queue proportionally
-            final_result = []
+
+            final_result: list[dict] = []
             per_queue = max(1, limit // max(len(result_by_queue), 1))
             for queue_results in result_by_queue.values():
                 final_result.extend(queue_results[:per_queue])
                 if len(final_result) >= limit:
                     break
-            
-            # Fill remaining slots if needed
+
             if len(final_result) < limit:
                 for r in result:
                     if r not in final_result:
                         final_result.append(r)
                         if len(final_result) >= limit:
                             break
-            
+
             result = final_result[:limit]
 
         return {
@@ -729,8 +765,11 @@ class TrackerService:
         if err:
             return err
 
-        # 1) получить issue, достать checklistItems
-        sti, issue_full = await self.tracker.get_issue(access, issue_key)
+        try:
+            sti, issue_full = await self.tracker.get_issue(access, issue_key)
+        except Exception as e:
+            return {"http_status": 503, "body": {"error": f"Get issue failed: {e}"}}
+
         if sti != 200 or not isinstance(issue_full, dict):
             return {"http_status": 200, "body": {"status_code": sti, "response": issue_full}}
 
@@ -738,7 +777,6 @@ class TrackerService:
         if not items:
             return {"http_status": 404, "body": {"error": "No checklistItems in issue"}}
 
-        # 2) обновить checked у нужного item
         found = False
         new_items = []
         for ci in items:
@@ -751,22 +789,29 @@ class TrackerService:
                 new_items.append(ci)
 
         if not found:
-            return {"http_status": 404, "body": {"error": "Checklist item not found in issue", "item_id": item_id}}
+            return {"http_status": 404, "body": {"error": "Checklist item not found", "item_id": item_id}}
 
-        # 3) PATCH issue (возможный формат)
-        stp, resp = await self.tracker.patch_issue(access, issue_key, {"checklistItems": new_items})
+        try:
+            stp, resp = await self.tracker.patch_issue(access, issue_key, {"checklistItems": new_items})
+        except Exception as e:
+            return {"http_status": 503, "body": {"error": f"Patch failed: {e}"}}
+
         return {"http_status": 200, "body": {"status_code": stp, "response": resp}}
 
     async def get_issue_full(self, tg_id: int, issue_key: str) -> dict:
-        """Get full issue data with changelog and comments for summary generation"""
+        """Get full issue data with changelog and comments for summary generation."""
         access, err = await self._get_valid_access_token(tg_id)
         if err:
             return err
-        
-        st, issue_data = await self.tracker.get_issue_with_changelog(access, issue_key)
+
+        try:
+            st, issue_data = await self.tracker.get_issue_with_changelog(access, issue_key)
+        except Exception as e:
+            return {"http_status": 503, "body": {"error": f"Get issue failed: {e}"}}
+
         if st != 200:
             return {"http_status": st, "body": issue_data}
-        
+
         return {"http_status": 200, "body": issue_data}
 
     async def get_issue_checklist(self, tg_id: int, issue_key: str) -> dict:
@@ -774,11 +819,15 @@ class TrackerService:
         access, err = await self._get_valid_access_token(tg_id)
         if err:
             return err
-        
-        st, issue_data = await self.tracker.get_issue(access, issue_key)
+
+        try:
+            st, issue_data = await self.tracker.get_issue(access, issue_key)
+        except Exception as e:
+            return {"http_status": 503, "body": {"error": f"Get issue failed: {e}"}}
+
         if st != 200:
             return {"http_status": st, "body": issue_data}
-        
+
         items = self._extract_checklist_items(issue_data)
         return {
             "http_status": 200,
@@ -789,7 +838,7 @@ class TrackerService:
         }
 
     async def get_summons(self, tg_id: int, limit: int = 10) -> dict:
-        """Get issues where user was mentioned (summoned) - field 'Нужен ответ пользователя'"""
+        """Get issues where user was mentioned (field 'Нужен ответ пользователя')."""
         u = await self.user_by_tg(tg_id)
         if u["http_status"] != 200:
             return u
@@ -807,50 +856,51 @@ class TrackerService:
         if limit == 10:
             limit = int(s.get("limit_results", 10))
 
-        # Build base query with queues filter
         base_query = f"Updated: >= now()-{days}d"
         if queues:
             queue_conditions = [f"Queue: {x}" for x in queues]
             q = " OR ".join(queue_conditions)
             base_query = f"({q}) AND {base_query}"
-        
-        # Search for issues where user is in "Нужен ответ пользователя" (summonees) field
-        # Yandex Tracker API: "Нужен ответ пользователя": me() or Summonees: login
+
         summon_query = f'"Нужен ответ пользователя": me() AND {base_query}'
-        
-        st, payload = await self.tracker.search_issues(access, query=summon_query, limit=min(limit * 3, 100))
-        
+
+        try:
+            st, payload = await self.tracker.search_issues(access, query=summon_query, limit=min(limit * 3, 100))
+        except Exception as e:
+            return {"http_status": 503, "body": {"error": f"Search failed: {e}"}}
+
         issues = []
         if st == 200:
             raw_issues = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
-            
+
             for issue in raw_issues:
                 if len(issues) >= limit:
                     break
-                    
+
                 issue_key = issue.get("key")
                 if not issue_key:
                     continue
-                
-                # Check if user has responded (commented on the issue after being summoned)
+
+                # Check if user has responded
                 has_responded = False
                 try:
                     comments_url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/comments"
-                    headers = {"Authorization": f"OAuth {access}", "X-Org-Id": self.tracker.settings.yandex_org_id}
+                    headers = {
+                        "Authorization": f"OAuth {access}",
+                        "X-Org-Id": self.tracker.settings.yandex_org_id,
+                    }
                     r = await self.tracker.http.get(comments_url, headers=headers)
                     if r.status_code == 200:
                         comments = _safe_json(r)
                         if isinstance(comments, list):
-                            # Get summonees from issue to find when user was summoned
-                            summonees = issue.get("summonees") or []
-                            for comment in reversed(comments):  # Check from newest
+                            for comment in reversed(comments):
                                 author = comment.get("createdBy", {})
                                 if (author.get("login") or "").lower() == login:
                                     has_responded = True
                                     break
                 except Exception:
                     pass
-                
+
                 issues.append({
                     "key": issue_key,
                     "summary": issue.get("summary") or "",
@@ -870,36 +920,26 @@ class TrackerService:
         }
 
     async def issue_summary(self, tg_id: int, issue_key: str) -> dict:
-        """Generate AI summary for issue"""
-        # Получаем данные задачи
+        """Generate AI summary for issue."""
         issue_result = await self.get_issue_full(tg_id, issue_key)
         if issue_result["http_status"] != 200:
             return issue_result
-        
+
         issue_data = issue_result["body"]
-        
-        # Генерируем summary с помощью ИИ
+
         try:
             from ai_service import generate_summary
-            summary_text, error_msg = await generate_summary(issue_data)
+            summary_text, error_msg = await generate_summary(issue_data, _http)
         except ImportError as e:
-            return {
-                "http_status": 500,
-                "body": {"error": f"AI service module not found: {str(e)}"}
-            }
+            return {"http_status": 500, "body": {"error": f"AI module not found: {e}"}}
         except Exception as e:
-            return {
-                "http_status": 500,
-                "body": {"error": f"AI service error: {str(e)}"}
-            }
-        
+            logger.error(f"AI summary error for {issue_key}: {e}")
+            return {"http_status": 500, "body": {"error": f"AI service error: {e}"}}
+
         if not summary_text:
-            error_detail = error_msg or "Неизвестная ошибка"
-            return {
-                "http_status": 500,
-                "body": {"error": f"Не удалось сгенерировать резюме: {error_detail}"}
-            }
-        
+            error_detail = error_msg or "Unknown error"
+            return {"http_status": 500, "body": {"error": f"Summary generation failed: {error_detail}"}}
+
         return {
             "http_status": 200,
             "body": {
@@ -914,11 +954,15 @@ class TrackerService:
         access, err = await self._get_valid_access_token(tg_id)
         if err:
             return err
-        
-        st, resp = await self.tracker.add_comment(access, issue_key, text)
+
+        try:
+            st, resp = await self.tracker.add_comment(access, issue_key, text)
+        except Exception as e:
+            return {"http_status": 503, "body": {"error": f"Add comment failed: {e}"}}
+
         if st not in (200, 201):
             return {"http_status": st, "body": resp}
-        
+
         return {
             "http_status": 200,
             "body": {
@@ -932,7 +976,7 @@ class TrackerService:
 # =========================
 # FastAPI wiring
 # =========================
-app = FastAPI()
+app = FastAPI(title="Tracker Bot Auth", version="2.0.0")
 settings = load_settings()
 
 _http: Optional[httpx.AsyncClient] = None
@@ -945,19 +989,20 @@ _service: Optional[TrackerService] = None
 @app.on_event("startup")
 async def startup():
     global _http, _storage, _oauth, _tracker, _service
-    # Optimize HTTP client for low-resource servers:
-    # - Connection pooling with limits
-    # - Keep-alive connections
-    # - Reduced timeout for faster failures
-    limits = httpx.Limits(max_keepalive_connections=10, max_connections=20, keepalive_expiry=30.0)
-    timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=5.0)
-    _http = httpx.AsyncClient(
-        timeout=timeout,
-        limits=limits,
+
+    # HTTP client optimized for low-resource server
+    limits = httpx.Limits(
+        max_keepalive_connections=8,
+        max_connections=15,
+        keepalive_expiry=30.0,
     )
+    timeout = httpx.Timeout(connect=10.0, read=25.0, write=10.0, pool=5.0)
+    _http = httpx.AsyncClient(timeout=timeout, limits=limits)
+    logger.info("HTTP client initialized")
 
     if settings.database_url:
         _storage = TokenStorage(settings.database_url)
+        await _storage.init_pool()
         await _storage.ensure_schema()
 
     cfg_err = _require(settings)
@@ -965,14 +1010,18 @@ async def startup():
         _oauth = OAuthClient(_http, settings)
         _tracker = TrackerClient(_http, settings)
         _service = TrackerService(_storage, _oauth, _tracker)
+        logger.info("Service layer initialized")
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    global _http
+    global _http, _storage
+    if _storage:
+        await _storage.close_pool()
     if _http:
         await _http.aclose()
         _http = None
+    logger.info("Shutdown complete")
 
 
 # =========================
@@ -980,7 +1029,7 @@ async def shutdown():
 # =========================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "tracker-bot-auth"}
+    return {"ok": True, "service": "tracker-bot-auth", "version": "2.0.0"}
 
 
 @app.get("/ping")
@@ -1020,7 +1069,8 @@ async def oauth_callback(code: str | None = None, state: str | None = None, erro
     try:
         token_payload = await _oauth.exchange_code(code)
     except Exception as e:
-        return JSONResponse({"ok": False, "error": "Token exchange failed", "detail": str(e)}, status_code=400)
+        logger.warning(f"Token exchange failed: {e}")
+        return JSONResponse({"ok": False, "error": "Token exchange failed"}, status_code=400)
 
     access = token_payload.get("access_token")
     refresh = token_payload.get("refresh_token")
@@ -1029,14 +1079,17 @@ async def oauth_callback(code: str | None = None, state: str | None = None, erro
 
     await _storage.upsert_token(tg_id, access, refresh, token_type, expires_in)
 
-    st, me = await _tracker.myself(access)
-    if st == 200 and isinstance(me, dict):
-        login = me.get("login")
-        uid = me.get("trackerUid") or me.get("passportUid") or me.get("uid")
-        if login:
-            await _storage.upsert_user(tg_id, login, str(uid) if uid is not None else None)
+    try:
+        st, me = await _tracker.myself(access)
+        if st == 200 and isinstance(me, dict):
+            login = me.get("login")
+            uid = me.get("trackerUid") or me.get("passportUid") or me.get("uid")
+            if login:
+                await _storage.upsert_user(tg_id, login, str(uid) if uid is not None else None)
+    except Exception as e:
+        logger.warning(f"Failed to get user info: {e}")
 
-    return JSONResponse({"ok": True, "message": "Connected. Return to Telegram and run /me", "tg": tg_id}, status_code=200)
+    return JSONResponse({"ok": True, "message": "Connected. Return to Telegram and run /me", "tg": tg_id})
 
 
 @app.get("/tracker/me_by_tg")
@@ -1116,7 +1169,7 @@ async def tg_users_with_reminder():
         return cfg_err
     assert _service is not None
     users = await _service.get_users_with_reminder()
-    return JSONResponse({"users": users}, status_code=200)
+    return JSONResponse({"users": users})
 
 
 @app.get("/tracker/summons")

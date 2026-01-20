@@ -1,14 +1,12 @@
 """
 Telegram Bot for Yandex Tracker integration.
-Optimized for low-resource servers (Render free tier).
+Optimized for Render.com free tier (512MB RAM, shared CPU).
 """
 import os
-import sys
 import asyncio
-import re
+import signal
 import time
 import logging
-import signal
 from datetime import datetime
 from functools import wraps
 from typing import Optional, Tuple, Dict, List, Any
@@ -29,38 +27,44 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 BASE_URL = (os.getenv("BASE_URL") or "").rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
-DEBUG = os.getenv("DEBUG", "").lower() == "true"
 
-# HTTP settings optimized for low-resource server
+# HTTP settings - conservative for 512MB RAM
 HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0)
 HTTP_TIMEOUT_LONG = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=5.0)
 HTTP_LIMITS = httpx.Limits(max_keepalive_connections=3, max_connections=5)
 
-# Cache settings
-CACHE_MAX_SIZE = 50
-CACHE_TTL_SECONDS = 3600  # 1 hour
-KEEP_ALIVE_INTERVAL = 300  # 5 minutes - more frequent for Render free tier
+# Cache settings - reduced for memory efficiency
+CACHE_CHECKLIST_SIZE = 30  # Reduced from 100
+CACHE_CHECKLIST_TTL = 1200  # 20 min (reduced from 30)
+CACHE_SUMMARY_SIZE = 20  # Reduced from 50
+CACHE_SUMMARY_TTL = 2400  # 40 min (reduced from 60)
+PENDING_STATE_MAX_AGE = 600  # 10 min - cleanup old pending states
+
+KEEP_ALIVE_INTERVAL = 300  # 5 minutes
 
 # =============================================================================
-# Logging Configuration (simplified)
+# Logging Configuration
 # =============================================================================
 logging.basicConfig(
-    level=logging.INFO if DEBUG else logging.WARNING,
+    level=logging.WARNING,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Suppress aiogram conflict errors
+# Suppress aiogram verbose logs
 for name in ["aiogram", "aiogram.event", "aiogram.dispatcher", "aiogram.polling"]:
     logging.getLogger(name).setLevel(logging.ERROR)
 
+
 # =============================================================================
-# Simple LRU Cache with TTL
+# LRU Cache with TTL
 # =============================================================================
 class TTLCache:
-    """Simple LRU cache with TTL, bounded size."""
+    """LRU cache with TTL and bounded size."""
     
-    def __init__(self, maxsize: int = CACHE_MAX_SIZE, ttl: int = CACHE_TTL_SECONDS):
+    __slots__ = ('_cache', '_maxsize', '_ttl')
+    
+    def __init__(self, maxsize: int, ttl: int):
         self._cache: OrderedDict = OrderedDict()
         self._maxsize = maxsize
         self._ttl = ttl
@@ -72,7 +76,6 @@ class TTLCache:
         if time.time() - timestamp > self._ttl:
             del self._cache[key]
             return None
-        # Move to end (LRU)
         self._cache.move_to_end(key)
         return value
     
@@ -80,36 +83,104 @@ class TTLCache:
         if key in self._cache:
             self._cache.move_to_end(key)
         self._cache[key] = (value, time.time())
-        # Evict oldest if over size
         while len(self._cache) > self._maxsize:
             self._cache.popitem(last=False)
     
+    def pop(self, key: str, default: Any = None) -> Any:
+        """Remove and return value."""
+        if key in self._cache:
+            value, _ = self._cache.pop(key)
+            return value
+        return default
+    
     def clear(self) -> None:
         self._cache.clear()
+    
+    def cleanup_expired(self) -> int:
+        """Remove expired entries, return count removed."""
+        now = time.time()
+        expired = [k for k, (_, ts) in self._cache.items() if now - ts > self._ttl]
+        for k in expired:
+            del self._cache[k]
+        return len(expired)
+
 
 # =============================================================================
-# Global State (minimal)
+# Pending State with TTL
+# =============================================================================
+class PendingState:
+    """Dict-like container with automatic expiration of old entries."""
+    
+    __slots__ = ('_data', '_max_age')
+    
+    def __init__(self, max_age: int = PENDING_STATE_MAX_AGE):
+        self._data: Dict[int, Tuple[Any, float]] = {}
+        self._max_age = max_age
+    
+    def __setitem__(self, key: int, value: Any) -> None:
+        self._cleanup()
+        self._data[key] = (value, time.time())
+    
+    def __getitem__(self, key: int) -> Any:
+        if key in self._data:
+            value, ts = self._data[key]
+            if time.time() - ts <= self._max_age:
+                return value
+            del self._data[key]
+        raise KeyError(key)
+    
+    def get(self, key: int, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+    
+    def pop(self, key: int, default: Any = None) -> Any:
+        if key in self._data:
+            value, ts = self._data.pop(key)
+            if time.time() - ts <= self._max_age:
+                return value
+        return default
+    
+    def _cleanup(self) -> None:
+        """Remove entries older than max_age."""
+        if len(self._data) > 50:  # Only cleanup when many entries
+            now = time.time()
+            expired = [k for k, (_, ts) in self._data.items() if now - ts > self._max_age]
+            for k in expired:
+                del self._data[k]
+
+
+# =============================================================================
+# Application State
 # =============================================================================
 class AppState:
-    """Application state container."""
+    """Application state container with minimal memory footprint."""
+    
+    __slots__ = (
+        'bot', 'dispatcher', 'http_client', 'shutdown_event',
+        'checklist_cache', 'summary_cache', 'pending_comment', 'pending_summary'
+    )
     
     def __init__(self):
         self.bot: Optional[Bot] = None
         self.dispatcher: Optional[Dispatcher] = None
         self.http_client: Optional[httpx.AsyncClient] = None
         self.shutdown_event = asyncio.Event()
-        self.checklist_cache = TTLCache(maxsize=100, ttl=1800)  # 30 min
-        self.summary_cache = TTLCache(maxsize=50, ttl=3600)  # 1 hour
-        self.pending_comment: Dict[int, str] = {}  # tg_id -> issue_key (awaiting comment text)
-        self.pending_summary: Dict[int, bool] = {}  # tg_id -> awaiting issue key for summary
+        self.checklist_cache = TTLCache(maxsize=CACHE_CHECKLIST_SIZE, ttl=CACHE_CHECKLIST_TTL)
+        self.summary_cache = TTLCache(maxsize=CACHE_SUMMARY_SIZE, ttl=CACHE_SUMMARY_TTL)
+        self.pending_comment = PendingState()
+        self.pending_summary = PendingState()
+
 
 state = AppState()
 
+
 # =============================================================================
-# HTTP Client (singleton, lazy init)
+# HTTP Client (singleton)
 # =============================================================================
 async def get_http_client() -> httpx.AsyncClient:
-    """Get or create HTTP client (singleton pattern)."""
+    """Get or create HTTP client."""
     if state.http_client is None or state.http_client.is_closed:
         state.http_client = httpx.AsyncClient(
             timeout=HTTP_TIMEOUT,
@@ -125,6 +196,7 @@ async def close_http_client() -> None:
         await state.http_client.aclose()
         state.http_client = None
 
+
 # =============================================================================
 # FastAPI App
 # =============================================================================
@@ -134,24 +206,18 @@ router = Router(name="main_router")
 
 @app.get("/")
 async def root():
-    """Health check endpoint."""
-    return {
-        "status": "ok",
-        "service": "tracker-bot",
-        "bot_active": state.bot is not None
-    }
+    return {"status": "ok", "service": "tracker-bot", "bot_active": state.bot is not None}
 
 
 @app.get("/ping")
 async def ping():
-    """Keep-alive endpoint."""
     return "pong"
 
 
 @app.on_event("shutdown")
 async def app_shutdown():
-    """Cleanup on app shutdown."""
     await close_http_client()
+
 
 # =============================================================================
 # Helpers
@@ -173,7 +239,6 @@ def fmt_date(date_str: Optional[str]) -> str:
         return ""
     try:
         clean = date_str.replace("Z", "+00:00")
-        # Fix timezone format: +0300 -> +03:00
         if "+" in clean and ":" not in clean.split("+")[-1]:
             parts = clean.rsplit("+", 1)
             if len(parts[1]) == 4:
@@ -184,17 +249,15 @@ def fmt_date(date_str: Optional[str]) -> str:
 
 
 def escape_md(text: str) -> str:
-    """Escape/clean special characters for Telegram Markdown link text."""
-    # Remove brackets that would break markdown links
+    """Escape special characters for Telegram Markdown."""
     text = text.replace("[", "(").replace("]", ")")
-    # Escape other markdown chars
     for ch in ('_', '*', '`'):
         text = text.replace(ch, f'\\{ch}')
     return text
 
 
 def fmt_issue_link(issue: dict, prefix: str = "", show_date: bool = True) -> str:
-    """Format issue as Markdown hyperlink with date outside: [KEY: Summary](url) (date)"""
+    """Format issue as Markdown hyperlink: [KEY: Summary](url) (date)"""
     key = issue.get("key", "")
     summary = escape_md((issue.get("summary") or "")[:55])
     url = issue.get("url") or f"https://tracker.yandex.ru/{key}"
@@ -216,7 +279,12 @@ def parse_response(r: httpx.Response) -> dict:
     return {"raw": r.text}
 
 
-async def api_request(method: str, path: str, params: dict, timeout: httpx.Timeout = None) -> Tuple[int, dict]:
+async def api_request(
+    method: str,
+    path: str,
+    params: dict,
+    timeout: Optional[httpx.Timeout] = None
+) -> Tuple[int, dict]:
     """Make API request with error handling."""
     client = await get_http_client()
     try:
@@ -241,8 +309,9 @@ def require_base_url(func):
         return await func(m, *args, **kwargs)
     return wrapper
 
+
 # =============================================================================
-# Keyboard Builders
+# Keyboards
 # =============================================================================
 def kb_settings_main() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -285,11 +354,19 @@ def kb_settings_limit(limit: int) -> InlineKeyboardMarkup:
 
 def kb_settings_reminder(reminder: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    options = [(0, "Откл"), (1, "1ч"), (3, "3ч"), (6, "6ч")]
-    for val, label in options:
+    for val, label in [(0, "Откл"), (1, "1ч"), (3, "3ч"), (6, "6ч")]:
         kb.button(text=f"{'✅' if reminder == val else '⬜'} {label}", callback_data=f"st:rset:{val}")
     kb.button(text="Назад", callback_data="st:back")
     kb.adjust(4, 1)
+    return kb.as_markup()
+
+
+def kb_summary_actions(issue_key: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔄 Обновить", callback_data=f"sum:refresh:{issue_key}")
+    kb.button(text="💬 Комментарий", callback_data=f"sum:comment:{issue_key}")
+    kb.button(text="📋 Чеклисты", callback_data=f"sum:checklist:{issue_key}")
+    kb.adjust(3)
     return kb.as_markup()
 
 
@@ -304,6 +381,7 @@ def render_settings_text(queues: List[str], days: int, limit: int, reminder: int
         f"• 🔔 Напоминание: {r}\n\n"
         "Выбери параметр:"
     )
+
 
 # =============================================================================
 # Checklist Helpers
@@ -330,7 +408,7 @@ def build_checklist_response(
     """Build checklist text, keyboard, and item mapping."""
     lines = [header]
     kb = InlineKeyboardBuilder() if add_buttons else None
-    item_mapping = {}
+    item_mapping: Dict[int, Tuple[str, str]] = {}
     item_num = 1
     
     for idx, issue in enumerate(issues, 1):
@@ -348,8 +426,8 @@ def build_checklist_response(
     if kb:
         kb.adjust(4)
     
-    text = "\n".join(lines)
-    return text, kb.as_markup() if kb else None, item_mapping
+    return "\n".join(lines), kb.as_markup() if kb else None, item_mapping
+
 
 # =============================================================================
 # Bot Handlers
@@ -431,7 +509,6 @@ async def cmd_cl_my(m: Message):
     text, _, item_mapping = build_checklist_response(issues, "✅ *Задачи с моим согласованием:*")
     state.checklist_cache.set(f"cl:{tg_id}", item_mapping)
     
-    # Split long messages
     for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
         await m.answer(chunk, parse_mode="Markdown")
 
@@ -439,7 +516,7 @@ async def cmd_cl_my(m: Message):
 @router.message(Command("mentions"))
 @require_base_url
 async def cmd_mentions(m: Message):
-    """Get issues where user was mentioned (summoned)."""
+    """Get issues where user was mentioned."""
     tg_id = m.from_user.id
     settings = await get_settings(tg_id)
     limit = settings[2] if settings else 10
@@ -549,16 +626,6 @@ async def cmd_cl_done(m: Message):
         await m.answer(f"❌ Ошибка {sc}: {data}"[:200])
 
 
-def kb_summary_actions(issue_key: str) -> InlineKeyboardMarkup:
-    """Build keyboard for summary actions."""
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🔄 Обновить", callback_data=f"sum:refresh:{issue_key}")
-    kb.button(text="💬 Комментарий", callback_data=f"sum:comment:{issue_key}")
-    kb.button(text="📋 Чеклисты", callback_data=f"sum:checklist:{issue_key}")
-    kb.adjust(3)
-    return kb.as_markup()
-
-
 async def process_summary(m: Message, issue_key: str, tg_id: int):
     """Process summary request for an issue."""
     # Check cache
@@ -574,9 +641,7 @@ async def process_summary(m: Message, issue_key: str, tg_id: int):
     
     try:
         sc, data = await api_request("GET", f"/tracker/issue/{issue_key}/summary", {"tg": tg_id}, HTTP_TIMEOUT_LONG)
-        logger.info(f"Summary for {issue_key}: status={sc}")
     except Exception as e:
-        logger.error(f"Summary request failed: {e}")
         await loading.edit_text(f"❌ Ошибка запроса: {str(e)[:100]}")
         return
     
@@ -622,6 +687,7 @@ async def cmd_summary(m: Message):
     issue_key = parts[1].upper().strip()
     await process_summary(m, issue_key, m.from_user.id)
 
+
 # =============================================================================
 # Callback Handlers
 # =============================================================================
@@ -630,22 +696,14 @@ async def handle_callback(c: CallbackQuery):
     """Handle all callback queries."""
     data = c.data or ""
     
-    # Checklist item check
     if data.startswith("chk:"):
         await handle_check_callback(c)
-        return
-    
-    # Settings callbacks
-    if data.startswith("st:"):
+    elif data.startswith("st:"):
         await handle_settings_callback(c)
-        return
-    
-    # Summary action callbacks
-    if data.startswith("sum:"):
+    elif data.startswith("sum:"):
         await handle_summary_callback(c)
-        return
-
-    await c.answer()
+    else:
+        await c.answer()
 
 
 async def handle_check_callback(c: CallbackQuery):
@@ -668,10 +726,8 @@ async def handle_check_callback(c: CallbackQuery):
 
     await c.answer("✅ Отмечено!")
     
-    # Update message
     if c.message:
         text = (c.message.text or "").replace("⬜", "✅", 1)
-        # Remove clicked button
         if c.message.reply_markup:
             kb = InlineKeyboardBuilder()
             for row in c.message.reply_markup.inline_keyboard:
@@ -697,17 +753,14 @@ async def handle_summary_callback(c: CallbackQuery):
     tg_id = c.from_user.id
 
     if action == "refresh":
-        # Clear cache and regenerate
-        state.summary_cache.data.pop(issue_key, None)
+        state.summary_cache.pop(issue_key)
         await c.answer("🔄 Обновляю...")
         
-        # Send new message for result
         loading_msg = await c.message.reply(f"🤖 Генерирую резюме для {issue_key}...") if c.message else None
         
         try:
             sc, data = await api_request("GET", f"/tracker/issue/{issue_key}/summary", {"tg": tg_id}, HTTP_TIMEOUT_LONG)
         except Exception as e:
-            logger.error(f"Summary refresh error: {e}")
             if loading_msg:
                 await loading_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
             return
@@ -733,7 +786,6 @@ async def handle_summary_callback(c: CallbackQuery):
         return
     
     if action == "comment":
-        # Set pending comment state
         state.pending_comment[tg_id] = issue_key
         await c.answer()
         if c.message:
@@ -754,7 +806,6 @@ async def handle_summary_callback(c: CallbackQuery):
         return
     
     if action == "checklist":
-        # Get checklists for specific issue
         await c.answer("📋 Загружаю...")
         
         sc, data = await api_request("GET", f"/tracker/issue/{issue_key}/checklist", {"tg": tg_id})
@@ -791,8 +842,8 @@ async def handle_summary_callback(c: CallbackQuery):
         if c.message:
             try:
                 await c.message.reply("\n".join(lines), parse_mode="Markdown", reply_markup=kb.as_markup() if kb.buttons else None)
-            except Exception as e:
-                logger.error(f"Failed to send checklist: {e}")
+            except Exception:
+                pass
         await c.answer()
         return
 
@@ -810,7 +861,6 @@ async def handle_settings_callback(c: CallbackQuery):
     action = parts[1] if len(parts) > 1 else ""
     arg = parts[2] if len(parts) > 2 else ""
     
-    # Get current settings
     sc, data = await api_request("GET", "/tg/settings", {"tg": tg_id})
     if sc != 200:
         await c.answer(f"❌ Ошибка {sc}", show_alert=True)
@@ -913,7 +963,7 @@ async def handle_settings_callback(c: CallbackQuery):
 
 
 # =============================================================================
-# Text Message Handler (for comments and summary input)
+# Text Message Handler
 # =============================================================================
 @router.message(F.text)
 async def handle_text_message(m: Message):
@@ -921,7 +971,6 @@ async def handle_text_message(m: Message):
     if not m.text or not m.from_user:
         return
 
-    # Skip commands
     if m.text.startswith("/"):
         return
 
@@ -934,7 +983,6 @@ async def handle_text_message(m: Message):
         if not issue_key or len(issue_key) < 3:
             await m.answer("❌ Неверный формат. Введите ключ задачи (например: INV-123)")
             return
-        # Process summary request
         await process_summary(m, issue_key, tg_id)
         return
     
@@ -976,7 +1024,6 @@ async def run_bot():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN not set")
     
-    # Close previous bot session if exists
     if state.bot:
         try:
             await state.bot.session.close()
@@ -987,26 +1034,21 @@ async def run_bot():
     state.bot = bot
     await setup_bot_commands(bot)
     
-    # Clear old updates
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await asyncio.sleep(2)
-    except Exception as e:
-        logger.warning(f"Could not delete webhook: {e}")
+    except Exception:
+        pass
     
-    # Always use the same dispatcher (created once with router)
     if state.dispatcher is None:
         dp = Dispatcher()
         dp.include_router(router)
         state.dispatcher = dp
-    dp = state.dispatcher
     
-    # Start polling with retry
     max_retries = 5
     for attempt in range(max_retries):
         try:
-            logger.info(f"Starting bot polling (attempt {attempt + 1}/{max_retries})...")
-            await dp.start_polling(
+            await state.dispatcher.start_polling(
                 bot,
                 close_bot_session=False,
                 allowed_updates=["message", "callback_query"],
@@ -1016,9 +1058,7 @@ async def run_bot():
             break
         except Exception as e:
             error_str = str(e)
-            logger.error(f"Bot polling error: {error_str}")
             if ("Conflict" in error_str or "terminated" in error_str) and attempt < max_retries - 1:
-                logger.info(f"Conflict detected, retry {attempt + 1}/{max_retries}")
                 await asyncio.sleep(5 * (attempt + 1))
                 try:
                     await bot.delete_webhook(drop_pending_updates=True)
@@ -1036,17 +1076,19 @@ async def run_web():
 
 
 async def keep_alive():
-    """Keep service alive on Render (pings every 5 min)."""
-    await asyncio.sleep(10)  # Wait for server start
-    logger.info("Keep-alive worker started")
+    """Keep service alive (pings every 5 min)."""
+    await asyncio.sleep(10)
     
     while not state.shutdown_event.is_set():
         try:
             client = await get_http_client()
-            resp = await client.get(f"http://localhost:{PORT}/ping")
-            logger.debug(f"Keep-alive ping: {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"Keep-alive ping failed: {e}")
+            await client.get(f"http://localhost:{PORT}/ping")
+        except Exception:
+            pass
+        
+        # Cleanup expired cache entries periodically
+        state.checklist_cache.cleanup_expired()
+        state.summary_cache.cleanup_expired()
         
         try:
             await asyncio.wait_for(state.shutdown_event.wait(), timeout=KEEP_ALIVE_INTERVAL)
@@ -1060,23 +1102,20 @@ _last_reminder: Dict[int, float] = {}
 
 
 async def reminder_worker():
-    """Send periodic reminders to users with reminder enabled (09:00-19:00)."""
-    await asyncio.sleep(60)  # Wait for services to start
+    """Send periodic reminders (09:00-19:00)."""
+    await asyncio.sleep(60)
     
     while not state.shutdown_event.is_set():
         try:
-            # Check if we're in working hours (09:00-19:00)
             now = datetime.now()
             if not (9 <= now.hour < 19):
-                # Outside working hours, wait and check again
-                await asyncio.sleep(300)  # 5 min
+                await asyncio.sleep(300)
                 continue
             
             if not state.bot or not BASE_URL:
                 await asyncio.sleep(60)
                 continue
             
-            # Get users with reminder enabled
             sc, data = await api_request("GET", "/tg/users_with_reminder", {})
             if sc != 200 or not data.get("users"):
                 await asyncio.sleep(300)
@@ -1092,16 +1131,13 @@ async def reminder_worker():
                 if not tg_id or reminder_hours <= 0:
                     continue
                 
-                # Check if enough time passed since last reminder
                 last_time = _last_reminder.get(tg_id, 0)
                 if time.time() - last_time < reminder_hours * 3600:
                     continue
                 
-                # Build reminder message
                 lines = ["🔔 *Напоминание:*\n"]
                 has_items = False
                 
-                # Get unchecked checklists
                 try:
                     sc1, data1 = await api_request("GET", "/tracker/checklist/assigned_unchecked", {"tg": tg_id, "limit": 5}, HTTP_TIMEOUT_LONG)
                     if sc1 == 200:
@@ -1117,7 +1153,6 @@ async def reminder_worker():
                 except Exception:
                     pass
                 
-                # Get mentions without response
                 try:
                     sc2, data2 = await api_request("GET", "/tracker/summons", {"tg": tg_id, "limit": 5}, HTTP_TIMEOUT_LONG)
                     if sc2 == 200:
@@ -1132,25 +1167,20 @@ async def reminder_worker():
                 except Exception:
                     pass
                 
-                # Send reminder only if there are items
                 if has_items:
                     try:
-                        text = "\n".join(lines)
-                        await state.bot.send_message(tg_id, text, parse_mode="Markdown")
+                        await state.bot.send_message(tg_id, "\n".join(lines), parse_mode="Markdown")
                         _last_reminder[tg_id] = time.time()
-                        logger.info(f"Sent reminder to {tg_id}")
-                    except Exception as e:
-                        logger.warning(f"Failed to send reminder to {tg_id}: {e}")
+                    except Exception:
+                        pass
                 
-                # Small delay between users
                 await asyncio.sleep(1)
         
-        except Exception as e:
-            logger.error(f"Reminder worker error: {e}")
+        except Exception:
+            pass
         
-        # Wait before next check cycle
         try:
-            await asyncio.wait_for(state.shutdown_event.wait(), timeout=300)  # 5 min
+            await asyncio.wait_for(state.shutdown_event.wait(), timeout=300)
             break
         except asyncio.TimeoutError:
             continue
@@ -1158,24 +1188,21 @@ async def reminder_worker():
 
 async def shutdown():
     """Graceful shutdown."""
-    logger.info("Shutting down...")
     state.shutdown_event.set()
     
     if state.bot:
         try:
             await state.bot.delete_webhook(drop_pending_updates=True)
             await state.bot.session.close()
-        except Exception as e:
-            logger.warning(f"Bot shutdown error: {e}")
+        except Exception:
+            pass
     
     await close_http_client()
-    logger.info("Shutdown complete")
 
 
 def setup_signals():
     """Setup signal handlers."""
     def handler(sig, frame):
-        logger.info(f"Signal {sig} received")
         asyncio.create_task(shutdown())
     
     signal.signal(signal.SIGTERM, handler)
@@ -1185,7 +1212,6 @@ def setup_signals():
 async def main():
     """Main entry point."""
     setup_signals()
-    logger.info("Starting services...")
     
     tasks = {
         "web": asyncio.create_task(run_web()),
@@ -1198,13 +1224,8 @@ async def main():
         while not state.shutdown_event.is_set():
             await asyncio.sleep(5)
             
-            # Restart failed tasks
             for name, task in list(tasks.items()):
                 if task.done() and not state.shutdown_event.is_set():
-                    exc = task.exception()
-                    if exc:
-                        logger.error(f"{name} failed: {exc}")
-                    logger.info(f"Restarting {name}...")
                     await asyncio.sleep(3)
                     if name == "web":
                         tasks[name] = asyncio.create_task(run_web())
@@ -1217,7 +1238,6 @@ async def main():
     except asyncio.CancelledError:
         pass
     finally:
-        # Cancel all tasks
         for task in tasks.values():
             if not task.done():
                 task.cancel()
