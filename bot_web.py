@@ -245,10 +245,13 @@ def fmt_date(date_str: Optional[str]) -> str:
 
 
 def escape_md(text: str) -> str:
-    """Escape special characters for Telegram Markdown."""
+    """Escape special characters for Telegram Markdown link text.
+    
+    Inside [...] only ] and ) need escaping (replaced with similar chars).
+    _ * ` are safe inside link text brackets.
+    """
+    # Replace brackets that would break Markdown link syntax
     text = text.replace("[", "(").replace("]", ")")
-    for ch in ('_', '*', '`'):
-        text = text.replace(ch, f'\\{ch}')
     return text
 
 
@@ -1157,7 +1160,7 @@ async def reminder_worker():
                             has_items = True
                             lines.append("📣 *Требуют ответа:*")
                             for idx, issue in enumerate(issues[:3], 1):
-                                lines.append(f"{idx}. {fmt_issue_link(issue, show_date=False)}")
+                                lines.append(f"{idx}. ⏳ {fmt_issue_link(issue, show_date=False)}")
                             if len(issues) > 3:
                                 lines.append(f"_...и ещё {len(issues) - 3}_")
                 except Exception:
