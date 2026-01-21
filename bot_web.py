@@ -13,7 +13,6 @@ from typing import Optional, Tuple, Dict, List, Any
 from collections import OrderedDict
 
 import httpx
-from fastapi import FastAPI
 import uvicorn
 
 from aiogram import Bot, Dispatcher, Router, F
@@ -198,24 +197,21 @@ async def close_http_client() -> None:
 
 
 # =============================================================================
-# FastAPI App
+# FastAPI App - import from main.py to have OAuth endpoints
 # =============================================================================
-app = FastAPI(title="Tracker Bot", docs_url=None, redoc_url=None)
+from main import app  # OAuth + API endpoints from main.py
+
 router = Router(name="main_router")
 
 
-@app.get("/")
-async def root():
+# Override root to show bot status
+@app.get("/", include_in_schema=False)
+async def root_with_bot_status():
     return {"status": "ok", "service": "tracker-bot", "bot_active": state.bot is not None}
 
 
-@app.get("/ping")
-async def ping():
-    return "pong"
-
-
 @app.on_event("shutdown")
-async def app_shutdown():
+async def bot_app_shutdown():
     await close_http_client()
 
 
