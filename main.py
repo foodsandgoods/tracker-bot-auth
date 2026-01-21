@@ -695,20 +695,24 @@ class TrackerService:
                     continue
 
                 matched_items = []
+                all_items = []
+                
                 for ci in checklist_items:
-                    if only_unchecked and ci.get("checked") is True:
-                        continue
-
                     ass = ci.get("assignee")
-                    if not ass or (ass.get("login") or "").lower() != login:
-                        continue
-
-                    matched_items.append({
+                    item_data = {
                         "id": str(ci.get("id", "")),
                         "text": (ci.get("text") or ci.get("textHtml") or "").strip(),
                         "checked": bool(ci.get("checked", False)),
-                        "assignee": {"display": ass.get("display"), "login": ass.get("login")},
-                    })
+                        "assignee": {"display": ass.get("display") if ass else "", "login": ass.get("login") if ass else ""},
+                        "is_mine": bool(ass and (ass.get("login") or "").lower() == login),
+                    }
+                    all_items.append(item_data)
+                    
+                    if only_unchecked and ci.get("checked") is True:
+                        continue
+
+                    if ass and (ass.get("login") or "").lower() == login:
+                        matched_items.append(item_data)
 
                 if matched_items:
                     orig_issue = issues_by_key.get(key, {})
@@ -722,6 +726,7 @@ class TrackerService:
                         "url": f"https://tracker.yandex.ru/{key}",
                         "updatedAt": updated_at,
                         "items": matched_items,
+                        "all_items": all_items,
                     })
 
         # Distribute results across queues for diversity

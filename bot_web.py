@@ -398,13 +398,33 @@ async def get_settings(tg_id: int) -> Optional[Tuple[List[str], int, int, int]]:
     )
 
 
+def fmt_item_full(item: dict) -> str:
+    """Format checklist item with assignee, highlighting user's own items."""
+    mark = "✅" if item.get("checked") else "⬜"
+    text = (item.get("text") or "").strip().replace("\n", " ")[:80]
+    assignee = item.get("assignee") or {}
+    name = assignee.get("display") or assignee.get("login") or ""
+    is_mine = item.get("is_mine", False)
+    
+    if is_mine:
+        return f"{mark} {text} — 👤 *Вы*"
+    elif name:
+        return f"{mark} {text} — {name}"
+    return f"{mark} {text}"
+
+
 def build_checklist_response(
     issues: List[dict],
     header: str,
     include_checked: bool = True,
-    add_buttons: bool = False
+    add_buttons: bool = False,
+    show_all_items: bool = False
 ) -> Tuple[str, Optional[InlineKeyboardMarkup], Dict[int, Tuple[str, str]]]:
-    """Build checklist text, keyboard, and item mapping."""
+    """Build checklist text, keyboard, and item mapping.
+    
+    Args:
+        show_all_items: If True, show all checklist items (from 'all_items' field).
+    """
     lines = [header]
     kb = InlineKeyboardBuilder() if add_buttons else None
     item_mapping: Dict[int, Tuple[str, str]] = {}
@@ -413,14 +433,26 @@ def build_checklist_response(
     for idx, issue in enumerate(issues, 1):
         lines.append(f"\n{idx}. {fmt_issue_link(issue)}")
         
-        for item in issue.get("items", []):
-            is_checked = item.get("checked", False)
-            if include_checked or not is_checked:
-                lines.append(f"  {fmt_item(item)}")
-                item_mapping[item_num] = (issue.get("key"), item.get("id"))
-                if kb and not is_checked:
-                    kb.button(text=f"✅ {item_num}", callback_data=f"chk:{issue.get('key')}:{item.get('id')}:{item_num}")
-                item_num += 1
+        if show_all_items and issue.get("all_items"):
+            lines.append("   📋 *Все пункты чеклиста:*")
+            for item in issue.get("all_items", []):
+                is_checked = item.get("checked", False)
+                is_mine = item.get("is_mine", False)
+                lines.append(f"   {fmt_item_full(item)}")
+                if is_mine and not is_checked:
+                    item_mapping[item_num] = (issue.get("key"), item.get("id"))
+                    if kb:
+                        kb.button(text=f"✅ {item_num}", callback_data=f"chk:{issue.get('key')}:{item.get('id')}:{item_num}")
+                    item_num += 1
+        else:
+            for item in issue.get("items", []):
+                is_checked = item.get("checked", False)
+                if include_checked or not is_checked:
+                    lines.append(f"  {fmt_item(item)}")
+                    item_mapping[item_num] = (issue.get("key"), item.get("id"))
+                    if kb and not is_checked:
+                        kb.button(text=f"✅ {item_num}", callback_data=f"chk:{issue.get('key')}:{item.get('id')}:{item_num}")
+                    item_num += 1
     
     if kb:
         kb.adjust(4)
@@ -562,7 +594,7 @@ async def cmd_cl_my_open(m: Message):
         return
     
     text, keyboard, item_mapping = build_checklist_response(
-        issues, "❔ *Ожидают согласование:*", include_checked=False, add_buttons=True
+        issues, "❔ *Ожидают согласование:*", include_checked=False, add_buttons=True, show_all_items=True
     )
     state.checklist_cache.set(f"cl:{tg_id}", item_mapping)
     
