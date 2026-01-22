@@ -323,10 +323,10 @@ def kb_settings_main() -> InlineKeyboardMarkup:
 def kb_settings_queues(queues: List[str]) -> InlineKeyboardMarkup:
     qs = {q.upper() for q in queues}
     kb = InlineKeyboardBuilder()
-    for q in ["INV", "DOC", "HR"]:
+    for q in ["INV", "DOC", "HR", "BB", "KOMDEP", "FINANCE", "BDEV"]:
         kb.button(text=f"{'✅' if q in qs else '⬜'} {q}", callback_data=f"st:qtoggle:{q}")
     kb.button(text="Назад", callback_data="st:back")
-    kb.adjust(3, 1)
+    kb.adjust(4, 4, 1)  # 4 + 3 queues + back button
     return kb.as_markup()
 
 
