@@ -268,10 +268,17 @@ def require_base_url(func):
     """Decorator to check BASE_URL."""
     @wraps(func)
     async def wrapper(m: Message, *args, **kwargs):
-        if not settings.base_url:
-            await m.answer("❌ BASE_URL не задан")
-            return
-        return await func(m, *args, **kwargs)
+        try:
+            if not settings.base_url:
+                await m.answer("❌ BASE_URL не задан")
+                return
+            return await func(m, *args, **kwargs)
+        except Exception as e:
+            logger.error(f"Handler {func.__name__} error: {type(e).__name__}: {e}")
+            try:
+                await m.answer(f"❌ Ошибка: {type(e).__name__}")
+            except Exception:
+                pass
     return wrapper
 
 
@@ -710,17 +717,21 @@ async def cmd_ai_search(m: Message):
     
     parts = (m.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        await m.answer(
-            "🔍 *AI-поиск по задачам*\n\n"
-            "Примеры запросов:\n"
-            "• `/ai срочные баги в работе`\n"
-            "• `/ai задачи назначенные на меня`\n"
-            "• `/ai задачи где я участвую`\n"
-            "• `/ai открытые за неделю`\n\n"
-            "⚠️ _Для чеклистов и призывов используйте команды /cl\\_my, /cl\\_my\\_open, /mentions_",
-            parse_mode="Markdown",
-            reply_markup=ForceReply(input_field_placeholder="Что ищем?")
-        )
+        try:
+            await m.answer(
+                "🔍 AI-поиск по задачам\n\n"
+                "Примеры запросов:\n"
+                "• /ai мои задачи\n"
+                "• /ai срочные баги\n"
+                "• /ai просроченные\n"
+                "• /ai мои согласования\n\n"
+                "⚠️ Для чеклистов: /cl_my, /cl_my_open\n"
+                "⚠️ Для призывов: /mentions",
+                reply_markup=ForceReply(input_field_placeholder="Что ищем?")
+            )
+        except Exception as e:
+            logger.error(f"cmd_ai_search answer error: {e}")
+            await m.answer("🔍 Введите поисковый запрос после /ai")
         state.pending_ai_search[m.from_user.id] = True
         return
 
