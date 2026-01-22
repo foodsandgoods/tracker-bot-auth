@@ -30,14 +30,24 @@ SEARCH_PROMPT_TEMPLATE = """Преобразуй запрос пользоват
 - Очередь: Queue: KEY
 - Статус: Status: "В работе", Status: "Открыт", Status: !Закрыт (! = не равно)
 - Исполнитель: Assignee: me(), Assignee: login
-- Автор: Author: me(), Author: login  
+- Автор: Author: me(), Author: login
+- Следящий: Followers: me()
 - Приоритет: Priority: critical, Priority: high
 - Тип: Type: task, Type: bug
+- Компонент: Components: "название"
 - Дата: Created: >= "2024-01-01", Updated: >= now()-7d
 - Теги: Tags: "тег"
+- Сортировка: "Sort by: Updated DESC", "Sort by: Created DESC"
 - Комбинации: AND, OR, скобки ()
 
-Ограничения:
+ВАЖНО - ограничения языка запросов:
+- НЕТ фильтра по чеклистам ("мой чеклист", "пункты чеклиста") → используй Followers: me() или Assignee: me()
+- НЕТ фильтра по призывам/упоминаниям ("меня призвали", "summons") → используй Followers: me()
+- Для "мои задачи" используй Assignee: me()
+- Для "я создал" используй Author: me()
+- Для "я участвую" используй Followers: me() OR Assignee: me() OR Author: me()
+
+Ограничения пользователя:
 {constraints}
 
 Запрос пользователя: {user_query}

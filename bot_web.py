@@ -711,10 +711,12 @@ async def cmd_ai_search(m: Message):
     if len(parts) < 2 or not parts[1].strip():
         await m.answer(
             "🔍 *AI-поиск по задачам*\n\n"
-            "Опишите что ищете, например:\n"
+            "Примеры запросов:\n"
             "• `/ai срочные баги в работе`\n"
             "• `/ai задачи назначенные на меня`\n"
-            "• `/ai незакрытые задачи за неделю`",
+            "• `/ai задачи где я участвую`\n"
+            "• `/ai открытые за неделю`\n\n"
+            "⚠️ _Для чеклистов и призывов используйте команды /cl\\_my, /cl\\_my\\_open, /mentions_",
             parse_mode="Markdown",
             reply_markup=ForceReply(input_field_placeholder="Что ищем?")
         )
@@ -727,10 +729,22 @@ async def cmd_ai_search(m: Message):
 
 async def process_ai_search(m: Message, query: str, tg_id: int):
     """Process AI search request."""
+    query_lower = query.lower()
+    
+    # Detect checklist/summons queries and show hint
+    checklist_keywords = ["чеклист", "checklist", "пункт", "согласован"]
+    summons_keywords = ["призвали", "призыв", "упомянули", "упоминани", "summon", "mention"]
+    
+    hint = ""
+    if any(kw in query_lower for kw in checklist_keywords):
+        hint = "\n\n💡 _Для чеклистов лучше: /cl\\_my или /cl\\_my\\_open_"
+    elif any(kw in query_lower for kw in summons_keywords):
+        hint = "\n\n💡 _Для призывов лучше: /mentions_"
+    
     user_settings = await get_settings(tg_id)
     limit = user_settings[2] if user_settings else 10
     
-    loading = await m.answer("🔍 Ищу...")
+    loading = await m.answer("🔍 Ищу..." + hint, parse_mode="Markdown")
     
     try:
         sc, data = await api_request(
@@ -748,14 +762,9 @@ async def process_ai_search(m: Message, query: str, tg_id: int):
         return
     
     issues = data.get("issues", []) if isinstance(data, dict) else []
-    tracker_query = data.get("query", "") if isinstance(data, dict) else ""
     
     if not issues:
-        await loading.edit_text(
-            f"🔍 Ничего не найдено\n\n"
-            f"_Запрос: {tracker_query[:100]}_",
-            parse_mode="Markdown"
-        )
+        await loading.edit_text("🔍 Ничего не найдено")
         return
     
     lines = [f"🔍 *Найдено {len(issues)} задач:*\n"]
@@ -775,7 +784,6 @@ async def process_ai_search(m: Message, query: str, tg_id: int):
         if description:
             lines.append(f"   _{description}_")
     
-    lines.append(f"\n_Запрос: {tracker_query[:80]}{'...' if len(tracker_query) > 80 else ''}_")
     
     text = "\n".join(lines)
     
