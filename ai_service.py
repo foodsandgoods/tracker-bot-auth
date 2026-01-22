@@ -1,6 +1,6 @@
 """
 AI service for generating issue summaries using GPTunnel API.
-Uses shared HTTP client and includes retry logic.
+Uses shared HTTP client and includes retry logic with graceful degradation.
 """
 import asyncio
 import logging
@@ -8,8 +8,19 @@ from typing import Optional, Tuple
 
 from config import settings
 from http_client import get_client, get_timeout
+from metrics import metrics
 
 logger = logging.getLogger(__name__)
+
+# Graceful degradation messages
+FALLBACK_MESSAGES = {
+    "not_configured": "⚠️ AI-сервис не настроен. Обратитесь к администратору.",
+    "timeout": "⏱️ AI-сервис не отвечает. Попробуйте позже.",
+    "rate_limit": "🚫 Превышен лимит запросов к AI. Попробуйте через минуту.",
+    "auth_error": "🔐 Ошибка авторизации AI-сервиса. Обратитесь к администратору.",
+    "server_error": "⚠️ AI-сервис временно недоступен. Попробуйте позже.",
+    "unknown": "❌ Не удалось сгенерировать резюме. Попробуйте позже.",
+}
 
 
 def _build_prompt(issue_data: dict) -> str:
@@ -121,6 +132,7 @@ async def generate_summary(issue_data: dict) -> Tuple[Optional[str], Optional[st
     Generate summary for issue using GPTunnel API.
     
     Uses shared HTTP client and includes retry with exponential backoff.
+    Returns user-friendly error messages for graceful degradation.
     
     Args:
         issue_data: Issue data from Yandex Tracker
@@ -128,8 +140,11 @@ async def generate_summary(issue_data: dict) -> Tuple[Optional[str], Optional[st
     Returns:
         Tuple of (summary_text, error_message)
     """
+    metrics.inc("ai.requests")
+    
     if not settings.ai:
-        return None, "AI service not configured (GPTUNNEL_API_KEY not set)"
+        metrics.inc("ai.not_configured")
+        return None, FALLBACK_MESSAGES["not_configured"]
     
     ai_config = settings.ai
     prompt = _build_prompt(issue_data)
@@ -178,15 +193,12 @@ async def generate_summary(issue_data: dict) -> Tuple[Optional[str], Optional[st
                     # Check for API error codes in response
                     if "code" in data and data.get("code") != 0:
                         code = data.get("code")
-                        message = data.get("message", "Unknown error")
-                        error_map = {
-                            1: "Internal server error",
-                            2: "Invalid token",
-                            3: "Invalid request format",
-                            5: "Insufficient balance",
-                            6: "Service overloaded",
-                        }
-                        last_error = f"{error_map.get(code, f'Error {code}')}: {message}"
+                        if code == 5:  # Insufficient balance
+                            last_error = "server_error"
+                        elif code == 6:  # Overloaded
+                            last_error = "rate_limit"
+                        else:
+                            last_error = "server_error"
                         continue
                     
                     content = _extract_content(data)
@@ -194,37 +206,40 @@ async def generate_summary(issue_data: dict) -> Tuple[Optional[str], Optional[st
                         # Truncate if too long
                         if len(content) > 500:
                             content = content[:497] + "..."
+                        metrics.inc("ai.success")
                         return content, None
                     
-                    last_error = "API returned empty response"
+                    last_error = "unknown"
                     continue
                 
                 if status == 401:
                     # Try next auth variant
-                    last_error = "Authentication failed"
+                    last_error = "auth_error"
                     continue
                 
                 if status == 429:
                     # Rate limited - wait and retry
-                    last_error = "Rate limited"
+                    last_error = "rate_limit"
+                    metrics.inc("ai.rate_limited")
                     await asyncio.sleep(2 ** attempt)
                     continue
                 
                 if status >= 500:
                     # Server error - retry
-                    last_error = f"Server error: {status}"
+                    last_error = "server_error"
                     await asyncio.sleep(1)
                     continue
                 
                 # Other error
-                error_text = data.get("error") or data.get("raw", "")[:200]
-                last_error = f"HTTP {status}: {error_text}"
+                last_error = "unknown"
                 
             except asyncio.TimeoutError:
-                last_error = "Timeout waiting for AI response"
+                last_error = "timeout"
+                metrics.inc("ai.timeout")
                 continue
             except Exception as e:
-                last_error = f"Request error: {type(e).__name__}"
+                last_error = "unknown"
+                metrics.inc("ai.error")
                 logger.debug(f"AI request error: {e}")
                 continue
         
@@ -232,4 +247,7 @@ async def generate_summary(issue_data: dict) -> Tuple[Optional[str], Optional[st
         if attempt < ai_config.max_retries - 1:
             await asyncio.sleep(1.5 ** attempt)
     
-    return None, last_error or "Unknown error"
+    # Return user-friendly error message
+    metrics.inc("ai.failed")
+    error_key = last_error if last_error in FALLBACK_MESSAGES else "unknown"
+    return None, FALLBACK_MESSAGES.get(error_key, FALLBACK_MESSAGES["unknown"])

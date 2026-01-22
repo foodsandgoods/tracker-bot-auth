@@ -5,15 +5,18 @@ Optimized for low-resource environments (1GB RAM).
 import asyncio
 import logging
 import secrets
+import time
+from collections import defaultdict
 from typing import Any, Optional
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from config import settings
 from db import TokenStorage, queues_list
 from http_client import get_client, close_client, get_timeout, with_retry, safe_json
+from metrics import metrics, Timer
 
 # Configure logging
 logging.basicConfig(
@@ -26,6 +29,88 @@ logger = logging.getLogger(__name__)
 # Reduce noise from libraries
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("asyncpg").setLevel(logging.WARNING)
+
+
+# =============================================================================
+# Rate Limiting
+# =============================================================================
+class RateLimiter:
+    """Simple in-memory rate limiter with sliding window."""
+    
+    __slots__ = ('_requests', '_window', '_max_requests', '_lock')
+    
+    def __init__(self, max_requests: int = 30, window_seconds: int = 60):
+        self._requests: dict[int, list[float]] = defaultdict(list)
+        self._window = window_seconds
+        self._max_requests = max_requests
+        self._lock = asyncio.Lock()
+    
+    async def is_allowed(self, tg_id: int) -> bool:
+        """Check if request is allowed for given tg_id."""
+        async with self._lock:
+            now = time.time()
+            cutoff = now - self._window
+            
+            # Clean old requests
+            self._requests[tg_id] = [t for t in self._requests[tg_id] if t > cutoff]
+            
+            if len(self._requests[tg_id]) >= self._max_requests:
+                metrics.inc("rate_limit.exceeded")
+                return False
+            
+            self._requests[tg_id].append(now)
+            return True
+    
+    async def cleanup(self) -> int:
+        """Remove old entries. Returns count removed."""
+        async with self._lock:
+            now = time.time()
+            cutoff = now - self._window * 2
+            
+            to_remove = [k for k, v in self._requests.items() 
+                        if not v or max(v) < cutoff]
+            for k in to_remove:
+                del self._requests[k]
+            return len(to_remove)
+
+
+_rate_limiter = RateLimiter(max_requests=30, window_seconds=60)
+
+
+# =============================================================================
+# Settings Cache
+# =============================================================================
+class SettingsCache:
+    """TTL cache for user settings to reduce DB queries."""
+    
+    __slots__ = ('_cache', '_ttl')
+    
+    def __init__(self, ttl: int = 300):
+        self._cache: dict[int, tuple[dict, float]] = {}
+        self._ttl = ttl
+    
+    def get(self, tg_id: int) -> Optional[dict]:
+        if tg_id in self._cache:
+            data, ts = self._cache[tg_id]
+            if time.time() - ts < self._ttl:
+                metrics.inc("settings_cache.hit")
+                return data
+            del self._cache[tg_id]
+        metrics.inc("settings_cache.miss")
+        return None
+    
+    def set(self, tg_id: int, data: dict) -> None:
+        self._cache[tg_id] = (data, time.time())
+        # Limit cache size
+        if len(self._cache) > 500:
+            oldest = min(self._cache.items(), key=lambda x: x[1][1])
+            del self._cache[oldest[0]]
+    
+    def invalidate(self, tg_id: int) -> None:
+        self._cache.pop(tg_id, None)
+
+
+_settings_cache = SettingsCache(ttl=300)
 
 
 # =============================================================================
@@ -320,29 +405,40 @@ class TrackerService:
         return {"http_status": 200, "body": {"status_code": st, "response": payload}}
 
     async def settings_get(self, tg_id: int) -> dict:
-        """Get user settings."""
+        """Get user settings with caching."""
+        # Check cache first
+        cached = _settings_cache.get(tg_id)
+        if cached:
+            return {"http_status": 200, "body": cached}
+        
         s = await self.storage.get_settings(tg_id)
-        return {"http_status": 200, "body": {
+        body = {
             "queues": queues_list(s.get("queues_csv", "")),
             "days": s.get("days", 30),
             "limit": s.get("limit_results", 10),
             "reminder": s.get("reminder_hours", 0)
-        }}
+        }
+        _settings_cache.set(tg_id, body)
+        return {"http_status": 200, "body": body}
 
     async def settings_set_queues(self, tg_id: int, queues_csv: str) -> dict:
         await self.storage.set_queues(tg_id, queues_csv)
+        _settings_cache.invalidate(tg_id)
         return await self.settings_get(tg_id)
 
     async def settings_set_days(self, tg_id: int, days: int) -> dict:
         await self.storage.set_days(tg_id, days)
+        _settings_cache.invalidate(tg_id)
         return await self.settings_get(tg_id)
 
     async def settings_set_limit(self, tg_id: int, limit: int) -> dict:
         await self.storage.set_limit(tg_id, limit)
+        _settings_cache.invalidate(tg_id)
         return await self.settings_get(tg_id)
 
     async def settings_set_reminder(self, tg_id: int, hours: int) -> dict:
         await self.storage.set_reminder(tg_id, hours)
+        _settings_cache.invalidate(tg_id)
         return await self.settings_get(tg_id)
 
     async def get_users_with_reminder(self) -> list[dict]:
@@ -601,7 +697,7 @@ class TrackerService:
         }
 
     async def get_summons(self, tg_id: int, limit: int = 10) -> dict:
-        """Get issues where user was mentioned."""
+        """Get issues where user was mentioned. Optimized with batch comment fetching."""
         u = await self.user_by_tg(tg_id)
         if u["http_status"] != 200:
             return u
@@ -636,25 +732,41 @@ class TrackerService:
         issues = []
         if st == 200:
             raw_issues = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
-            client = await get_client()
-
+            
+            # Filter and prepare issues
+            candidate_issues = []
             for issue in raw_issues:
-                if len(issues) >= limit:
-                    break
-
                 issue_key = issue.get("key")
-                if not issue_key:
-                    continue
-
-                # Check if user has responded
-                has_responded = False
-                try:
-                    headers = {
-                        "Authorization": f"OAuth {access}",
-                        "X-Org-Id": settings.tracker.org_id if settings.tracker else "",
+                if issue_key and len(candidate_issues) < limit:
+                    candidate_issues.append(issue)
+            
+            if not candidate_issues:
+                return {
+                    "http_status": 200,
+                    "body": {
+                        "status_code": 200,
+                        "issues": [],
+                        "settings": {"queues": queues, "days": days},
+                        "login": login
                     }
+                }
+            
+            # Batch fetch comments
+            client = await get_client()
+            headers = {
+                "Authorization": f"OAuth {access}",
+                "X-Org-Id": settings.tracker.org_id if settings.tracker else "",
+            }
+            api_base = settings.tracker.api_base if settings.tracker else ""
+            
+            async def check_responded(issue: dict) -> dict:
+                """Check if user responded to issue."""
+                issue_key = issue.get("key")
+                has_responded = False
+                
+                try:
                     r = await client.get(
-                        f"{settings.tracker.api_base if settings.tracker else ''}/issues/{issue_key}/comments",
+                        f"{api_base}/issues/{issue_key}/comments",
                         headers=headers
                     )
                     if r.status_code == 200:
@@ -667,14 +779,26 @@ class TrackerService:
                                     break
                 except Exception:
                     pass
-
-                issues.append({
+                
+                return {
                     "key": issue_key,
                     "summary": issue.get("summary") or "",
                     "url": f"https://tracker.yandex.ru/{issue_key}",
                     "updatedAt": issue.get("updatedAt") or issue.get("updated"),
                     "has_responded": has_responded
-                })
+                }
+            
+            # Batch process in groups of 10
+            batch_size = 10
+            for i in range(0, len(candidate_issues), batch_size):
+                batch = candidate_issues[i:i + batch_size]
+                results = await asyncio.gather(
+                    *[check_responded(issue) for issue in batch],
+                    return_exceptions=True
+                )
+                for result in results:
+                    if isinstance(result, dict):
+                        issues.append(result)
 
         return {
             "http_status": 200,
@@ -743,7 +867,7 @@ class TrackerService:
 # =============================================================================
 # FastAPI Application
 # =============================================================================
-app = FastAPI(title="Tracker Bot Auth", version="2.1.0")
+app = FastAPI(title="Tracker Bot Auth", version="2.2.0")
 
 # Global service instances
 _storage: Optional[TokenStorage] = None
@@ -766,6 +890,16 @@ def _parse_state(state: str) -> int:
     """Parse Telegram ID from OAuth state."""
     tg_str, _nonce = state.split(":", 1)
     return int(tg_str)
+
+
+async def _check_rate_limit(tg_id: int) -> Optional[JSONResponse]:
+    """Check rate limit for user."""
+    if not await _rate_limiter.is_allowed(tg_id):
+        return JSONResponse(
+            {"error": "Rate limit exceeded. Try again later."},
+            status_code=429
+        )
+    return None
 
 
 @app.on_event("startup")
@@ -806,12 +940,58 @@ async def shutdown():
 # =============================================================================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "tracker-bot-auth", "version": "2.1.0"}
+    return {"ok": True, "service": "tracker-bot-auth", "version": "2.2.0"}
 
 
 @app.get("/ping")
 async def ping():
     return "pong"
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint for monitoring."""
+    checks = {
+        "service": "ok",
+        "database": "unknown",
+        "http_client": "unknown",
+    }
+    
+    # Check database
+    if _storage and _storage.is_connected:
+        try:
+            # Simple query to verify connection
+            await _storage.get_settings(0)
+            checks["database"] = "ok"
+        except Exception as e:
+            checks["database"] = f"error: {type(e).__name__}"
+    else:
+        checks["database"] = "not_connected"
+    
+    # Check HTTP client
+    try:
+        from http_client import _manager
+        if _manager.is_active:
+            checks["http_client"] = "ok"
+        else:
+            checks["http_client"] = "not_active"
+    except Exception as e:
+        checks["http_client"] = f"error: {type(e).__name__}"
+    
+    is_healthy = all(v == "ok" for v in checks.values())
+    status_code = 200 if is_healthy else 503
+    
+    return JSONResponse({
+        "status": "healthy" if is_healthy else "unhealthy",
+        "checks": checks,
+        "uptime_seconds": metrics.get_counter("uptime") or int(time.time() - metrics._start_time),
+    }, status_code=status_code)
+
+
+@app.get("/metrics")
+async def get_metrics():
+    """Get service metrics."""
+    return JSONResponse(metrics.snapshot())
 
 
 @app.get("/oauth/start")
@@ -945,7 +1125,12 @@ async def tracker_summons(tg: int = Query(..., ge=1), limit: int = Query(10, ge=
     err = _check_config()
     if err:
         return err
-    result = await _service.get_summons(tg, limit=limit)  # type: ignore
+    rate_err = await _check_rate_limit(tg)
+    if rate_err:
+        return rate_err
+    metrics.inc("api.summons")
+    with Timer("summons"):
+        result = await _service.get_summons(tg, limit=limit)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
@@ -967,7 +1152,12 @@ async def checklist_assigned(tg: int = Query(..., ge=1), limit: int = Query(10, 
     err = _check_config()
     if err:
         return err
-    result = await _service.checklist_assigned_issues(tg, only_unchecked=False, limit=limit)  # type: ignore
+    rate_err = await _check_rate_limit(tg)
+    if rate_err:
+        return rate_err
+    metrics.inc("api.checklist_assigned")
+    with Timer("checklist_assigned"):
+        result = await _service.checklist_assigned_issues(tg, only_unchecked=False, limit=limit)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
@@ -976,7 +1166,12 @@ async def checklist_assigned_unchecked(tg: int = Query(..., ge=1), limit: int = 
     err = _check_config()
     if err:
         return err
-    result = await _service.checklist_assigned_issues(tg, only_unchecked=True, limit=limit)  # type: ignore
+    rate_err = await _check_rate_limit(tg)
+    if rate_err:
+        return rate_err
+    metrics.inc("api.checklist_assigned_unchecked")
+    with Timer("checklist_assigned_unchecked"):
+        result = await _service.checklist_assigned_issues(tg, only_unchecked=True, limit=limit)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
@@ -1008,5 +1203,10 @@ async def issue_summary_endpoint(tg: int = Query(..., ge=1), issue_key: str = ""
     err = _check_config()
     if err:
         return err
-    result = await _service.issue_summary(tg, issue_key)  # type: ignore
+    rate_err = await _check_rate_limit(tg)
+    if rate_err:
+        return rate_err
+    metrics.inc("api.summary")
+    with Timer("summary"):
+        result = await _service.issue_summary(tg, issue_key)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])

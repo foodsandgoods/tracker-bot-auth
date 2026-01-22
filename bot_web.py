@@ -178,29 +178,24 @@ async def bot_app_shutdown():
 # =============================================================================
 # Helpers
 # =============================================================================
-def fmt_item(item: dict) -> str:
-    """Format checklist item."""
-    mark = "✅" if item.get("checked") else "⬜"
-    text = (item.get("text") or "").strip().replace("\n", " ")[:80]
-    assignee = item.get("assignee") or {}
-    name = assignee.get("display") or assignee.get("login") or ""
-    if name:
-        return f"{mark} {text} — _{name}_"
-    return f"{mark} {text}"
-
-
-def fmt_item_full(item: dict) -> str:
-    """Format checklist item with assignee, highlighting user's own items."""
-    mark = "✅" if item.get("checked") else "⬜"
-    text = (item.get("text") or "").strip().replace("\n", " ")[:80]
-    assignee = item.get("assignee") or {}
-    name = assignee.get("display") or assignee.get("login") or ""
-    is_mine = item.get("is_mine", False)
+def fmt_item(item: dict, highlight_mine: bool = False) -> str:
+    """
+    Format checklist item.
     
-    if is_mine:
+    Args:
+        item: Checklist item dict with text, checked, assignee, is_mine fields
+        highlight_mine: If True, highlight user's own items with "👤 *Вы*"
+    """
+    mark = "✅" if item.get("checked") else "⬜"
+    text = (item.get("text") or "").strip().replace("\n", " ")[:80]
+    assignee = item.get("assignee") or {}
+    name = assignee.get("display") or assignee.get("login") or ""
+    
+    if highlight_mine and item.get("is_mine", False):
         return f"{mark} {text} — 👤 *Вы*"
     elif name:
-        return f"{mark} {text} — {name}"
+        suffix = f"_{name}_" if not highlight_mine else name
+        return f"{mark} {text} — {suffix}"
     return f"{mark} {text}"
 
 
@@ -389,7 +384,7 @@ def build_checklist_response(
             for item in issue.get("all_items", []):
                 is_checked = item.get("checked", False)
                 is_mine = item.get("is_mine", False)
-                lines.append(f"   {fmt_item_full(item)}")
+                lines.append(f"   {fmt_item(item, highlight_mine=True)}")
                 if is_mine and not is_checked:
                     item_mapping[item_num] = (issue.get("key"), item.get("id"))
                     if kb:
