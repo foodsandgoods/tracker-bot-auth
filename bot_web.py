@@ -126,7 +126,7 @@ class AppState:
     __slots__ = (
         'bot', 'dispatcher', 'shutdown_event',
         'checklist_cache', 'summary_cache',
-        'pending_comment', 'pending_summary', 'last_reminder'
+        'pending_comment', 'pending_summary', 'pending_ai_search', 'last_reminder'
     )
     
     def __init__(self):
@@ -145,6 +145,7 @@ class AppState:
         )
         self.pending_comment = PendingState(max_age=settings.cache.pending_state_ttl)
         self.pending_summary = PendingState(max_age=settings.cache.pending_state_ttl)
+        self.pending_ai_search = PendingState(max_age=settings.cache.pending_state_ttl)
         self.last_reminder: Dict[int, float] = {}
 
 
@@ -438,10 +439,10 @@ async def cmd_menu(m: Message):
         "👤 /me — проверить доступ\n"
         "⚙️ /settings — настройки\n\n"
         "✅ /cl\\_my — задачи с моим ОК\n"
-        "❔ /cl\\_my\\_open — ожидают согласование\n"
-        "✔️ /done N — отметить пункт\n\n"
+        "❓ /cl\\_my\\_open — ожидают согласование\n\n"
         "📣 /mentions — требующие ответа\n"
-        "🤖 /summary ISSUE — резюме (ИИ)",
+        "🤖 /summary ISSUE — резюме (ИИ)\n"
+        "🔍 /ai ЗАПРОС — поиск (ИИ)",
         parse_mode="Markdown"
     )
 
@@ -568,7 +569,7 @@ async def cmd_cl_my_open(m: Message):
         return
     
     text, keyboard, item_mapping = build_checklist_response(
-        issues, "❔ *Ожидают согласование:*",
+        issues, "❓ *Ожидают согласование:*",
         include_checked=False, add_buttons=True, show_all_items=True,
         add_comment_buttons=True
     )
@@ -581,36 +582,37 @@ async def cmd_cl_my_open(m: Message):
         await m.answer(text, reply_markup=keyboard, parse_mode="Markdown")
 
 
-@router.message(Command("done"))
-@require_base_url
-async def cmd_done(m: Message):
-    """Mark checklist item by number."""
-    parts = (m.text or "").split()
-    if len(parts) != 2:
-        await m.answer("Использование: /done N")
-        return
-    
-    try:
-        num = int(parts[1])
-    except ValueError:
-        await m.answer("❌ N должно быть числом")
-        return
-
-    tg_id = m.from_user.id
-    item_mapping = state.checklist_cache.get(f"cl:{tg_id}")
-    if not item_mapping or num not in item_mapping:
-        await m.answer("❌ Сначала выполните /cl_my или /cl_my_open")
-        return
-
-    issue_key, item_id = item_mapping[num]
-    sc, data = await api_request("POST", "/tracker/checklist/check", {
-        "tg": tg_id, "issue": issue_key, "item": item_id, "checked": True
-    })
-    
-    if sc == 200:
-        await m.answer(f"✅ Отмечен: {issue_key} #{num}")
-    else:
-        await m.answer(f"❌ Ошибка: {data.get('error', data)}"[:200])
+# TODO: временно отключено
+# @router.message(Command("done"))
+# @require_base_url
+# async def cmd_done(m: Message):
+#     """Mark checklist item by number."""
+#     parts = (m.text or "").split()
+#     if len(parts) != 2:
+#         await m.answer("Использование: /done N")
+#         return
+#     
+#     try:
+#         num = int(parts[1])
+#     except ValueError:
+#         await m.answer("❌ N должно быть числом")
+#         return
+#
+#     tg_id = m.from_user.id
+#     item_mapping = state.checklist_cache.get(f"cl:{tg_id}")
+#     if not item_mapping or num not in item_mapping:
+#         await m.answer("❌ Сначала выполните /cl_my или /cl_my_open")
+#         return
+#
+#     issue_key, item_id = item_mapping[num]
+#     sc, data = await api_request("POST", "/tracker/checklist/check", {
+#         "tg": tg_id, "issue": issue_key, "item": item_id, "checked": True
+#     })
+#     
+#     if sc == 200:
+#         await m.answer(f"✅ Отмечен: {issue_key} #{num}")
+#     else:
+#         await m.answer(f"❌ Ошибка: {data.get('error', data)}"[:200])
 
 
 @router.message(Command("cl_done"))
@@ -697,6 +699,91 @@ async def cmd_summary(m: Message):
 
     issue_key = parts[1].upper().strip()
     await process_summary(m, issue_key, m.from_user.id)
+
+
+@router.message(Command("ai"))
+@require_base_url
+async def cmd_ai_search(m: Message):
+    """AI-powered search for issues."""
+    from aiogram.types import ForceReply
+    
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await m.answer(
+            "🔍 *AI-поиск по задачам*\n\n"
+            "Опишите что ищете, например:\n"
+            "• `/ai срочные баги в работе`\n"
+            "• `/ai задачи назначенные на меня`\n"
+            "• `/ai незакрытые задачи за неделю`",
+            parse_mode="Markdown",
+            reply_markup=ForceReply(input_field_placeholder="Что ищем?")
+        )
+        state.pending_ai_search[m.from_user.id] = True
+        return
+
+    query = parts[1].strip()
+    await process_ai_search(m, query, m.from_user.id)
+
+
+async def process_ai_search(m: Message, query: str, tg_id: int):
+    """Process AI search request."""
+    user_settings = await get_settings(tg_id)
+    limit = user_settings[2] if user_settings else 10
+    
+    loading = await m.answer("🔍 Ищу...")
+    
+    try:
+        sc, data = await api_request(
+            "GET", "/tracker/ai_search",
+            {"tg": tg_id, "q": query, "limit": limit},
+            long_timeout=True
+        )
+    except Exception as e:
+        await loading.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+        return
+    
+    if sc != 200:
+        error_msg = data.get('error', str(data)[:100]) if isinstance(data, dict) else str(data)[:100]
+        await loading.edit_text(f"❌ {error_msg}"[:500])
+        return
+    
+    issues = data.get("issues", []) if isinstance(data, dict) else []
+    tracker_query = data.get("query", "") if isinstance(data, dict) else ""
+    
+    if not issues:
+        await loading.edit_text(
+            f"🔍 Ничего не найдено\n\n"
+            f"_Запрос: {tracker_query[:100]}_",
+            parse_mode="Markdown"
+        )
+        return
+    
+    lines = [f"🔍 *Найдено {len(issues)} задач:*\n"]
+    
+    for idx, issue in enumerate(issues, 1):
+        key = issue.get("key", "")
+        summary = escape_md((issue.get("summary") or "")[:50])
+        status = issue.get("status", "")
+        description = (issue.get("description") or "")[:80]
+        url = issue.get("url", f"https://tracker.yandex.ru/{key}")
+        
+        line = f"{idx}. [{key}: {summary}]({url})"
+        if status:
+            line += f" _{status}_"
+        lines.append(line)
+        
+        if description:
+            lines.append(f"   _{description}_")
+    
+    lines.append(f"\n_Запрос: {tracker_query[:80]}{'...' if len(tracker_query) > 80 else ''}_")
+    
+    text = "\n".join(lines)
+    
+    if len(text) > 4000:
+        await loading.edit_text(text[:4000], parse_mode="Markdown")
+        await m.answer(text[4000:], parse_mode="Markdown")
+    else:
+        await loading.edit_text(text, parse_mode="Markdown")
 
 
 # =============================================================================
@@ -1046,6 +1133,14 @@ async def handle_text_message(m: Message):
         await process_summary(m, issue_key, tg_id)
         return
     
+    # Check if awaiting AI search query
+    if state.pending_ai_search.pop(tg_id, None):
+        if len(text) < 2:
+            await m.answer("❌ Слишком короткий запрос")
+            return
+        await process_ai_search(m, text, tg_id)
+        return
+    
     # Check if awaiting comment input
     issue_key = state.pending_comment.pop(tg_id, None)
     if issue_key:
@@ -1072,10 +1167,11 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="me", description="👤 Проверить доступ"),
         BotCommand(command="settings", description="⚙️ Настройки"),
         BotCommand(command="cl_my", description="✅ Задачи с моим ОК"),
-        BotCommand(command="cl_my_open", description="❔ Ожидают согласование"),
-        BotCommand(command="done", description="✔️ Отметить пункт"),
+        BotCommand(command="cl_my_open", description="❓ Ожидают согласование"),
+        # BotCommand(command="done", description="✔️ Отметить пункт"),  # TODO: временно отключено
         BotCommand(command="mentions", description="📣 Требующие ответа"),
         BotCommand(command="summary", description="🤖 Резюме (ИИ)"),
+        BotCommand(command="ai", description="🔍 Поиск (ИИ)"),
     ])
 
 
@@ -1216,7 +1312,7 @@ async def reminder_worker():
                         issues = data1.get("issues", [])
                         if issues:
                             has_items = True
-                            lines.append("❔ *Ожидают согласование:*")
+                            lines.append("❓ *Ожидают согласование:*")
                             for idx, issue in enumerate(issues[:3], 1):
                                 lines.append(f"{idx}. {fmt_issue_link(issue, show_date=False)}")
                             if len(issues) > 3:

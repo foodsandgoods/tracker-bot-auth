@@ -840,6 +840,76 @@ class TrackerService:
             }
         }
 
+    async def ai_search(self, tg_id: int, user_query: str, limit: int = 10) -> dict:
+        """Search issues using AI-generated query from natural language."""
+        access, err = await self._get_valid_access_token(tg_id)
+        if err:
+            return err
+
+        s = await self.storage.get_settings(tg_id)
+        queues = queues_list(s.get("queues_csv", ""))
+        days = int(s.get("days", 30))
+        if limit == 10:
+            limit = int(s.get("limit_results", 10))
+
+        try:
+            from ai_service import generate_search_query
+            tracker_query, error_msg = await generate_search_query(user_query, queues, days)
+        except ImportError as e:
+            return {"http_status": 500, "body": {"error": f"AI module not found: {e}"}}
+        except Exception as e:
+            logger.error(f"AI search error: {type(e).__name__}")
+            return {"http_status": 500, "body": {"error": f"AI service error: {type(e).__name__}"}}
+
+        if not tracker_query:
+            return {"http_status": 500, "body": {"error": error_msg or "Failed to generate search query"}}
+
+        # Execute the search
+        try:
+            st, payload = await self.tracker.search_issues(access, query=tracker_query, limit=limit)
+        except Exception as e:
+            return {"http_status": 503, "body": {"error": f"Search failed: {type(e).__name__}"}}
+
+        if st != 200:
+            return {"http_status": 200, "body": {"status_code": st, "response": payload, "query": tracker_query}}
+
+        issues_raw = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
+        
+        issues = []
+        for issue in issues_raw[:limit]:
+            issue_key = issue.get("key")
+            if not issue_key:
+                continue
+            
+            summary = issue.get("summary") or ""
+            description = (issue.get("description") or "")[:150]
+            if len(description) == 150:
+                description += "..."
+            
+            status = ""
+            if isinstance(issue.get("status"), dict):
+                status = issue["status"].get("display", "")
+            
+            issues.append({
+                "key": issue_key,
+                "summary": summary,
+                "description": description,
+                "status": status,
+                "url": f"https://tracker.yandex.ru/{issue_key}",
+                "updatedAt": issue.get("updatedAt") or issue.get("updated"),
+            })
+
+        return {
+            "http_status": 200,
+            "body": {
+                "status_code": 200,
+                "issues": issues,
+                "query": tracker_query,
+                "user_query": user_query,
+                "settings": {"queues": queues, "days": days},
+            }
+        }
+
     async def add_comment(self, tg_id: int, issue_key: str, text: str) -> dict:
         """Add comment to issue."""
         access, err = await self._get_valid_access_token(tg_id)
@@ -1209,4 +1279,23 @@ async def issue_summary_endpoint(tg: int = Query(..., ge=1), issue_key: str = ""
     metrics.inc("api.summary")
     with Timer("summary"):
         result = await _service.issue_summary(tg, issue_key)  # type: ignore
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.get("/tracker/ai_search")
+async def ai_search_endpoint(
+    tg: int = Query(..., ge=1),
+    q: str = Query(..., min_length=2, max_length=500),
+    limit: int = Query(10, ge=1, le=50)
+):
+    """AI-powered search: convert natural language to Tracker query."""
+    err = _check_config()
+    if err:
+        return err
+    rate_err = await _check_rate_limit(tg)
+    if rate_err:
+        return rate_err
+    metrics.inc("api.ai_search")
+    with Timer("ai_search"):
+        result = await _service.ai_search(tg, user_query=q, limit=limit)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])

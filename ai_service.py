@@ -19,8 +19,30 @@ FALLBACK_MESSAGES = {
     "rate_limit": "🚫 Превышен лимит запросов к AI. Попробуйте через минуту.",
     "auth_error": "🔐 Ошибка авторизации AI-сервиса. Обратитесь к администратору.",
     "server_error": "⚠️ AI-сервис временно недоступен. Попробуйте позже.",
-    "unknown": "❌ Не удалось сгенерировать резюме. Попробуйте позже.",
+    "unknown": "❌ Не удалось выполнить запрос. Попробуйте позже.",
 }
+
+# Search query generation prompt
+SEARCH_PROMPT_TEMPLATE = """Преобразуй запрос пользователя в поисковый запрос для Yandex Tracker Query Language.
+
+Синтаксис Tracker Query Language:
+- Поиск по тексту: "текст" (в кавычках для точного совпадения)
+- Очередь: Queue: KEY
+- Статус: Status: "В работе", Status: "Открыт", Status: !Закрыт (! = не равно)
+- Исполнитель: Assignee: me(), Assignee: login
+- Автор: Author: me(), Author: login  
+- Приоритет: Priority: critical, Priority: high
+- Тип: Type: task, Type: bug
+- Дата: Created: >= "2024-01-01", Updated: >= now()-7d
+- Теги: Tags: "тег"
+- Комбинации: AND, OR, скобки ()
+
+Ограничения:
+{constraints}
+
+Запрос пользователя: {user_query}
+
+Верни ТОЛЬКО поисковый запрос для Tracker, без объяснений. Если запрос слишком общий, добавь ограничение по дате обновления."""
 
 
 def _build_prompt(issue_data: dict) -> str:
@@ -251,3 +273,99 @@ async def generate_summary(issue_data: dict) -> Tuple[Optional[str], Optional[st
     metrics.inc("ai.failed")
     error_key = last_error if last_error in FALLBACK_MESSAGES else "unknown"
     return None, FALLBACK_MESSAGES.get(error_key, FALLBACK_MESSAGES["unknown"])
+
+
+async def generate_search_query(
+    user_query: str,
+    queues: list[str],
+    days: int
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Generate Tracker search query from natural language.
+    
+    Args:
+        user_query: User's search request in natural language
+        queues: List of queue keys to limit search
+        days: Number of days to limit search period
+    
+    Returns:
+        Tuple of (tracker_query, error_message)
+    """
+    metrics.inc("ai.search_requests")
+    
+    if not settings.ai:
+        metrics.inc("ai.not_configured")
+        return None, FALLBACK_MESSAGES["not_configured"]
+    
+    # Build constraints description
+    constraints_parts = []
+    if queues:
+        constraints_parts.append(f"Искать только в очередях: {', '.join(queues)}")
+    constraints_parts.append(f"Период: последние {days} дней (Updated: >= now()-{days}d)")
+    constraints = "\n".join(constraints_parts) if constraints_parts else "Нет ограничений"
+    
+    prompt = SEARCH_PROMPT_TEMPLATE.format(
+        constraints=constraints,
+        user_query=user_query
+    )
+    
+    ai_config = settings.ai
+    
+    payload = {
+        "model": ai_config.model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Ты помощник для генерации поисковых запросов Yandex Tracker. Отвечай только поисковым запросом, без пояснений."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "useWalletBalance": True,
+        "max_tokens": 200,
+        "temperature": 0.3,  # Lower temperature for more deterministic output
+    }
+    
+    client = await get_client()
+    timeout = get_timeout(long=False)  # Shorter timeout for search query generation
+    
+    auth_variants = [
+        {"Authorization": ai_config.api_key, "Content-Type": "application/json"},
+        {"Authorization": f"Bearer {ai_config.api_key}", "Content-Type": "application/json"},
+    ]
+    
+    for headers in auth_variants:
+        try:
+            status, data = await _make_request(
+                client, ai_config.api_url, headers, payload, timeout
+            )
+            
+            if status == 200:
+                content = _extract_content(data)
+                if content:
+                    # Clean up the query - remove quotes if wrapped
+                    query = content.strip().strip('"\'`')
+                    
+                    # Add queue constraints if not present and queues specified
+                    if queues and not any(f"Queue:" in query for _ in [1]):
+                        queue_filter = " OR ".join([f"Queue: {q}" for q in queues])
+                        query = f"({queue_filter}) AND ({query})"
+                    
+                    # Ensure date constraint is present
+                    if "Updated:" not in query and "Created:" not in query:
+                        query = f"({query}) AND Updated: >= now()-{days}d"
+                    
+                    metrics.inc("ai.search_success")
+                    return query, None
+            
+            if status == 401:
+                continue
+                
+        except Exception as e:
+            logger.debug(f"AI search query error: {e}")
+            continue
+    
+    metrics.inc("ai.search_failed")
+    return None, FALLBACK_MESSAGES["unknown"]
