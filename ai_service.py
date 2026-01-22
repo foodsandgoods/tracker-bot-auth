@@ -1,21 +1,15 @@
 """
 AI service for generating issue summaries using GPTunnel API.
-Optimized for shared httpx client to reduce memory usage.
+Uses shared HTTP client and includes retry logic.
 """
+import asyncio
 import logging
-import os
-from typing import Optional
+from typing import Optional, Tuple
 
-import httpx
+from config import settings
+from http_client import get_client, get_timeout
 
 logger = logging.getLogger(__name__)
-
-GPTUNNEL_API_KEY = os.getenv("GPTUNNEL_API_KEY", "")
-GPTUNNEL_API_URL = "https://gptunnel.ru/v1/chat/completions"
-GPTUNNEL_MODEL = os.getenv("GPTUNNEL_MODEL", "gpt-4o-mini")
-
-# Timeout for AI requests (longer than regular API calls)
-AI_TIMEOUT = httpx.Timeout(connect=10.0, read=55.0, write=10.0, pool=5.0)
 
 
 def _build_prompt(issue_data: dict) -> str:
@@ -103,32 +97,45 @@ def _extract_content(data: dict) -> Optional[str]:
     return None
 
 
-async def generate_summary(
-    issue_data: dict,
-    http_client: Optional[httpx.AsyncClient] = None
-) -> tuple[Optional[str], Optional[str]]:
+async def _make_request(
+    client,
+    url: str,
+    headers: dict,
+    payload: dict,
+    timeout
+) -> Tuple[int, dict]:
+    """Make HTTP request to AI API."""
+    try:
+        r = await client.post(url, headers=headers, json=payload, timeout=timeout)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"raw": r.text[:500] if r.text else ""}
+        return r.status_code, data
+    except Exception as e:
+        return 0, {"error": str(e)}
+
+
+async def generate_summary(issue_data: dict) -> Tuple[Optional[str], Optional[str]]:
     """
     Generate summary for issue using GPTunnel API.
     
+    Uses shared HTTP client and includes retry with exponential backoff.
+    
     Args:
         issue_data: Issue data from Yandex Tracker
-        http_client: Shared httpx client (optional, creates new if not provided)
     
     Returns:
         Tuple of (summary_text, error_message)
     """
-    if not GPTUNNEL_API_KEY:
-        return None, "GPTUNNEL_API_KEY не установлен"
+    if not settings.ai:
+        return None, "AI service not configured (GPTUNNEL_API_KEY not set)"
     
+    ai_config = settings.ai
     prompt = _build_prompt(issue_data)
     
-    headers = {
-        "Authorization": GPTUNNEL_API_KEY,
-        "Content-Type": "application/json",
-    }
-    
     payload = {
-        "model": GPTUNNEL_MODEL,
+        "model": ai_config.model,
         "messages": [
             {
                 "role": "system",
@@ -140,90 +147,89 @@ async def generate_summary(
             }
         ],
         "useWalletBalance": True,
-        "max_tokens": 600,
-        "temperature": 0.7,
+        "max_tokens": ai_config.max_tokens,
+        "temperature": ai_config.temperature,
     }
     
-    # Use provided client or create temporary one
-    client_to_use = http_client
-    created_client = False
+    client = await get_client()
+    timeout = get_timeout(long=True)
     
-    if client_to_use is None:
-        client_to_use = httpx.AsyncClient(timeout=AI_TIMEOUT)
-        created_client = True
+    # Try different auth methods
+    auth_variants = [
+        {"Authorization": ai_config.api_key, "Content-Type": "application/json"},
+        {"Authorization": f"Bearer {ai_config.api_key}", "Content-Type": "application/json"},
+    ]
     
-    try:
-        r = await client_to_use.post(
-            GPTUNNEL_API_URL,
-            headers=headers,
-            json=payload,
-            timeout=AI_TIMEOUT,
-        )
+    last_error = None
+    
+    for attempt in range(ai_config.max_retries):
+        for headers in auth_variants:
+            try:
+                status, data = await _make_request(
+                    client, ai_config.api_url, headers, payload, timeout
+                )
+                
+                if status == 0:
+                    # Connection error
+                    last_error = data.get("error", "Connection error")
+                    continue
+                
+                if status == 200:
+                    # Check for API error codes in response
+                    if "code" in data and data.get("code") != 0:
+                        code = data.get("code")
+                        message = data.get("message", "Unknown error")
+                        error_map = {
+                            1: "Internal server error",
+                            2: "Invalid token",
+                            3: "Invalid request format",
+                            5: "Insufficient balance",
+                            6: "Service overloaded",
+                        }
+                        last_error = f"{error_map.get(code, f'Error {code}')}: {message}"
+                        continue
+                    
+                    content = _extract_content(data)
+                    if content:
+                        # Truncate if too long
+                        if len(content) > 500:
+                            content = content[:497] + "..."
+                        return content, None
+                    
+                    last_error = "API returned empty response"
+                    continue
+                
+                if status == 401:
+                    # Try next auth variant
+                    last_error = "Authentication failed"
+                    continue
+                
+                if status == 429:
+                    # Rate limited - wait and retry
+                    last_error = "Rate limited"
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                
+                if status >= 500:
+                    # Server error - retry
+                    last_error = f"Server error: {status}"
+                    await asyncio.sleep(1)
+                    continue
+                
+                # Other error
+                error_text = data.get("error") or data.get("raw", "")[:200]
+                last_error = f"HTTP {status}: {error_text}"
+                
+            except asyncio.TimeoutError:
+                last_error = "Timeout waiting for AI response"
+                continue
+            except Exception as e:
+                last_error = f"Request error: {type(e).__name__}"
+                logger.debug(f"AI request error: {e}")
+                continue
         
-        if r.status_code != 200:
-            error_text = r.text[:300] if r.text else "No error text"
-            
-            # Try with Bearer auth on 401
-            if r.status_code == 401:
-                headers_alt = {
-                    "Authorization": f"Bearer {GPTUNNEL_API_KEY}",
-                    "Content-Type": "application/json",
-                }
-                try:
-                    r2 = await client_to_use.post(
-                        GPTUNNEL_API_URL,
-                        headers=headers_alt,
-                        json=payload,
-                        timeout=AI_TIMEOUT,
-                    )
-                    if r2.status_code == 200:
-                        data2 = r2.json()
-                        content = _extract_content(data2)
-                        if content:
-                            if len(content) > 500:
-                                content = content[:497] + "..."
-                            return content, None
-                except Exception as e:
-                    logger.debug(f"Bearer auth fallback failed: {e}")
-            
-            return None, f"HTTP {r.status_code}: {error_text}"
-        
-        try:
-            data = r.json()
-        except Exception as e:
-            return None, f"JSON parse error: {e}"
-        
-        # Check for API error codes
-        if "code" in data and data.get("code") != 0:
-            code = data.get("code")
-            message = data.get("message", "Unknown error")
-            error_map = {
-                1: "Internal server error",
-                2: "Invalid token",
-                3: "Invalid request format",
-                5: "Insufficient balance",
-                6: "Service overloaded",
-            }
-            error_msg = error_map.get(code, f"Error {code}")
-            return None, f"{error_msg}: {message}"
-        
-        content = _extract_content(data)
-        
-        if not content:
-            logger.warning(f"Empty AI response. Keys: {list(data.keys()) if isinstance(data, dict) else 'not dict'}")
-            return None, "API returned empty response"
-        
-        # Truncate if too long
-        if len(content) > 500:
-            content = content[:497] + "..."
-        
-        return content, None
-        
-    except httpx.TimeoutException:
-        return None, "Timeout waiting for AI response (55s)"
-    except Exception as e:
-        logger.error(f"AI request error: {e}")
-        return None, f"Request error: {e}"
-    finally:
-        if created_client:
-            await client_to_use.aclose()
+        # Wait before retry
+        if attempt < ai_config.max_retries - 1:
+            await asyncio.sleep(1.5 ** attempt)
+    
+    return None, last_error or "Unknown error"

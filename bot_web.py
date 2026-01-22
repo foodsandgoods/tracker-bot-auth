@@ -1,62 +1,40 @@
 """
 Telegram Bot for Yandex Tracker integration.
-Optimized for Render.com free tier (512MB RAM, shared CPU).
+Optimized for low-resource environments (1GB RAM).
 """
-import os
 import asyncio
-import signal
-import time
 import logging
+import time
+from collections import OrderedDict
 from datetime import datetime
 from functools import wraps
-from typing import Optional, Tuple, Dict, List, Any
-from collections import OrderedDict
+from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
 import uvicorn
-
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, CallbackQuery, BotCommand
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# =============================================================================
-# Configuration
-# =============================================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-BASE_URL = (os.getenv("BASE_URL") or "").rstrip("/")
-PORT = int(os.getenv("PORT", "10000"))
-
-# HTTP settings - conservative for 512MB RAM
-HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0)
-HTTP_TIMEOUT_LONG = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=5.0)
-HTTP_LIMITS = httpx.Limits(max_keepalive_connections=3, max_connections=5)
-
-# Cache settings - reduced for memory efficiency
-CACHE_CHECKLIST_SIZE = 30  # Reduced from 100
-CACHE_CHECKLIST_TTL = 1200  # 20 min (reduced from 30)
-CACHE_SUMMARY_SIZE = 20  # Reduced from 50
-CACHE_SUMMARY_TTL = 2400  # 40 min (reduced from 60)
-PENDING_STATE_MAX_AGE = 600  # 10 min - cleanup old pending states
-
-KEEP_ALIVE_INTERVAL = 300  # 5 minutes
+from config import settings
+from http_client import get_client, close_client, get_timeout
 
 # =============================================================================
 # Logging Configuration
 # =============================================================================
 logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Suppress aiogram verbose logs
-for name in ["aiogram", "aiogram.event", "aiogram.dispatcher", "aiogram.polling"]:
-    logging.getLogger(name).setLevel(logging.ERROR)
+# Suppress noisy loggers
+for name in ["aiogram", "aiogram.event", "aiogram.dispatcher", "aiogram.polling", "httpx"]:
+    logging.getLogger(name).setLevel(logging.WARNING)
 
 
 # =============================================================================
-# LRU Cache with TTL
+# LRU Cache with TTL (memory-efficient)
 # =============================================================================
 class TTLCache:
     """LRU cache with TTL and bounded size."""
@@ -86,17 +64,12 @@ class TTLCache:
             self._cache.popitem(last=False)
     
     def pop(self, key: str, default: Any = None) -> Any:
-        """Remove and return value."""
         if key in self._cache:
             value, _ = self._cache.pop(key)
             return value
         return default
     
-    def clear(self) -> None:
-        self._cache.clear()
-    
     def cleanup_expired(self) -> int:
-        """Remove expired entries, return count removed."""
         now = time.time()
         expired = [k for k, (_, ts) in self._cache.items() if now - ts > self._ttl]
         for k in expired:
@@ -105,34 +78,29 @@ class TTLCache:
 
 
 # =============================================================================
-# Pending State with TTL
+# Pending State with TTL (bounded)
 # =============================================================================
 class PendingState:
-    """Dict-like container with automatic expiration of old entries."""
+    """Dict-like container with automatic expiration."""
     
-    __slots__ = ('_data', '_max_age')
+    __slots__ = ('_data', '_max_age', '_maxsize')
     
-    def __init__(self, max_age: int = PENDING_STATE_MAX_AGE):
+    def __init__(self, max_age: int = 600, maxsize: int = 100):
         self._data: Dict[int, Tuple[Any, float]] = {}
         self._max_age = max_age
+        self._maxsize = maxsize
     
     def __setitem__(self, key: int, value: Any) -> None:
         self._cleanup()
         self._data[key] = (value, time.time())
     
-    def __getitem__(self, key: int) -> Any:
+    def get(self, key: int, default: Any = None) -> Any:
         if key in self._data:
             value, ts = self._data[key]
             if time.time() - ts <= self._max_age:
                 return value
             del self._data[key]
-        raise KeyError(key)
-    
-    def get(self, key: int, default: Any = None) -> Any:
-        try:
-            return self[key]
-        except KeyError:
-            return default
+        return default
     
     def pop(self, key: int, default: Any = None) -> Any:
         if key in self._data:
@@ -142,8 +110,7 @@ class PendingState:
         return default
     
     def _cleanup(self) -> None:
-        """Remove entries older than max_age."""
-        if len(self._data) > 50:  # Only cleanup when many entries
+        if len(self._data) > self._maxsize // 2:
             now = time.time()
             expired = [k for k, (_, ts) in self._data.items() if now - ts > self._max_age]
             for k in expired:
@@ -154,78 +121,86 @@ class PendingState:
 # Application State
 # =============================================================================
 class AppState:
-    """Application state container with minimal memory footprint."""
+    """Application state container."""
     
     __slots__ = (
-        'bot', 'dispatcher', 'http_client', 'shutdown_event',
-        'checklist_cache', 'summary_cache', 'pending_comment', 'pending_summary'
+        'bot', 'dispatcher', 'shutdown_event',
+        'checklist_cache', 'summary_cache',
+        'pending_comment', 'pending_summary', 'last_reminder'
     )
     
     def __init__(self):
         self.bot: Optional[Bot] = None
         self.dispatcher: Optional[Dispatcher] = None
-        self.http_client: Optional[httpx.AsyncClient] = None
         self.shutdown_event = asyncio.Event()
-        self.checklist_cache = TTLCache(maxsize=CACHE_CHECKLIST_SIZE, ttl=CACHE_CHECKLIST_TTL)
-        self.summary_cache = TTLCache(maxsize=CACHE_SUMMARY_SIZE, ttl=CACHE_SUMMARY_TTL)
-        self.pending_comment = PendingState()
-        self.pending_summary = PendingState()
+        
+        # Caches with config-based sizes
+        self.checklist_cache = TTLCache(
+            maxsize=settings.cache.checklist_size,
+            ttl=settings.cache.checklist_ttl
+        )
+        self.summary_cache = TTLCache(
+            maxsize=settings.cache.summary_size,
+            ttl=settings.cache.summary_ttl
+        )
+        self.pending_comment = PendingState(max_age=settings.cache.pending_state_ttl)
+        self.pending_summary = PendingState(max_age=settings.cache.pending_state_ttl)
+        self.last_reminder: Dict[int, float] = {}
 
 
 state = AppState()
 
 
 # =============================================================================
-# HTTP Client (singleton)
+# Import FastAPI app from main.py
 # =============================================================================
-async def get_http_client() -> httpx.AsyncClient:
-    """Get or create HTTP client."""
-    if state.http_client is None or state.http_client.is_closed:
-        state.http_client = httpx.AsyncClient(
-            timeout=HTTP_TIMEOUT,
-            limits=HTTP_LIMITS,
-            http2=False  # HTTP/2 uses more memory
-        )
-    return state.http_client
-
-
-async def close_http_client() -> None:
-    """Close HTTP client."""
-    if state.http_client and not state.http_client.is_closed:
-        await state.http_client.aclose()
-        state.http_client = None
-
-
-# =============================================================================
-# FastAPI App - import from main.py to have OAuth endpoints
-# =============================================================================
-from main import app  # OAuth + API endpoints from main.py
+from main import app
 
 router = Router(name="main_router")
 
 
-# Override root to show bot status
+# Override root endpoint
 @app.get("/", include_in_schema=False)
 async def root_with_bot_status():
-    return {"status": "ok", "service": "tracker-bot", "bot_active": state.bot is not None}
+    return {
+        "status": "ok",
+        "service": "tracker-bot",
+        "version": "2.1.0",
+        "bot_active": state.bot is not None
+    }
 
 
 @app.on_event("shutdown")
 async def bot_app_shutdown():
-    await close_http_client()
+    await close_client()
 
 
 # =============================================================================
 # Helpers
 # =============================================================================
 def fmt_item(item: dict) -> str:
-    """Format checklist item with assignee."""
+    """Format checklist item."""
     mark = "✅" if item.get("checked") else "⬜"
     text = (item.get("text") or "").strip().replace("\n", " ")[:80]
     assignee = item.get("assignee") or {}
     name = assignee.get("display") or assignee.get("login") or ""
     if name:
         return f"{mark} {text} — _{name}_"
+    return f"{mark} {text}"
+
+
+def fmt_item_full(item: dict) -> str:
+    """Format checklist item with assignee, highlighting user's own items."""
+    mark = "✅" if item.get("checked") else "⬜"
+    text = (item.get("text") or "").strip().replace("\n", " ")[:80]
+    assignee = item.get("assignee") or {}
+    name = assignee.get("display") or assignee.get("login") or ""
+    is_mine = item.get("is_mine", False)
+    
+    if is_mine:
+        return f"{mark} {text} — 👤 *Вы*"
+    elif name:
+        return f"{mark} {text} — {name}"
     return f"{mark} {text}"
 
 
@@ -245,54 +220,49 @@ def fmt_date(date_str: Optional[str]) -> str:
 
 
 def escape_md(text: str) -> str:
-    """Escape special characters for Telegram Markdown link text.
-    
-    Inside [...] only ] and ) need escaping (replaced with similar chars).
-    _ * ` are safe inside link text brackets.
-    """
-    # Replace brackets that would break Markdown link syntax
-    text = text.replace("[", "(").replace("]", ")")
-    return text
+    """Escape special characters for Telegram Markdown link text."""
+    return text.replace("[", "(").replace("]", ")")
 
 
 def fmt_issue_link(issue: dict, prefix: str = "", show_date: bool = True) -> str:
-    """Format issue as Markdown hyperlink: [KEY: Summary](url) (date)"""
+    """Format issue as Markdown hyperlink."""
     key = issue.get("key", "")
     summary = escape_md((issue.get("summary") or "")[:55])
     url = issue.get("url") or f"https://tracker.yandex.ru/{key}"
     date_str = fmt_date(issue.get("updatedAt")) if show_date else ""
     
     link = f"{prefix}[{key}: {summary}]({url})"
-    if date_str:
-        return f"{link} ({date_str})"
-    return link
+    return f"{link} ({date_str})" if date_str else link
 
 
-def parse_response(r: httpx.Response) -> dict:
+def parse_response(r) -> dict:
     """Parse HTTP response to dict."""
     if "application/json" in r.headers.get("content-type", ""):
         try:
             return r.json()
         except Exception:
             pass
-    return {"raw": r.text}
+    return {"raw": r.text[:500] if r.text else ""}
 
 
 async def api_request(
     method: str,
     path: str,
     params: dict,
-    timeout: Optional[httpx.Timeout] = None
+    long_timeout: bool = False
 ) -> Tuple[int, dict]:
     """Make API request with error handling."""
-    client = await get_http_client()
+    client = await get_client()
+    timeout = get_timeout(long=long_timeout)
+    url = f"{settings.base_url}{path}"
+    
     try:
         if method == "GET":
-            r = await client.get(f"{BASE_URL}{path}", params=params, timeout=timeout)
+            r = await client.get(url, params=params, timeout=timeout)
         else:
-            r = await client.post(f"{BASE_URL}{path}", params=params, timeout=timeout)
+            r = await client.post(url, params=params, timeout=timeout)
         return r.status_code, parse_response(r)
-    except httpx.TimeoutException:
+    except asyncio.TimeoutError:
         return 504, {"error": "Timeout"}
     except Exception as e:
         return 500, {"error": str(e)[:200]}
@@ -302,7 +272,7 @@ def require_base_url(func):
     """Decorator to check BASE_URL."""
     @wraps(func)
     async def wrapper(m: Message, *args, **kwargs):
-        if not BASE_URL:
+        if not settings.base_url:
             await m.answer("❌ BASE_URL не задан")
             return
         return await func(m, *args, **kwargs)
@@ -398,21 +368,6 @@ async def get_settings(tg_id: int) -> Optional[Tuple[List[str], int, int, int]]:
     )
 
 
-def fmt_item_full(item: dict) -> str:
-    """Format checklist item with assignee, highlighting user's own items."""
-    mark = "✅" if item.get("checked") else "⬜"
-    text = (item.get("text") or "").strip().replace("\n", " ")[:80]
-    assignee = item.get("assignee") or {}
-    name = assignee.get("display") or assignee.get("login") or ""
-    is_mine = item.get("is_mine", False)
-    
-    if is_mine:
-        return f"{mark} {text} — 👤 *Вы*"
-    elif name:
-        return f"{mark} {text} — {name}"
-    return f"{mark} {text}"
-
-
 def build_checklist_response(
     issues: List[dict],
     header: str,
@@ -420,11 +375,7 @@ def build_checklist_response(
     add_buttons: bool = False,
     show_all_items: bool = False
 ) -> Tuple[str, Optional[InlineKeyboardMarkup], Dict[int, Tuple[str, str]]]:
-    """Build checklist text, keyboard, and item mapping.
-    
-    Args:
-        show_all_items: If True, show all checklist items (from 'all_items' field).
-    """
+    """Build checklist text, keyboard, and item mapping."""
     lines = [header]
     kb = InlineKeyboardBuilder() if add_buttons else None
     item_mapping: Dict[int, Tuple[str, str]] = {}
@@ -442,7 +393,10 @@ def build_checklist_response(
                 if is_mine and not is_checked:
                     item_mapping[item_num] = (issue.get("key"), item.get("id"))
                     if kb:
-                        kb.button(text=f"✅ {item_num}", callback_data=f"chk:{issue.get('key')}:{item.get('id')}:{item_num}")
+                        kb.button(
+                            text=f"✅ {item_num}",
+                            callback_data=f"chk:{issue.get('key')}:{item.get('id')}:{item_num}"
+                        )
                     item_num += 1
         else:
             for item in issue.get("items", []):
@@ -451,7 +405,10 @@ def build_checklist_response(
                     lines.append(f"  {fmt_item(item)}")
                     item_mapping[item_num] = (issue.get("key"), item.get("id"))
                     if kb and not is_checked:
-                        kb.button(text=f"✅ {item_num}", callback_data=f"chk:{issue.get('key')}:{item.get('id')}:{item_num}")
+                        kb.button(
+                            text=f"✅ {item_num}",
+                            callback_data=f"chk:{issue.get('key')}:{item.get('id')}:{item_num}"
+                        )
                     item_num += 1
     
     if kb:
@@ -487,7 +444,7 @@ async def cmd_menu(m: Message):
 @router.message(Command("connect"))
 @require_base_url
 async def cmd_connect(m: Message):
-    url = f"{BASE_URL}/oauth/start?tg={m.from_user.id}"
+    url = f"{settings.base_url}/oauth/start?tg={m.from_user.id}"
     await m.answer(f"Открой ссылку:\n{url}\n\nПосле — /me")
 
 
@@ -511,11 +468,11 @@ async def cmd_me(m: Message):
 @router.message(Command("settings"))
 @require_base_url
 async def cmd_settings(m: Message):
-    settings = await get_settings(m.from_user.id)
-    if not settings:
+    user_settings = await get_settings(m.from_user.id)
+    if not user_settings:
         await m.answer("❌ Не удалось получить настройки")
         return
-    queues, days, limit, reminder = settings
+    queues, days, limit, reminder = user_settings
     await m.answer(render_settings_text(queues, days, limit, reminder), reply_markup=kb_settings_main())
 
 
@@ -523,10 +480,14 @@ async def cmd_settings(m: Message):
 @require_base_url
 async def cmd_cl_my(m: Message):
     tg_id = m.from_user.id
-    settings = await get_settings(tg_id)
-    limit = settings[2] if settings else 10
+    user_settings = await get_settings(tg_id)
+    limit = user_settings[2] if user_settings else 10
     
-    sc, data = await api_request("GET", "/tracker/checklist/assigned", {"tg": tg_id, "limit": limit}, HTTP_TIMEOUT_LONG)
+    sc, data = await api_request(
+        "GET", "/tracker/checklist/assigned",
+        {"tg": tg_id, "limit": limit},
+        long_timeout=True
+    )
     if sc != 200:
         await m.answer(f"❌ Ошибка {sc}: {data.get('error', data)}"[:500])
         return
@@ -549,10 +510,14 @@ async def cmd_cl_my(m: Message):
 async def cmd_mentions(m: Message):
     """Get issues where user was mentioned."""
     tg_id = m.from_user.id
-    settings = await get_settings(tg_id)
-    limit = settings[2] if settings else 10
+    user_settings = await get_settings(tg_id)
+    limit = user_settings[2] if user_settings else 10
     
-    sc, data = await api_request("GET", "/tracker/summons", {"tg": tg_id, "limit": limit}, HTTP_TIMEOUT_LONG)
+    sc, data = await api_request(
+        "GET", "/tracker/summons",
+        {"tg": tg_id, "limit": limit},
+        long_timeout=True
+    )
     if sc != 200:
         await m.answer(f"❌ Ошибка {sc}: {data.get('error', data)}"[:500])
         return
@@ -579,10 +544,14 @@ async def cmd_mentions(m: Message):
 @require_base_url
 async def cmd_cl_my_open(m: Message):
     tg_id = m.from_user.id
-    settings = await get_settings(tg_id)
-    limit = settings[2] if settings else 10
+    user_settings = await get_settings(tg_id)
+    limit = user_settings[2] if user_settings else 10
     
-    sc, data = await api_request("GET", "/tracker/checklist/assigned_unchecked", {"tg": tg_id, "limit": limit}, HTTP_TIMEOUT_LONG)
+    sc, data = await api_request(
+        "GET", "/tracker/checklist/assigned_unchecked",
+        {"tg": tg_id, "limit": limit},
+        long_timeout=True
+    )
     if sc != 200:
         await m.answer(f"❌ Ошибка {sc}: {data.get('error', data)}"[:500])
         return
@@ -594,7 +563,8 @@ async def cmd_cl_my_open(m: Message):
         return
     
     text, keyboard, item_mapping = build_checklist_response(
-        issues, "❔ *Ожидают согласование:*", include_checked=False, add_buttons=True, show_all_items=True
+        issues, "❔ *Ожидают согласование:*",
+        include_checked=False, add_buttons=True, show_all_items=True
     )
     state.checklist_cache.set(f"cl:{tg_id}", item_mapping)
     
@@ -671,7 +641,11 @@ async def process_summary(m: Message, issue_key: str, tg_id: int):
     loading = await m.answer("🤖 Генерирую резюме...")
     
     try:
-        sc, data = await api_request("GET", f"/tracker/issue/{issue_key}/summary", {"tg": tg_id}, HTTP_TIMEOUT_LONG)
+        sc, data = await api_request(
+            "GET", f"/tracker/issue/{issue_key}/summary",
+            {"tg": tg_id},
+            long_timeout=True
+        )
     except Exception as e:
         await loading.edit_text(f"❌ Ошибка запроса: {str(e)[:100]}")
         return
@@ -790,7 +764,11 @@ async def handle_summary_callback(c: CallbackQuery):
         loading_msg = await c.message.reply(f"🤖 Генерирую резюме для {issue_key}...") if c.message else None
         
         try:
-            sc, data = await api_request("GET", f"/tracker/issue/{issue_key}/summary", {"tg": tg_id}, HTTP_TIMEOUT_LONG)
+            sc, data = await api_request(
+                "GET", f"/tracker/issue/{issue_key}/summary",
+                {"tg": tg_id},
+                long_timeout=True
+            )
         except Exception as e:
             if loading_msg:
                 await loading_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
@@ -833,7 +811,10 @@ async def handle_summary_callback(c: CallbackQuery):
         state.pending_comment.pop(tg_id, None)
         await c.answer("Отменено")
         if c.message:
-            await c.message.delete()
+            try:
+                await c.message.delete()
+            except Exception:
+                pass
         return
     
     if action == "checklist":
@@ -872,7 +853,11 @@ async def handle_summary_callback(c: CallbackQuery):
         
         if c.message:
             try:
-                await c.message.reply("\n".join(lines), parse_mode="Markdown", reply_markup=kb.as_markup() if kb.buttons else None)
+                await c.message.reply(
+                    "\n".join(lines),
+                    parse_mode="Markdown",
+                    reply_markup=kb.as_markup() if kb.buttons else None
+                )
             except Exception:
                 pass
         await c.answer()
@@ -883,7 +868,7 @@ async def handle_summary_callback(c: CallbackQuery):
 
 async def handle_settings_callback(c: CallbackQuery):
     """Handle settings callbacks."""
-    if not BASE_URL:
+    if not settings.base_url:
         await c.answer("❌ BASE_URL не задан", show_alert=True)
         return
     
@@ -910,7 +895,10 @@ async def handle_settings_callback(c: CallbackQuery):
 
     if action == "back":
         if c.message:
-            await c.message.edit_text(render_settings_text(queues, days, limit, reminder), reply_markup=kb_settings_main())
+            await c.message.edit_text(
+                render_settings_text(queues, days, limit, reminder),
+                reply_markup=kb_settings_main()
+            )
         await c.answer()
         return
 
@@ -1052,7 +1040,7 @@ async def setup_bot_commands(bot: Bot):
 
 async def run_bot():
     """Run bot polling."""
-    if not BOT_TOKEN:
+    if not settings.bot:
         raise RuntimeError("BOT_TOKEN not set")
     
     if state.bot:
@@ -1061,7 +1049,7 @@ async def run_bot():
         except Exception:
             pass
 
-    bot = Bot(token=BOT_TOKEN)
+    bot = Bot(token=settings.bot.token)
     state.bot = bot
     await setup_bot_commands(bot)
     
@@ -1101,40 +1089,48 @@ async def run_bot():
 
 async def run_web():
     """Run web server."""
-    config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="warning")
+    config = uvicorn.Config(app, host="0.0.0.0", port=settings.port, log_level="warning")
     server = uvicorn.Server(config)
     await server.serve()
 
 
 async def keep_alive():
-    """Keep service alive (pings every 5 min)."""
+    """Keep service alive and cleanup caches."""
     await asyncio.sleep(10)
+    
+    interval = settings.bot.keep_alive_interval if settings.bot else 300
     
     while not state.shutdown_event.is_set():
         try:
-            client = await get_http_client()
-            await client.get(f"http://localhost:{PORT}/ping")
+            client = await get_client()
+            await client.get(f"http://localhost:{settings.port}/ping")
         except Exception:
             pass
         
-        # Cleanup expired cache entries periodically
+        # Cleanup expired cache entries
         state.checklist_cache.cleanup_expired()
         state.summary_cache.cleanup_expired()
         
+        # Cleanup old reminder timestamps (keep only active users)
+        if len(state.last_reminder) > 1000:
+            cutoff = time.time() - 86400 * 7  # 7 days
+            state.last_reminder = {
+                k: v for k, v in state.last_reminder.items()
+                if v > cutoff
+            }
+        
         try:
-            await asyncio.wait_for(state.shutdown_event.wait(), timeout=KEEP_ALIVE_INTERVAL)
+            await asyncio.wait_for(state.shutdown_event.wait(), timeout=interval)
             break
         except asyncio.TimeoutError:
             continue
 
 
-# Track last reminder time per user
-_last_reminder: Dict[int, float] = {}
-
-
 async def reminder_worker():
     """Send periodic reminders (09:00-19:00)."""
     await asyncio.sleep(60)
+    
+    interval = settings.bot.reminder_check_interval if settings.bot else 300
     
     while not state.shutdown_event.is_set():
         try:
@@ -1143,7 +1139,7 @@ async def reminder_worker():
                 await asyncio.sleep(300)
                 continue
             
-            if not state.bot or not BASE_URL:
+            if not state.bot or not settings.base_url:
                 await asyncio.sleep(60)
                 continue
             
@@ -1162,7 +1158,7 @@ async def reminder_worker():
                 if not tg_id or reminder_hours <= 0:
                     continue
                 
-                last_time = _last_reminder.get(tg_id, 0)
+                last_time = state.last_reminder.get(tg_id, 0)
                 if time.time() - last_time < reminder_hours * 3600:
                     continue
                 
@@ -1170,7 +1166,11 @@ async def reminder_worker():
                 has_items = False
                 
                 try:
-                    sc1, data1 = await api_request("GET", "/tracker/checklist/assigned_unchecked", {"tg": tg_id, "limit": 5}, HTTP_TIMEOUT_LONG)
+                    sc1, data1 = await api_request(
+                        "GET", "/tracker/checklist/assigned_unchecked",
+                        {"tg": tg_id, "limit": 5},
+                        long_timeout=True
+                    )
                     if sc1 == 200:
                         issues = data1.get("issues", [])
                         if issues:
@@ -1185,7 +1185,11 @@ async def reminder_worker():
                     pass
                 
                 try:
-                    sc2, data2 = await api_request("GET", "/tracker/summons", {"tg": tg_id, "limit": 5}, HTTP_TIMEOUT_LONG)
+                    sc2, data2 = await api_request(
+                        "GET", "/tracker/summons",
+                        {"tg": tg_id, "limit": 5},
+                        long_timeout=True
+                    )
                     if sc2 == 200:
                         issues = [i for i in data2.get("issues", []) if not i.get("has_responded")]
                         if issues:
@@ -1201,17 +1205,17 @@ async def reminder_worker():
                 if has_items:
                     try:
                         await state.bot.send_message(tg_id, "\n".join(lines), parse_mode="Markdown")
-                        _last_reminder[tg_id] = time.time()
+                        state.last_reminder[tg_id] = time.time()
                     except Exception:
                         pass
                 
                 await asyncio.sleep(1)
         
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Reminder worker error: {e}")
         
         try:
-            await asyncio.wait_for(state.shutdown_event.wait(), timeout=300)
+            await asyncio.wait_for(state.shutdown_event.wait(), timeout=interval)
             break
         except asyncio.TimeoutError:
             continue
@@ -1219,6 +1223,7 @@ async def reminder_worker():
 
 async def shutdown():
     """Graceful shutdown."""
+    logger.info("Shutting down...")
     state.shutdown_event.set()
     
     if state.bot:
@@ -1228,22 +1233,12 @@ async def shutdown():
         except Exception:
             pass
     
-    await close_http_client()
-
-
-def setup_signals():
-    """Setup signal handlers."""
-    def handler(sig, frame):
-        asyncio.create_task(shutdown())
-    
-    signal.signal(signal.SIGTERM, handler)
-    signal.signal(signal.SIGINT, handler)
+    await close_client()
+    logger.info("Shutdown complete")
 
 
 async def main():
     """Main entry point."""
-    setup_signals()
-    
     tasks = {
         "web": asyncio.create_task(run_web()),
         "bot": asyncio.create_task(run_bot()),
@@ -1251,12 +1246,18 @@ async def main():
         "reminder": asyncio.create_task(reminder_worker()),
     }
     
+    logger.info(f"Starting tracker-bot on port {settings.port}")
+    
     try:
         while not state.shutdown_event.is_set():
             await asyncio.sleep(5)
             
             for name, task in list(tasks.items()):
                 if task.done() and not state.shutdown_event.is_set():
+                    exc = task.exception() if not task.cancelled() else None
+                    if exc:
+                        logger.warning(f"Task {name} failed: {exc}")
+                    
                     await asyncio.sleep(3)
                     if name == "web":
                         tasks[name] = asyncio.create_task(run_web())
@@ -1267,6 +1268,8 @@ async def main():
                     elif name == "reminder":
                         tasks[name] = asyncio.create_task(reminder_worker())
     except asyncio.CancelledError:
+        pass
+    except KeyboardInterrupt:
         pass
     finally:
         for task in tasks.values():

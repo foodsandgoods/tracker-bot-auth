@@ -1,454 +1,177 @@
 """
 FastAPI service for Yandex Tracker OAuth and API proxy.
-Optimized for Render.com free tier (512MB RAM, shared CPU).
+Optimized for low-resource environments (1GB RAM).
 """
 import asyncio
 import logging
-import os
 import secrets
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from functools import wraps
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Optional
 from urllib.parse import urlencode
 
-import asyncpg
-import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, RedirectResponse
 
-# Configure logging - minimal, no tokens in logs
+from config import settings
+from db import TokenStorage, queues_list
+from http_client import get_client, close_client, get_timeout, with_retry, safe_json
+
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
-# Type var for retry decorator
-T = TypeVar("T")
+# Reduce noise from libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("asyncpg").setLevel(logging.WARNING)
 
 
-# =========================
-# Config
-# =========================
-@dataclass(frozen=True)
-class Settings:
-    base_url: str
-    yandex_client_id: str
-    yandex_client_secret: str
-    yandex_org_id: str
-    database_url: str
-
-    yandex_auth_url: str = "https://oauth.yandex.ru/authorize"
-    yandex_token_url: str = "https://oauth.yandex.ru/token"
-
-    # Timeouts optimized for low-resource server
-    http_timeout_default: float = 20.0
-    http_timeout_long: float = 30.0  # For AI summary
-
-
-def load_settings() -> Settings:
-    return Settings(
-        base_url=(os.getenv("BASE_URL") or "").rstrip("/"),
-        yandex_client_id=os.getenv("YANDEX_CLIENT_ID") or "",
-        yandex_client_secret=os.getenv("YANDEX_CLIENT_SECRET") or "",
-        yandex_org_id=os.getenv("YANDEX_ORG_ID") or "",
-        database_url=os.getenv("DATABASE_URL") or "",
-    )
-
-
-# =========================
-# Retry decorator with exponential backoff
-# =========================
-def with_retry(
-    max_attempts: int = 3,
-    base_delay: float = 0.5,
-    max_delay: float = 5.0,
-    retryable_exceptions: tuple = (httpx.TimeoutException, httpx.ConnectError),
-) -> Callable:
-    """Decorator for async functions with exponential backoff retry."""
-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        @wraps(func)
-        async def wrapper(*args: Any, **kwargs: Any) -> T:
-            last_exception: Optional[Exception] = None
-            for attempt in range(max_attempts):
-                try:
-                    return await func(*args, **kwargs)
-                except retryable_exceptions as e:
-                    last_exception = e
-                    if attempt < max_attempts - 1:
-                        delay = min(base_delay * (2 ** attempt), max_delay)
-                        logger.warning(f"Retry {attempt + 1}/{max_attempts} for {func.__name__} after {delay:.1f}s: {e}")
-                        await asyncio.sleep(delay)
-            raise last_exception  # type: ignore
-        return wrapper
-    return decorator
-
-
-# =========================
-# Utils
-# =========================
-def _safe_json(r: httpx.Response) -> Any:
-    try:
-        return r.json()
-    except Exception:
-        return {"raw": r.text}
-
-
-def _require(settings: Settings) -> Optional[JSONResponse]:
-    missing = []
-    if not settings.base_url:
-        missing.append("BASE_URL")
-    if not settings.yandex_client_id:
-        missing.append("YANDEX_CLIENT_ID")
-    if not settings.yandex_client_secret:
-        missing.append("YANDEX_CLIENT_SECRET")
-    if not settings.yandex_org_id:
-        missing.append("YANDEX_ORG_ID")
-    if not settings.database_url:
-        missing.append("DATABASE_URL")
-
-    if missing:
-        return JSONResponse({"error": "Service not configured", "missing": missing}, status_code=500)
-    return None
-
-
-def _parse_state(state: str) -> int:
-    tg_str, _nonce = state.split(":", 1)
-    return int(tg_str)
-
-
-def _normalize_queues_csv(s: str) -> str:
-    raw = s.replace(";", ",").replace(" ", "")
-    parts = [p for p in raw.split(",") if p]
-    seen: set[str] = set()
-    out: list[str] = []
-    for p in parts:
-        p2 = p.upper()
-        if p2 not in seen:
-            out.append(p2)
-            seen.add(p2)
-    return ",".join(out)
-
-
-def _queues_list(csv: str) -> list[str]:
-    if not csv:
-        return []
-    return [p for p in csv.split(",") if p]
-
-
-# =========================
-# Storage (PostgreSQL with asyncpg pool)
-# =========================
-class TokenStorage:
-    """Database storage with connection pooling for efficiency."""
-    
-    def __init__(self, database_url: str):
-        self.database_url = database_url
-        self._pool: Optional[asyncpg.Pool] = None
-
-    async def init_pool(self) -> None:
-        """Initialize connection pool with conservative settings for 512MB RAM."""
-        if self._pool is not None:
-            return
-        self._pool = await asyncpg.create_pool(
-            self.database_url,
-            min_size=1,      # Minimal idle connections
-            max_size=5,      # Max connections (low for free tier)
-            max_inactive_connection_lifetime=60.0,  # Close idle connections faster
-            command_timeout=30.0,
-        )
-        logger.info("Database pool initialized (1-5 connections)")
-
-    async def close_pool(self) -> None:
-        """Close connection pool gracefully."""
-        if self._pool:
-            await self._pool.close()
-            self._pool = None
-            logger.info("Database pool closed")
-
-    async def _get_pool(self) -> asyncpg.Pool:
-        if self._pool is None:
-            await self.init_pool()
-        return self._pool  # type: ignore
-
-    async def ensure_schema(self) -> None:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS oauth_tokens (
-                    tg_id BIGINT PRIMARY KEY,
-                    access_token TEXT NOT NULL,
-                    refresh_token TEXT,
-                    token_type TEXT,
-                    expires_in BIGINT,
-                    obtained_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS tg_users (
-                    tg_id BIGINT PRIMARY KEY,
-                    tracker_login TEXT NOT NULL,
-                    tracker_uid TEXT,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS tg_settings (
-                    tg_id BIGINT PRIMARY KEY,
-                    queues_csv TEXT NOT NULL DEFAULT '',
-                    days INT NOT NULL DEFAULT 30,
-                    limit_results INT NOT NULL DEFAULT 10,
-                    reminder_hours INT NOT NULL DEFAULT 0,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-            """)
-            # Add columns if they don't exist (for existing databases)
-            await conn.execute("""
-                ALTER TABLE tg_settings
-                ADD COLUMN IF NOT EXISTS limit_results INT NOT NULL DEFAULT 10;
-            """)
-            await conn.execute("""
-                ALTER TABLE tg_settings
-                ADD COLUMN IF NOT EXISTS reminder_hours INT NOT NULL DEFAULT 0;
-            """)
-        logger.info("Database schema ensured")
-
-    async def upsert_token(
-        self,
-        tg_id: int,
-        access_token: str,
-        refresh_token: Optional[str],
-        token_type: Optional[str],
-        expires_in: Optional[int],
-    ) -> None:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO oauth_tokens (tg_id, access_token, refresh_token, token_type, expires_in, obtained_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (tg_id) DO UPDATE SET
-                    access_token = EXCLUDED.access_token,
-                    refresh_token = EXCLUDED.refresh_token,
-                    token_type = EXCLUDED.token_type,
-                    expires_in = EXCLUDED.expires_in,
-                    obtained_at = EXCLUDED.obtained_at;
-            """, tg_id, access_token, refresh_token, token_type, expires_in, datetime.now(timezone.utc))
-
-    async def get_tokens(self, tg_id: int) -> Optional[dict]:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT access_token, refresh_token FROM oauth_tokens WHERE tg_id=$1",
-                tg_id
-            )
-        if row:
-            return dict(row)
-        return None
-
-    async def upsert_user(self, tg_id: int, tracker_login: str, tracker_uid: Optional[str]) -> None:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO tg_users (tg_id, tracker_login, tracker_uid, updated_at)
-                VALUES ($1, $2, $3, NOW())
-                ON CONFLICT (tg_id) DO UPDATE SET
-                    tracker_login = EXCLUDED.tracker_login,
-                    tracker_uid = EXCLUDED.tracker_uid,
-                    updated_at = NOW();
-            """, tg_id, tracker_login, tracker_uid)
-
-    async def get_user(self, tg_id: int) -> Optional[dict]:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT tracker_login, tracker_uid FROM tg_users WHERE tg_id=$1",
-                tg_id
-            )
-        if row:
-            return dict(row)
-        return None
-
-    async def ensure_settings_row(self, tg_id: int) -> None:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO tg_settings (tg_id)
-                VALUES ($1)
-                ON CONFLICT (tg_id) DO NOTHING;
-            """, tg_id)
-
-    async def get_settings(self, tg_id: int) -> dict:
-        await self.ensure_settings_row(tg_id)
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT queues_csv, days, limit_results, reminder_hours FROM tg_settings WHERE tg_id=$1",
-                tg_id
-            )
-        if row:
-            return dict(row)
-        return {"queues_csv": "", "days": 30, "limit_results": 10, "reminder_hours": 0}
-
-    async def set_queues(self, tg_id: int, queues_csv: str) -> None:
-        q = _normalize_queues_csv(queues_csv)
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO tg_settings (tg_id, queues_csv, updated_at)
-                VALUES ($1, $2, NOW())
-                ON CONFLICT (tg_id) DO UPDATE SET
-                    queues_csv = EXCLUDED.queues_csv,
-                    updated_at = NOW();
-            """, tg_id, q)
-
-    async def set_days(self, tg_id: int, days: int) -> None:
-        days = max(1, min(int(days), 3650))
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO tg_settings (tg_id, days, updated_at)
-                VALUES ($1, $2, NOW())
-                ON CONFLICT (tg_id) DO UPDATE SET
-                    days = EXCLUDED.days,
-                    updated_at = NOW();
-            """, tg_id, days)
-
-    async def set_limit(self, tg_id: int, limit: int) -> None:
-        limit = max(1, min(int(limit), 100))
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO tg_settings (tg_id, limit_results, updated_at)
-                VALUES ($1, $2, NOW())
-                ON CONFLICT (tg_id) DO UPDATE SET
-                    limit_results = EXCLUDED.limit_results,
-                    updated_at = NOW();
-            """, tg_id, limit)
-
-    async def set_reminder(self, tg_id: int, hours: int) -> None:
-        hours = hours if hours in (0, 1, 3, 6) else 0
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO tg_settings (tg_id, reminder_hours, updated_at)
-                VALUES ($1, $2, NOW())
-                ON CONFLICT (tg_id) DO UPDATE SET
-                    reminder_hours = EXCLUDED.reminder_hours,
-                    updated_at = NOW();
-            """, tg_id, hours)
-
-    async def get_users_with_reminder(self) -> list[dict]:
-        """Get all users with reminder enabled (reminder_hours > 0)."""
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT tg_id, reminder_hours FROM tg_settings WHERE reminder_hours > 0"
-            )
-        return [dict(r) for r in rows] if rows else []
-
-
-# =========================
-# HTTP clients with retry
-# =========================
+# =============================================================================
+# OAuth Client
+# =============================================================================
 class OAuthClient:
-    def __init__(self, http: httpx.AsyncClient, settings: Settings):
-        self.http = http
-        self.settings = settings
+    """Yandex OAuth client."""
+    
+    def __init__(self):
+        if not settings.oauth or not settings.tracker:
+            raise ValueError("OAuth not configured")
+        self._client_id = settings.oauth.client_id
+        self._client_secret = settings.oauth.client_secret
+        self._token_url = settings.tracker.token_url
+        self._auth_url = settings.tracker.auth_url
 
     def build_authorize_url(self, tg_id: int) -> str:
+        """Build OAuth authorization URL."""
         nonce = secrets.token_urlsafe(16)
         state = f"{tg_id}:{nonce}"
-        redirect_uri = f"{self.settings.base_url}/oauth/callback"
+        redirect_uri = f"{settings.base_url}/oauth/callback"
         params = {
             "response_type": "code",
-            "client_id": self.settings.yandex_client_id,
+            "client_id": self._client_id,
             "redirect_uri": redirect_uri,
             "state": state,
         }
-        return f"{self.settings.yandex_auth_url}?{urlencode(params)}"
+        return f"{self._auth_url}?{urlencode(params)}"
 
     @with_retry(max_attempts=2, base_delay=1.0)
     async def exchange_code(self, code: str) -> dict[str, Any]:
-        redirect_uri = f"{self.settings.base_url}/oauth/callback"
+        """Exchange authorization code for tokens."""
+        client = await get_client()
+        redirect_uri = f"{settings.base_url}/oauth/callback"
         data = {
             "grant_type": "authorization_code",
             "code": code,
-            "client_id": self.settings.yandex_client_id,
-            "client_secret": self.settings.yandex_client_secret,
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
             "redirect_uri": redirect_uri,
         }
-        r = await self.http.post(self.settings.yandex_token_url, data=data)
-        payload = _safe_json(r)
+        r = await client.post(self._token_url, data=data)
+        payload = safe_json(r)
+        
         if r.status_code != 200:
             raise RuntimeError(f"Token exchange failed: {r.status_code}")
         if "access_token" not in payload:
             raise RuntimeError("Token exchange response has no access_token")
+        
         return payload
 
     @with_retry(max_attempts=2, base_delay=1.0)
     async def refresh(self, refresh_token: str) -> dict[str, Any]:
+        """Refresh access token."""
+        client = await get_client()
         data = {
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
-            "client_id": self.settings.yandex_client_id,
-            "client_secret": self.settings.yandex_client_secret,
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
         }
-        r = await self.http.post(self.settings.yandex_token_url, data=data)
-        payload = _safe_json(r)
+        r = await client.post(self._token_url, data=data)
+        payload = safe_json(r)
+        
         if r.status_code != 200:
             raise RuntimeError(f"Token refresh failed: {r.status_code}")
         if "access_token" not in payload:
             raise RuntimeError("Refresh response has no access_token")
+        
         return payload
 
 
+# =============================================================================
+# Tracker API Client
+# =============================================================================
 class TrackerClient:
     """Yandex Tracker API client with retry support."""
     
-    def __init__(self, http: httpx.AsyncClient, settings: Settings):
-        self.http = http
-        self.settings = settings
+    def __init__(self):
+        if not settings.tracker:
+            raise ValueError("Tracker not configured")
+        self._api_base = settings.tracker.api_base
+        self._org_id = settings.tracker.org_id
 
     def _headers(self, access_token: str) -> dict[str, str]:
+        """Build request headers."""
         return {
             "Authorization": f"OAuth {access_token}",
-            "X-Org-Id": self.settings.yandex_org_id,
+            "X-Org-Id": self._org_id,
         }
 
     @with_retry(max_attempts=3, base_delay=0.5)
     async def myself(self, access_token: str) -> tuple[int, Any]:
-        url = "https://api.tracker.yandex.net/v2/myself"
-        r = await self.http.get(url, headers=self._headers(access_token))
-        return r.status_code, _safe_json(r)
+        """Get current user info."""
+        client = await get_client()
+        r = await client.get(
+            f"{self._api_base}/myself",
+            headers=self._headers(access_token)
+        )
+        return r.status_code, safe_json(r)
 
     @with_retry(max_attempts=3, base_delay=0.5)
-    async def search_issues(self, access_token: str, query: str, limit: int = 50) -> tuple[int, Any]:
-        url = "https://api.tracker.yandex.net/v2/issues/_search"
+    async def search_issues(
+        self, access_token: str, query: str, limit: int = 50
+    ) -> tuple[int, Any]:
+        """Search issues."""
+        client = await get_client()
         headers = {**self._headers(access_token), "Content-Type": "application/json"}
         params = {"page": 1, "perPage": limit}
-        r = await self.http.post(url, headers=headers, params=params, json={"query": query})
-        return r.status_code, _safe_json(r)
+        r = await client.post(
+            f"{self._api_base}/issues/_search",
+            headers=headers,
+            params=params,
+            json={"query": query}
+        )
+        return r.status_code, safe_json(r)
 
     @with_retry(max_attempts=3, base_delay=0.5)
     async def get_issue(self, access_token: str, issue_key: str) -> tuple[int, Any]:
-        url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}"
-        r = await self.http.get(url, headers=self._headers(access_token))
-        return r.status_code, _safe_json(r)
+        """Get single issue."""
+        client = await get_client()
+        r = await client.get(
+            f"{self._api_base}/issues/{issue_key}",
+            headers=self._headers(access_token)
+        )
+        return r.status_code, safe_json(r)
 
-    async def get_issue_with_changelog(self, access_token: str, issue_key: str) -> tuple[int, Any]:
+    async def get_issue_with_changelog(
+        self, access_token: str, issue_key: str
+    ) -> tuple[int, Any]:
         """Get issue with changelog and comments for summary generation."""
         st, issue_data = await self.get_issue(access_token, issue_key)
         if st != 200 or not isinstance(issue_data, dict):
             return st, issue_data
 
+        client = await get_client()
+        headers = self._headers(access_token)
+
         # Fetch comments
         try:
-            comments_url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/comments"
-            r = await self.http.get(comments_url, headers=self._headers(access_token))
+            r = await client.get(
+                f"{self._api_base}/issues/{issue_key}/comments",
+                headers=headers
+            )
             if r.status_code == 200:
-                comments = _safe_json(r)
+                comments = safe_json(r)
                 if isinstance(comments, list):
                     issue_data["comments"] = comments
                 elif isinstance(comments, dict) and "values" in comments:
@@ -459,10 +182,12 @@ class TrackerClient:
 
         # Fetch changelog
         try:
-            changelog_url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/changelog"
-            r = await self.http.get(changelog_url, headers=self._headers(access_token))
+            r = await client.get(
+                f"{self._api_base}/issues/{issue_key}/changelog",
+                headers=headers
+            )
             if r.status_code == 200:
-                changelog = _safe_json(r)
+                changelog = safe_json(r)
                 if isinstance(changelog, list):
                     issue_data["changelog"] = changelog
                 elif isinstance(changelog, dict) and "values" in changelog:
@@ -474,40 +199,57 @@ class TrackerClient:
         return 200, issue_data
 
     @with_retry(max_attempts=2, base_delay=0.5)
-    async def patch_issue(self, access_token: str, issue_key: str, patch: dict) -> tuple[int, Any]:
-        url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}"
+    async def patch_issue(
+        self, access_token: str, issue_key: str, patch: dict
+    ) -> tuple[int, Any]:
+        """Update issue."""
+        client = await get_client()
         headers = {**self._headers(access_token), "Content-Type": "application/json"}
-        r = await self.http.patch(url, headers=headers, json=patch)
-        return r.status_code, _safe_json(r)
+        r = await client.patch(
+            f"{self._api_base}/issues/{issue_key}",
+            headers=headers,
+            json=patch
+        )
+        return r.status_code, safe_json(r)
 
     @with_retry(max_attempts=2, base_delay=0.5)
-    async def add_comment(self, access_token: str, issue_key: str, text: str) -> tuple[int, Any]:
-        """Add a comment to an issue."""
-        url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/comments"
+    async def add_comment(
+        self, access_token: str, issue_key: str, text: str
+    ) -> tuple[int, Any]:
+        """Add comment to issue."""
+        client = await get_client()
         headers = {**self._headers(access_token), "Content-Type": "application/json"}
-        r = await self.http.post(url, headers=headers, json={"text": text})
-        return r.status_code, _safe_json(r)
+        r = await client.post(
+            f"{self._api_base}/issues/{issue_key}/comments",
+            headers=headers,
+            json={"text": text}
+        )
+        return r.status_code, safe_json(r)
 
 
-# =========================
-# Service layer
-# =========================
+# =============================================================================
+# Service Layer
+# =============================================================================
 class TrackerService:
+    """Business logic for Tracker operations."""
+    
     def __init__(self, storage: TokenStorage, oauth: OAuthClient, tracker: TrackerClient):
         self.storage = storage
         self.oauth = oauth
         self.tracker = tracker
 
     async def _get_valid_access_token(self, tg_id: int) -> tuple[Optional[str], Optional[dict]]:
+        """Get valid access token, refreshing if needed."""
         tokens = await self.storage.get_tokens(tg_id)
         if not tokens or not tokens.get("access_token"):
             return None, {"http_status": 401, "body": {"error": "No token. Use /connect first."}}
 
         access = tokens["access_token"]
+        
         try:
             st, me = await self.tracker.myself(access)
         except Exception as e:
-            logger.warning(f"Token validation failed for tg_id={tg_id}: {e}")
+            logger.warning(f"Token validation failed for tg_id={tg_id}: {type(e).__name__}")
             return None, {"http_status": 503, "body": {"error": "Tracker API unavailable"}}
 
         if st != 401:
@@ -515,7 +257,7 @@ class TrackerService:
                 login = me.get("login")
                 uid = me.get("trackerUid") or me.get("passportUid") or me.get("uid")
                 if login:
-                    await self.storage.upsert_user(tg_id, login, str(uid) if uid is not None else None)
+                    await self.storage.upsert_user(tg_id, login, str(uid) if uid else None)
             return access, None
 
         # Token expired, try refresh
@@ -526,7 +268,7 @@ class TrackerService:
         try:
             new_payload = await self.oauth.refresh(refresh_token)
         except Exception as e:
-            logger.warning(f"Token refresh failed for tg_id={tg_id}: {e}")
+            logger.warning(f"Token refresh failed for tg_id={tg_id}: {type(e).__name__}")
             return None, {"http_status": 401, "body": {"error": "Token refresh failed. Reconnect."}}
 
         new_access = new_payload.get("access_token")
@@ -542,13 +284,14 @@ class TrackerService:
                 login2 = me2.get("login")
                 uid2 = me2.get("trackerUid") or me2.get("passportUid") or me2.get("uid")
                 if login2:
-                    await self.storage.upsert_user(tg_id, login2, str(uid2) if uid2 is not None else None)
+                    await self.storage.upsert_user(tg_id, login2, str(uid2) if uid2 else None)
         except Exception:
             pass
 
         return new_access, None
 
     async def user_by_tg(self, tg_id: int) -> dict:
+        """Get Tracker user by Telegram ID."""
         user = await self.storage.get_user(tg_id)
         if user:
             return {"http_status": 200, "body": user}
@@ -564,19 +307,23 @@ class TrackerService:
         return {"http_status": 404, "body": {"error": "User not linked yet. Run /connect again."}}
 
     async def me_by_tg(self, tg_id: int) -> dict:
+        """Get /myself info for Telegram user."""
         access, err = await self._get_valid_access_token(tg_id)
         if err:
             return err
+        
         try:
-            st, payload = await self.tracker.myself(access)
+            st, payload = await self.tracker.myself(access)  # type: ignore
         except Exception as e:
-            return {"http_status": 503, "body": {"error": f"Tracker API error: {e}"}}
+            return {"http_status": 503, "body": {"error": f"Tracker API error: {type(e).__name__}"}}
+        
         return {"http_status": 200, "body": {"status_code": st, "response": payload}}
 
     async def settings_get(self, tg_id: int) -> dict:
+        """Get user settings."""
         s = await self.storage.get_settings(tg_id)
         return {"http_status": 200, "body": {
-            "queues": _queues_list(s.get("queues_csv", "")),
+            "queues": queues_list(s.get("queues_csv", "")),
             "days": s.get("days", 30),
             "limit": s.get("limit_results", 10),
             "reminder": s.get("reminder_hours", 0)
@@ -602,6 +349,7 @@ class TrackerService:
         return await self.storage.get_users_with_reminder()
 
     def _build_candidate_query(self, queues: list[str], days: int) -> str:
+        """Build search query for checklist candidates."""
         base = f"Updated: >= now()-{int(days)}d"
         if not queues:
             return base
@@ -615,10 +363,14 @@ class TrackerService:
             return issue_payload["checklistItems"]
         return []
 
-    async def checklist_assigned_issues(self, tg_id: int, only_unchecked: bool, limit: int = 10) -> dict:
+    async def checklist_assigned_issues(
+        self, tg_id: int, only_unchecked: bool, limit: int = 10
+    ) -> dict:
+        """Get issues with checklist items assigned to user."""
         u = await self.user_by_tg(tg_id)
         if u["http_status"] != 200:
             return u
+        
         login = (u["body"].get("tracker_login") or "").lower()
         if not login:
             return {"http_status": 500, "body": {"error": "tracker_login is empty"}}
@@ -628,7 +380,7 @@ class TrackerService:
             return err
 
         s = await self.storage.get_settings(tg_id)
-        queues = _queues_list(s.get("queues_csv", ""))
+        queues = queues_list(s.get("queues_csv", ""))
         days = int(s.get("days", 30))
         if limit == 10:
             limit = int(s.get("limit_results", 10))
@@ -637,9 +389,9 @@ class TrackerService:
         search_limit = min(max(50, limit * 5), 150)
 
         try:
-            st, payload = await self.tracker.search_issues(access, query=query, limit=search_limit)
+            st, payload = await self.tracker.search_issues(access, query=query, limit=search_limit)  # type: ignore
         except Exception as e:
-            return {"http_status": 503, "body": {"error": f"Search failed: {e}"}}
+            return {"http_status": 503, "body": {"error": f"Search failed: {type(e).__name__}"}}
 
         if st != 200:
             return {"http_status": 200, "body": {"status_code": st, "response": payload, "query": query}}
@@ -661,9 +413,9 @@ class TrackerService:
         issues_by_key = {it.get("key"): it for it in issues if it.get("key")}
         issue_keys = list(issues_by_key.keys())[:min(len(issues_by_key), 120)]
 
-        async def fetch_issue(key: str) -> tuple[str, dict | None]:
+        async def fetch_issue(key: str) -> tuple[str, Optional[dict]]:
             try:
-                sti, issue_full = await self.tracker.get_issue(access, key)
+                sti, issue_full = await self.tracker.get_issue(access, key)  # type: ignore
                 if sti == 200 and isinstance(issue_full, dict):
                     return key, issue_full
             except Exception:
@@ -696,18 +448,21 @@ class TrackerService:
 
                 matched_items = []
                 all_items = []
-                
+
                 for ci in checklist_items:
                     ass = ci.get("assignee")
                     item_data = {
                         "id": str(ci.get("id", "")),
                         "text": (ci.get("text") or ci.get("textHtml") or "").strip(),
                         "checked": bool(ci.get("checked", False)),
-                        "assignee": {"display": ass.get("display") if ass else "", "login": ass.get("login") if ass else ""},
+                        "assignee": {
+                            "display": ass.get("display") if ass else "",
+                            "login": ass.get("login") if ass else ""
+                        },
                         "is_mine": bool(ass and (ass.get("login") or "").lower() == login),
                     }
                     all_items.append(item_data)
-                    
+
                     if only_unchecked and ci.get("checked") is True:
                         continue
 
@@ -765,15 +520,18 @@ class TrackerService:
             },
         }
 
-    async def checklist_item_check(self, tg_id: int, issue_key: str, item_id: str, checked: bool) -> dict:
+    async def checklist_item_check(
+        self, tg_id: int, issue_key: str, item_id: str, checked: bool
+    ) -> dict:
+        """Check/uncheck a checklist item."""
         access, err = await self._get_valid_access_token(tg_id)
         if err:
             return err
 
         try:
-            sti, issue_full = await self.tracker.get_issue(access, issue_key)
+            sti, issue_full = await self.tracker.get_issue(access, issue_key)  # type: ignore
         except Exception as e:
-            return {"http_status": 503, "body": {"error": f"Get issue failed: {e}"}}
+            return {"http_status": 503, "body": {"error": f"Get issue failed: {type(e).__name__}"}}
 
         if sti != 200 or not isinstance(issue_full, dict):
             return {"http_status": 200, "body": {"status_code": sti, "response": issue_full}}
@@ -797,22 +555,22 @@ class TrackerService:
             return {"http_status": 404, "body": {"error": "Checklist item not found", "item_id": item_id}}
 
         try:
-            stp, resp = await self.tracker.patch_issue(access, issue_key, {"checklistItems": new_items})
+            stp, resp = await self.tracker.patch_issue(access, issue_key, {"checklistItems": new_items})  # type: ignore
         except Exception as e:
-            return {"http_status": 503, "body": {"error": f"Patch failed: {e}"}}
+            return {"http_status": 503, "body": {"error": f"Patch failed: {type(e).__name__}"}}
 
         return {"http_status": 200, "body": {"status_code": stp, "response": resp}}
 
     async def get_issue_full(self, tg_id: int, issue_key: str) -> dict:
-        """Get full issue data with changelog and comments for summary generation."""
+        """Get full issue data with changelog and comments."""
         access, err = await self._get_valid_access_token(tg_id)
         if err:
             return err
 
         try:
-            st, issue_data = await self.tracker.get_issue_with_changelog(access, issue_key)
+            st, issue_data = await self.tracker.get_issue_with_changelog(access, issue_key)  # type: ignore
         except Exception as e:
-            return {"http_status": 503, "body": {"error": f"Get issue failed: {e}"}}
+            return {"http_status": 503, "body": {"error": f"Get issue failed: {type(e).__name__}"}}
 
         if st != 200:
             return {"http_status": st, "body": issue_data}
@@ -826,9 +584,9 @@ class TrackerService:
             return err
 
         try:
-            st, issue_data = await self.tracker.get_issue(access, issue_key)
+            st, issue_data = await self.tracker.get_issue(access, issue_key)  # type: ignore
         except Exception as e:
-            return {"http_status": 503, "body": {"error": f"Get issue failed: {e}"}}
+            return {"http_status": 503, "body": {"error": f"Get issue failed: {type(e).__name__}"}}
 
         if st != 200:
             return {"http_status": st, "body": issue_data}
@@ -843,10 +601,11 @@ class TrackerService:
         }
 
     async def get_summons(self, tg_id: int, limit: int = 10) -> dict:
-        """Get issues where user was mentioned (field 'Нужен ответ пользователя')."""
+        """Get issues where user was mentioned."""
         u = await self.user_by_tg(tg_id)
         if u["http_status"] != 200:
             return u
+        
         login = (u["body"].get("tracker_login") or "").lower()
         if not login:
             return {"http_status": 500, "body": {"error": "tracker_login is empty"}}
@@ -856,7 +615,7 @@ class TrackerService:
             return err
 
         s = await self.storage.get_settings(tg_id)
-        queues = _queues_list(s.get("queues_csv", ""))
+        queues = queues_list(s.get("queues_csv", ""))
         days = int(s.get("days", 30))
         if limit == 10:
             limit = int(s.get("limit_results", 10))
@@ -870,13 +629,14 @@ class TrackerService:
         summon_query = f'"Нужен ответ пользователя": me() AND {base_query}'
 
         try:
-            st, payload = await self.tracker.search_issues(access, query=summon_query, limit=min(limit * 3, 100))
+            st, payload = await self.tracker.search_issues(access, query=summon_query, limit=min(limit * 3, 100))  # type: ignore
         except Exception as e:
-            return {"http_status": 503, "body": {"error": f"Search failed: {e}"}}
+            return {"http_status": 503, "body": {"error": f"Search failed: {type(e).__name__}"}}
 
         issues = []
         if st == 200:
             raw_issues = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
+            client = await get_client()
 
             for issue in raw_issues:
                 if len(issues) >= limit:
@@ -889,14 +649,16 @@ class TrackerService:
                 # Check if user has responded
                 has_responded = False
                 try:
-                    comments_url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}/comments"
                     headers = {
                         "Authorization": f"OAuth {access}",
-                        "X-Org-Id": self.tracker.settings.yandex_org_id,
+                        "X-Org-Id": settings.tracker.org_id if settings.tracker else "",
                     }
-                    r = await self.tracker.http.get(comments_url, headers=headers)
+                    r = await client.get(
+                        f"{settings.tracker.api_base if settings.tracker else ''}/issues/{issue_key}/comments",
+                        headers=headers
+                    )
                     if r.status_code == 200:
-                        comments = _safe_json(r)
+                        comments = safe_json(r)
                         if isinstance(comments, list):
                             for comment in reversed(comments):
                                 author = comment.get("createdBy", {})
@@ -934,12 +696,12 @@ class TrackerService:
 
         try:
             from ai_service import generate_summary
-            summary_text, error_msg = await generate_summary(issue_data, _http)
+            summary_text, error_msg = await generate_summary(issue_data)
         except ImportError as e:
             return {"http_status": 500, "body": {"error": f"AI module not found: {e}"}}
         except Exception as e:
-            logger.error(f"AI summary error for {issue_key}: {e}")
-            return {"http_status": 500, "body": {"error": f"AI service error: {e}"}}
+            logger.error(f"AI summary error for {issue_key}: {type(e).__name__}")
+            return {"http_status": 500, "body": {"error": f"AI service error: {type(e).__name__}"}}
 
         if not summary_text:
             error_detail = error_msg or "Unknown error"
@@ -955,15 +717,15 @@ class TrackerService:
         }
 
     async def add_comment(self, tg_id: int, issue_key: str, text: str) -> dict:
-        """Add a comment to an issue."""
+        """Add comment to issue."""
         access, err = await self._get_valid_access_token(tg_id)
         if err:
             return err
 
         try:
-            st, resp = await self.tracker.add_comment(access, issue_key, text)
+            st, resp = await self.tracker.add_comment(access, issue_key, text)  # type: ignore
         except Exception as e:
-            return {"http_status": 503, "body": {"error": f"Add comment failed: {e}"}}
+            return {"http_status": 503, "body": {"error": f"Add comment failed: {type(e).__name__}"}}
 
         if st not in (200, 201):
             return {"http_status": st, "body": resp}
@@ -978,63 +740,73 @@ class TrackerService:
         }
 
 
-# =========================
-# FastAPI wiring
-# =========================
-app = FastAPI(title="Tracker Bot Auth", version="2.0.0")
-settings = load_settings()
+# =============================================================================
+# FastAPI Application
+# =============================================================================
+app = FastAPI(title="Tracker Bot Auth", version="2.1.0")
 
-_http: Optional[httpx.AsyncClient] = None
+# Global service instances
 _storage: Optional[TokenStorage] = None
 _oauth: Optional[OAuthClient] = None
 _tracker: Optional[TrackerClient] = None
 _service: Optional[TrackerService] = None
 
 
+def _check_config() -> Optional[JSONResponse]:
+    """Check if service is configured."""
+    if not settings.is_configured:
+        return JSONResponse(
+            {"error": "Service not configured", "missing": settings.missing_vars},
+            status_code=500
+        )
+    return None
+
+
+def _parse_state(state: str) -> int:
+    """Parse Telegram ID from OAuth state."""
+    tg_str, _nonce = state.split(":", 1)
+    return int(tg_str)
+
+
 @app.on_event("startup")
 async def startup():
-    global _http, _storage, _oauth, _tracker, _service
+    """Initialize services on startup."""
+    global _storage, _oauth, _tracker, _service
 
-    # HTTP client optimized for low-resource server
-    limits = httpx.Limits(
-        max_keepalive_connections=8,
-        max_connections=15,
-        keepalive_expiry=30.0,
-    )
-    timeout = httpx.Timeout(connect=10.0, read=25.0, write=10.0, pool=5.0)
-    _http = httpx.AsyncClient(timeout=timeout, limits=limits)
-    logger.info("HTTP client initialized")
+    logger.info("Starting tracker-bot-auth service...")
 
-    if settings.database_url:
-        _storage = TokenStorage(settings.database_url)
-        await _storage.init_pool()
+    if settings.database:
+        _storage = TokenStorage(settings.database)
+        await _storage.connect()
         await _storage.ensure_schema()
 
-    cfg_err = _require(settings)
-    if not cfg_err and _http and _storage:
-        _oauth = OAuthClient(_http, settings)
-        _tracker = TrackerClient(_http, settings)
+    if settings.is_configured and _storage:
+        _oauth = OAuthClient()
+        _tracker = TrackerClient()
         _service = TrackerService(_storage, _oauth, _tracker)
         logger.info("Service layer initialized")
+    else:
+        logger.warning(f"Service not fully configured. Missing: {settings.missing_vars}")
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    global _http, _storage
+    """Cleanup on shutdown."""
+    global _storage
+    
     if _storage:
-        await _storage.close_pool()
-    if _http:
-        await _http.aclose()
-        _http = None
+        await _storage.close()
+    
+    await close_client()
     logger.info("Shutdown complete")
 
 
-# =========================
+# =============================================================================
 # Routes
-# =========================
+# =============================================================================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "tracker-bot-auth", "version": "2.0.0"}
+    return {"ok": True, "service": "tracker-bot-auth", "version": "2.1.0"}
 
 
 @app.get("/ping")
@@ -1043,19 +815,22 @@ async def ping():
 
 
 @app.get("/oauth/start")
-async def oauth_start(tg: int):
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-    assert _oauth is not None
-    return RedirectResponse(_oauth.build_authorize_url(tg), status_code=302)
+async def oauth_start(tg: int = Query(..., ge=1)):
+    err = _check_config()
+    if err:
+        return err
+    return RedirectResponse(_oauth.build_authorize_url(tg), status_code=302)  # type: ignore
 
 
 @app.get("/oauth/callback")
-async def oauth_callback(code: str | None = None, state: str | None = None, error: str | None = None):
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
+async def oauth_callback(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None
+):
+    err = _check_config()
+    if err:
+        return err
 
     if error:
         return JSONResponse({"ok": False, "error": error, "state": state}, status_code=400)
@@ -1067,14 +842,10 @@ async def oauth_callback(code: str | None = None, state: str | None = None, erro
     except Exception:
         return JSONResponse({"ok": False, "error": "Invalid state format"}, status_code=400)
 
-    assert _oauth is not None
-    assert _storage is not None
-    assert _tracker is not None
-
     try:
-        token_payload = await _oauth.exchange_code(code)
+        token_payload = await _oauth.exchange_code(code)  # type: ignore
     except Exception as e:
-        logger.warning(f"Token exchange failed: {e}")
+        logger.warning(f"Token exchange failed: {type(e).__name__}")
         return JSONResponse({"ok": False, "error": "Token exchange failed"}, status_code=400)
 
     access = token_payload.get("access_token")
@@ -1082,168 +853,160 @@ async def oauth_callback(code: str | None = None, state: str | None = None, erro
     token_type = token_payload.get("token_type")
     expires_in = token_payload.get("expires_in")
 
-    await _storage.upsert_token(tg_id, access, refresh, token_type, expires_in)
+    await _storage.upsert_token(tg_id, access, refresh, token_type, expires_in)  # type: ignore
 
     try:
-        st, me = await _tracker.myself(access)
+        st, me = await _tracker.myself(access)  # type: ignore
         if st == 200 and isinstance(me, dict):
             login = me.get("login")
             uid = me.get("trackerUid") or me.get("passportUid") or me.get("uid")
             if login:
-                await _storage.upsert_user(tg_id, login, str(uid) if uid is not None else None)
+                await _storage.upsert_user(tg_id, login, str(uid) if uid else None)  # type: ignore
     except Exception as e:
-        logger.warning(f"Failed to get user info: {e}")
+        logger.warning(f"Failed to get user info: {type(e).__name__}")
 
     return JSONResponse({"ok": True, "message": "Connected. Return to Telegram and run /me", "tg": tg_id})
 
 
 @app.get("/tracker/me_by_tg")
-async def tracker_me_by_tg(tg: int):
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-    assert _service is not None
-    result = await _service.me_by_tg(tg)
+async def tracker_me_by_tg(tg: int = Query(..., ge=1)):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.me_by_tg(tg)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
 @app.get("/tracker/user_by_tg")
-async def tracker_user_by_tg(tg: int):
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-    assert _service is not None
-    result = await _service.user_by_tg(tg)
+async def tracker_user_by_tg(tg: int = Query(..., ge=1)):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.user_by_tg(tg)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
 @app.get("/tg/settings")
-async def tg_settings(tg: int):
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-    assert _service is not None
-    result = await _service.settings_get(tg)
+async def tg_settings(tg: int = Query(..., ge=1)):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.settings_get(tg)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
 @app.post("/tg/settings/queues")
-async def tg_settings_queues(tg: int, queues: str):
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-    assert _service is not None
-    result = await _service.settings_set_queues(tg, queues)
+async def tg_settings_queues(tg: int = Query(..., ge=1), queues: str = Query("")):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.settings_set_queues(tg, queues)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
 @app.post("/tg/settings/days")
-async def tg_settings_days(tg: int, days: int):
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-    assert _service is not None
-    result = await _service.settings_set_days(tg, days)
+async def tg_settings_days(tg: int = Query(..., ge=1), days: int = Query(..., ge=1, le=3650)):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.settings_set_days(tg, days)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
 @app.post("/tg/settings/limit")
-async def tg_settings_limit(tg: int, limit: int):
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-    assert _service is not None
-    result = await _service.settings_set_limit(tg, limit)
+async def tg_settings_limit(tg: int = Query(..., ge=1), limit: int = Query(..., ge=1, le=100)):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.settings_set_limit(tg, limit)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
 @app.post("/tg/settings/reminder")
-async def tg_settings_reminder(tg: int, hours: int):
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-    assert _service is not None
-    result = await _service.settings_set_reminder(tg, hours)
+async def tg_settings_reminder(tg: int = Query(..., ge=1), hours: int = Query(..., ge=0)):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.settings_set_reminder(tg, hours)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
 @app.get("/tg/users_with_reminder")
 async def tg_users_with_reminder():
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-    assert _service is not None
-    users = await _service.get_users_with_reminder()
+    err = _check_config()
+    if err:
+        return err
+    users = await _service.get_users_with_reminder()  # type: ignore
     return JSONResponse({"users": users})
 
 
 @app.get("/tracker/summons")
-async def tracker_summons(tg: int, limit: int = 10):
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-    assert _service is not None
-    result = await _service.get_summons(tg, limit=limit)
+async def tracker_summons(tg: int = Query(..., ge=1), limit: int = Query(10, ge=1, le=100)):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.get_summons(tg, limit=limit)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
 @app.post("/tracker/issue/{issue_key}/comment")
-async def tracker_add_comment(issue_key: str, tg: int, text: str):
-    """Add a comment to an issue."""
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-    assert _service is not None
-    result = await _service.add_comment(tg, issue_key, text)
+async def tracker_add_comment(
+    issue_key: str,
+    tg: int = Query(..., ge=1),
+    text: str = Query(..., min_length=1)
+):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.add_comment(tg, issue_key, text)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
 @app.get("/tracker/checklist/assigned")
-async def checklist_assigned(tg: int, limit: int = 10):
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-    assert _service is not None
-    result = await _service.checklist_assigned_issues(tg, only_unchecked=False, limit=limit)
+async def checklist_assigned(tg: int = Query(..., ge=1), limit: int = Query(10, ge=1, le=100)):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.checklist_assigned_issues(tg, only_unchecked=False, limit=limit)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
 @app.get("/tracker/checklist/assigned_unchecked")
-async def checklist_assigned_unchecked(tg: int, limit: int = 10):
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-    assert _service is not None
-    result = await _service.checklist_assigned_issues(tg, only_unchecked=True, limit=limit)
+async def checklist_assigned_unchecked(tg: int = Query(..., ge=1), limit: int = Query(10, ge=1, le=100)):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.checklist_assigned_issues(tg, only_unchecked=True, limit=limit)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
 @app.post("/tracker/checklist/check")
-async def checklist_check(tg: int, issue: str, item: str, checked: bool = True):
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-    assert _service is not None
-    result = await _service.checklist_item_check(tg, issue_key=issue, item_id=item, checked=checked)
+async def checklist_check(
+    tg: int = Query(..., ge=1),
+    issue: str = Query(..., min_length=1),
+    item: str = Query(..., min_length=1),
+    checked: bool = Query(True)
+):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.checklist_item_check(tg, issue_key=issue, item_id=item, checked=checked)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
 @app.get("/tracker/issue/{issue_key}/checklist")
-async def issue_checklist(tg: int, issue_key: str):
-    """Get checklist items for a specific issue."""
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-    assert _service is not None
-    result = await _service.get_issue_checklist(tg, issue_key)
+async def issue_checklist(tg: int = Query(..., ge=1), issue_key: str = ""):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.get_issue_checklist(tg, issue_key)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
 @app.get("/tracker/issue/{issue_key}/summary")
-async def issue_summary_endpoint(tg: int, issue_key: str):
-    cfg_err = _require(settings)
-    if cfg_err:
-        return cfg_err
-    assert _service is not None
-    result = await _service.issue_summary(tg, issue_key)
+async def issue_summary_endpoint(tg: int = Query(..., ge=1), issue_key: str = ""):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.issue_summary(tg, issue_key)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
