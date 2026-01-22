@@ -864,6 +864,13 @@ class TrackerService:
         if not tracker_query:
             return {"http_status": 500, "body": {"error": error_msg or "Failed to generate search query"}}
 
+        # Check for special commands from AI
+        tracker_query_upper = tracker_query.strip().upper()
+        if tracker_query_upper == "CHECKLIST":
+            return {"http_status": 200, "body": {"redirect": "checklist", "message": "Используйте /cl_my или /cl_my_open для чеклистов"}}
+        if tracker_query_upper == "SUMMONS":
+            return {"http_status": 200, "body": {"redirect": "summons", "message": "Используйте /mentions для призывов"}}
+
         # Execute the search
         try:
             st, payload = await self.tracker.search_issues(access, query=tracker_query, limit=limit)

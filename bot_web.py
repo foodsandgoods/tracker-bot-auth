@@ -706,6 +706,7 @@ async def cmd_summary(m: Message):
 async def cmd_ai_search(m: Message):
     """AI-powered search for issues."""
     from aiogram.types import ForceReply
+    logger.info(f"cmd_ai_search called: tg={m.from_user.id}, text={m.text[:50] if m.text else ''}")
     
     parts = (m.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
@@ -737,14 +738,15 @@ async def process_ai_search(m: Message, query: str, tg_id: int):
     
     hint = ""
     if any(kw in query_lower for kw in checklist_keywords):
-        hint = "\n\n💡 _Для чеклистов лучше: /cl\\_my или /cl\\_my\\_open_"
+        hint = "\n\n💡 Для чеклистов лучше: /cl_my или /cl_my_open"
     elif any(kw in query_lower for kw in summons_keywords):
-        hint = "\n\n💡 _Для призывов лучше: /mentions_"
+        hint = "\n\n💡 Для призывов лучше: /mentions"
     
     user_settings = await get_settings(tg_id)
     limit = user_settings[2] if user_settings else 10
     
-    loading = await m.answer("🔍 Ищу..." + hint, parse_mode="Markdown")
+    loading = await m.answer("🔍 Ищу..." + hint)
+    logger.info(f"AI search: tg={tg_id}, query={query[:50]}")
     
     try:
         sc, data = await api_request(
@@ -752,13 +754,34 @@ async def process_ai_search(m: Message, query: str, tg_id: int):
             {"tg": tg_id, "q": query, "limit": limit},
             long_timeout=True
         )
+        logger.info(f"AI search result: sc={sc}, issues={len(data.get('issues', [])) if isinstance(data, dict) else 0}")
     except Exception as e:
+        logger.error(f"AI search exception: {type(e).__name__}: {e}")
         await loading.edit_text(f"❌ Ошибка: {str(e)[:100]}")
         return
     
     if sc != 200:
         error_msg = data.get('error', str(data)[:100]) if isinstance(data, dict) else str(data)[:100]
+        logger.warning(f"AI search failed: sc={sc}, error={error_msg}")
         await loading.edit_text(f"❌ {error_msg}"[:500])
+        return
+    
+    # Handle redirects for checklist/summons
+    if isinstance(data, dict) and data.get("redirect"):
+        redirect = data["redirect"]
+        if redirect == "checklist":
+            await loading.edit_text(
+                "📋 Для поиска по чеклистам используйте:\n"
+                "• /cl_my — задачи с моим ОК\n"
+                "• /cl_my_open — ожидают согласования"
+            )
+        elif redirect == "summons":
+            await loading.edit_text(
+                "📣 Для поиска призывов используйте:\n"
+                "• /mentions — задачи где вас призвали"
+            )
+        else:
+            await loading.edit_text(data.get("message", "Используйте специальную команду"))
         return
     
     issues = data.get("issues", []) if isinstance(data, dict) else []

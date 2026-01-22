@@ -23,36 +23,63 @@ FALLBACK_MESSAGES = {
 }
 
 # Search query generation prompt
-SEARCH_PROMPT_TEMPLATE = """Преобразуй запрос пользователя в поисковый запрос для Yandex Tracker Query Language.
+SEARCH_PROMPT_TEMPLATE = """Преобразуй запрос пользователя в поисковый запрос Yandex Tracker Query Language (YQL).
 
-Синтаксис Tracker Query Language:
-- Поиск по тексту: "текст" (в кавычках для точного совпадения)
-- Очередь: Queue: KEY
-- Статус: Status: "В работе", Status: "Открыт", Status: !Закрыт (! = не равно)
-- Исполнитель: Assignee: me(), Assignee: login
-- Автор: Author: me(), Author: login
-- Следящий: Followers: me()
-- Приоритет: Priority: critical, Priority: high
-- Тип: Type: task, Type: bug
-- Компонент: Components: "название"
-- Дата: Created: >= "2024-01-01", Updated: >= now()-7d
-- Теги: Tags: "тег"
-- Сортировка: "Sort by: Updated DESC", "Sort by: Created DESC"
-- Комбинации: AND, OR, скобки ()
+## Синтаксис YQL:
 
-ВАЖНО - ограничения языка запросов:
-- НЕТ фильтра по чеклистам ("мой чеклист", "пункты чеклиста") → используй Followers: me() или Assignee: me()
-- НЕТ фильтра по призывам/упоминаниям ("меня призвали", "summons") → используй Followers: me()
-- Для "мои задачи" используй Assignee: me()
-- Для "я создал" используй Author: me()
-- Для "я участвую" используй Followers: me() OR Assignee: me() OR Author: me()
+### Основные фильтры:
+- Очередь: Queue: DOC, Queue: INV, Queue: HR, Queue: BB, Queue: KOMDEP, Queue: FINANCE, Queue: BDEV
+- Исполнитель: Assignee: me() (мои задачи), Assignee: empty() (без исполнителя)
+- Автор: Author: me() (я создал)
+- Следящий: Followers: me() (я в наблюдателях)
+- Тип: Type: task, Type: bug, Type: story, Type: epic
+- Приоритет: Priority: critical, Priority: blocker, Priority: high, Priority: normal, Priority: low
+
+### Статусы (Status:):
+Начальные: open, new, backlog, selectedForDev, newGoal, dutyQueue
+В процессе: inProgress, testing, asPlanned, secondSupportLine, approvalbythoseresponsible, approved, transferredtothebank
+На паузе: needInfo, tested, inReview, rc, readyForTest, needAcceptance, documentsPrepared, onHold, resultAcceptance, withRisks, blockedGoal, errorsinthebranch, documentsarerequired, requiresclarification
+Завершены: resolved, closed, achieved
+Отменены: cancelled, duplicate
+
+### Даты и сроки:
+- Updated: >= now()-7d (обновлено за N дней)
+- Created: >= "2024-01-01" (создано после даты)
+- Deadline: >= today() (срок сегодня или позже)
+- Deadline: < today() (просроченные)
+
+### Спринты:
+- Sprint: "Название спринта"
+- Sprint: notEmpty() (в каком-либо спринте)
+
+### Операторы:
+- AND, OR, скобки ()
+- ! = не равно: Status: !closed, Assignee: !empty()
+- Resolution: empty() (не решена)
+
+### Сортировка:
+- "Sort by: Updated DESC" (сначала недавние)
+- "Sort by: Priority DESC" (сначала важные)
+- "Sort by: Deadline ASC" (сначала срочные)
+
+## ВАЖНО — ограничения YQL:
+- НЕТ фильтра по чеклистам → для "мои чеклисты" ответь: CHECKLIST
+- НЕТ фильтра по призывам/упоминаниям → для "меня призвали", "ждут ответа" ответь: SUMMONS
+- Для "мои согласования" используй: (Assignee: me() OR Followers: me()) AND (Status: needAcceptance OR Status: resultAcceptance OR Status: approvalbythoseresponsible)
+
+## Примеры преобразований:
+- "мои задачи" → Assignee: me() AND Resolution: empty()
+- "мои открытые" → Assignee: me() AND Status: !closed AND Status: !resolved
+- "срочные баги" → Type: bug AND Priority: critical AND Resolution: empty()
+- "просроченные" → Deadline: < today() AND Resolution: empty()
+- "на согласовании" → Status: needAcceptance OR Status: resultAcceptance
 
 Ограничения пользователя:
 {constraints}
 
-Запрос пользователя: {user_query}
+Запрос: {user_query}
 
-Верни ТОЛЬКО поисковый запрос для Tracker, без объяснений. Если запрос слишком общий, добавь ограничение по дате обновления."""
+Верни ТОЛЬКО YQL запрос (или CHECKLIST/SUMMONS если нужна спец.команда). Без пояснений."""
 
 
 def _build_prompt(issue_data: dict) -> str:
