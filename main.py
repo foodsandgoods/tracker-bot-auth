@@ -810,7 +810,7 @@ class TrackerService:
             }
         }
 
-    async def issue_summary(self, tg_id: int, issue_key: str) -> dict:
+    async def issue_summary(self, tg_id: int, issue_key: str, extended: bool = False) -> dict:
         """Generate AI summary for issue."""
         issue_result = await self.get_issue_full(tg_id, issue_key)
         if issue_result["http_status"] != 200:
@@ -820,7 +820,7 @@ class TrackerService:
 
         try:
             from ai_service import generate_summary
-            summary_text, error_msg = await generate_summary(issue_data)
+            summary_text, error_msg = await generate_summary(issue_data, extended=extended)
         except ImportError as e:
             return {"http_status": 500, "body": {"error": f"AI module not found: {e}"}}
         except Exception as e:
@@ -1276,16 +1276,21 @@ async def issue_checklist(tg: int = Query(..., ge=1), issue_key: str = ""):
 
 
 @app.get("/tracker/issue/{issue_key}/summary")
-async def issue_summary_endpoint(tg: int = Query(..., ge=1), issue_key: str = ""):
+async def issue_summary_endpoint(
+    tg: int = Query(..., ge=1),
+    issue_key: str = "",
+    extended: str = Query("false")
+):
     err = _check_config()
     if err:
         return err
     rate_err = await _check_rate_limit(tg)
     if rate_err:
         return rate_err
-    metrics.inc("api.summary")
+    is_extended = extended.lower() in ("true", "1", "yes")
+    metrics.inc("api.summary_extended" if is_extended else "api.summary")
     with Timer("summary"):
-        result = await _service.issue_summary(tg, issue_key)  # type: ignore
+        result = await _service.issue_summary(tg, issue_key, extended=is_extended)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 

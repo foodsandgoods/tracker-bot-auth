@@ -4,6 +4,7 @@ Optimized for low-resource environments (1GB RAM).
 """
 import asyncio
 import logging
+import re
 import time
 from collections import OrderedDict
 from datetime import datetime
@@ -215,6 +216,29 @@ def fmt_date(date_str: Optional[str]) -> str:
         return date_str[:16] if len(date_str) > 16 else date_str
 
 
+def normalize_issue_key(text: str) -> Optional[str]:
+    """
+    Normalize issue key from various formats.
+    
+    Examples:
+        inv123 → INV-123
+        INV123 → INV-123
+        doc 123 → DOC-123
+        DOC 123 → DOC-123
+        inv-123 → INV-123
+        INV-123 → INV-123
+    """
+    text = text.strip().upper()
+    # Remove extra spaces, hyphens, underscores
+    text = re.sub(r'[\s\-_]+', '', text)
+    # Match: letters followed by digits
+    match = re.match(r'^([A-ZА-ЯЁ]+)(\d+)$', text)
+    if match:
+        queue, number = match.groups()
+        return f"{queue}-{number}"
+    return None
+
+
 def escape_md(text: str) -> str:
     """Escape special characters for Telegram Markdown link text."""
     return text.replace("[", "(").replace("]", ")")
@@ -333,11 +357,12 @@ def kb_settings_reminder(reminder: int) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def kb_summary_actions(issue_key: str) -> InlineKeyboardMarkup:
+def kb_summary_actions(issue_key: str, extended: bool = False) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="🔄 Обновить", callback_data=f"sum:refresh:{issue_key}")
+    if not extended:
+        kb.button(text="📋 Подробнее", callback_data=f"sum:extended:{issue_key}")
     kb.button(text="💬 Комментарий", callback_data=f"sum:comment:{issue_key}")
-    kb.button(text="📋 Чеклисты", callback_data=f"sum:checklist:{issue_key}")
     kb.adjust(3)
     return kb.as_markup()
 
@@ -704,7 +729,10 @@ async def cmd_summary(m: Message):
         )
         return
 
-    issue_key = parts[1].upper().strip()
+    issue_key = normalize_issue_key(parts[1])
+    if not issue_key:
+        await m.answer("❌ Неверный формат. Примеры: INV-123, inv123, DOC 45")
+        return
     await process_summary(m, issue_key, m.from_user.id)
 
 
@@ -964,6 +992,41 @@ async def handle_summary_callback(c: CallbackQuery):
             await loading_msg.edit_text(text[:4000], reply_markup=kb_summary_actions(issue_key))
         return
     
+    if action == "extended":
+        await c.answer("📋 Генерирую расширенное резюме...")
+        
+        loading_msg = await c.message.reply(f"🤖 Генерирую расширенное резюме для {issue_key}...") if c.message else None
+        
+        try:
+            sc, data = await api_request(
+                "GET", f"/tracker/issue/{issue_key}/summary",
+                {"tg": tg_id, "extended": "true"},
+                long_timeout=True
+            )
+        except Exception as e:
+            if loading_msg:
+                await loading_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+            return
+        
+        if sc != 200 or not isinstance(data, dict):
+            err = data.get('error', f'Ошибка {sc}') if isinstance(data, dict) else f'Ошибка {sc}'
+            if loading_msg:
+                await loading_msg.edit_text(f"❌ {err}"[:300], reply_markup=kb_summary_actions(issue_key, extended=True))
+            return
+        
+        summary = data.get("summary", "")
+        url = data.get("issue_url", f"https://tracker.yandex.ru/{issue_key}")
+        
+        if not summary:
+            if loading_msg:
+                await loading_msg.edit_text("❌ Пустой ответ от AI", reply_markup=kb_summary_actions(issue_key, extended=True))
+            return
+        
+        text = f"📋 {issue_key} (подробно):\n\n{summary}\n\n🔗 {url}"
+        if loading_msg:
+            await loading_msg.edit_text(text[:4000], reply_markup=kb_summary_actions(issue_key, extended=True))
+        return
+    
     if action == "comment":
         state.pending_comment[tg_id] = issue_key
         await c.answer()
@@ -1168,9 +1231,9 @@ async def handle_text_message(m: Message):
     
     # Check if awaiting summary issue key
     if state.pending_summary.pop(tg_id, None):
-        issue_key = text.upper().replace(" ", "")
-        if not issue_key or len(issue_key) < 3:
-            await m.answer("❌ Неверный формат. Введите ключ задачи (например: INV-123)")
+        issue_key = normalize_issue_key(text)
+        if not issue_key:
+            await m.answer("❌ Неверный формат. Примеры: INV-123, inv123, DOC 45")
             return
         await process_summary(m, issue_key, tg_id)
         return

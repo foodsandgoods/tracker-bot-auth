@@ -82,7 +82,7 @@ SEARCH_PROMPT_TEMPLATE = """Преобразуй запрос пользоват
 Верни ТОЛЬКО YQL запрос (или CHECKLIST/SUMMONS если нужна спец.команда). Без пояснений."""
 
 
-def _build_prompt(issue_data: dict) -> str:
+def _build_prompt(issue_data: dict, extended: bool = False) -> str:
     """Build structured prompt from issue data."""
     key = issue_data.get("key", "")
     summary = issue_data.get("summary", "")
@@ -96,40 +96,48 @@ def _build_prompt(issue_data: dict) -> str:
     if isinstance(issue_data.get("assignee"), dict):
         assignee = issue_data["assignee"].get("display", "Не назначен")
     
-    # Last 5 comments
+    # Comments - more for extended
     comments = issue_data.get("comments", [])
     comments_text = ""
+    comment_limit = 7 if extended else 5
+    comment_len = 250 if extended else 150
     if comments and isinstance(comments, list):
         comments_list = []
-        for c in comments[-5:]:
+        for c in comments[-comment_limit:]:
             if isinstance(c, dict):
                 author = "Неизвестно"
                 if isinstance(c.get("createdBy"), dict):
                     author = c["createdBy"].get("display", "Неизвестно")
                 text = (c.get("text") or "").strip()
                 if text:
-                    comments_list.append(f"  • {author}: {text[:150]}")
+                    comments_list.append(f"  • {author}: {text[:comment_len]}")
         if comments_list:
             comments_text = "\n".join(comments_list)
     
-    # Checklist items
+    # Checklist items - more for extended
     checklist = issue_data.get("checklistItems", [])
     checklist_text = ""
+    checklist_limit = 10 if extended else 5
+    checklist_len = 150 if extended else 100
     if checklist and isinstance(checklist, list):
         checklist_list = []
-        for item in checklist[:5]:
+        for item in checklist[:checklist_limit]:
             if isinstance(item, dict):
                 checked = "✅" if item.get("checked", False) else "⬜"
                 text = (item.get("text") or "").strip()
                 if text:
-                    checklist_list.append(f"  {checked} {text[:100]}")
+                    checklist_list.append(f"  {checked} {text[:checklist_len]}")
         if checklist_list:
             checklist_text = "\n".join(checklist_list)
     
-    # Limit description length
-    desc_limited = description[:800] if len(description) > 800 else description
+    # Limit description length - more for extended
+    desc_limit = 1200 if extended else 800
+    desc_limited = description[:desc_limit] if len(description) > desc_limit else description
     
-    return f"""Составь подробное резюме задачи из Yandex Tracker (максимум 500 символов).
+    # Different output limits
+    max_chars = 800 if extended else 500
+    
+    return f"""Составь подробное резюме задачи из Yandex Tracker (максимум {max_chars} символов).
 
 Задача: {key} — {summary}
 Статус: {status}
@@ -151,7 +159,7 @@ def _build_prompt(issue_data: dict) -> str:
 4. Прогресс по чеклисту (если есть)
 5. Последние действия/комментарии (если есть)
 
-Резюме должно быть информативным (до 500 символов) и на русском языке."""
+Резюме должно быть информативным (до {max_chars} символов) и на русском языке."""
 
 
 def _extract_content(data: dict) -> Optional[str]:
@@ -186,7 +194,7 @@ async def _make_request(
         return 0, {"error": str(e)}
 
 
-async def generate_summary(issue_data: dict) -> Tuple[Optional[str], Optional[str]]:
+async def generate_summary(issue_data: dict, extended: bool = False) -> Tuple[Optional[str], Optional[str]]:
     """
     Generate summary for issue using GPTunnel API.
     
@@ -195,18 +203,19 @@ async def generate_summary(issue_data: dict) -> Tuple[Optional[str], Optional[st
     
     Args:
         issue_data: Issue data from Yandex Tracker
+        extended: If True, generate extended summary (800 chars vs 500)
     
     Returns:
         Tuple of (summary_text, error_message)
     """
-    metrics.inc("ai.requests")
+    metrics.inc("ai.requests_extended" if extended else "ai.requests")
     
     if not settings.ai:
         metrics.inc("ai.not_configured")
         return None, FALLBACK_MESSAGES["not_configured"]
     
     ai_config = settings.ai
-    prompt = _build_prompt(issue_data)
+    prompt = _build_prompt(issue_data, extended=extended)
     
     payload = {
         "model": ai_config.model,
@@ -262,9 +271,10 @@ async def generate_summary(issue_data: dict) -> Tuple[Optional[str], Optional[st
                     
                     content = _extract_content(data)
                     if content:
-                        # Truncate if too long
-                        if len(content) > 500:
-                            content = content[:497] + "..."
+                        # Truncate if too long (800 for extended, 500 for standard)
+                        max_len = 800 if extended else 500
+                        if len(content) > max_len:
+                            content = content[:max_len - 3] + "..."
                         metrics.inc("ai.success")
                         return content, None
                     
