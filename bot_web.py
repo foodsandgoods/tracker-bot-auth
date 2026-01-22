@@ -368,7 +368,8 @@ def build_checklist_response(
     header: str,
     include_checked: bool = True,
     add_buttons: bool = False,
-    show_all_items: bool = False
+    show_all_items: bool = False,
+    add_comment_buttons: bool = False
 ) -> Tuple[str, Optional[InlineKeyboardMarkup], Dict[int, Tuple[str, str]]]:
     """Build checklist text, keyboard, and item mapping."""
     lines = [header]
@@ -393,6 +394,12 @@ def build_checklist_response(
                             callback_data=f"chk:{issue.get('key')}:{item.get('id')}:{item_num}"
                         )
                     item_num += 1
+            # Add comment button for each issue
+            if kb and add_comment_buttons:
+                kb.button(
+                    text=f"💬 {idx}",
+                    callback_data=f"cmt:{issue.get('key')}"
+                )
         else:
             for item in issue.get("items", []):
                 is_checked = item.get("checked", False)
@@ -407,7 +414,10 @@ def build_checklist_response(
                     item_num += 1
     
     if kb:
-        kb.adjust(4)
+        kb.adjust(5)
+    
+    if add_comment_buttons and issues:
+        lines.append("\n_💬 N — комментировать задачу N_")
     
     return "\n".join(lines), kb.as_markup() if kb else None, item_mapping
 
@@ -427,7 +437,7 @@ async def cmd_menu(m: Message):
         "🔗 /connect — привязать аккаунт\n"
         "👤 /me — проверить доступ\n"
         "⚙️ /settings — настройки\n\n"
-        "✅ /cl\\_my — задачи с моим согласованием\n"
+        "✅ /cl\\_my — задачи с моим ОК\n"
         "❔ /cl\\_my\\_open — ожидают согласование\n"
         "✔️ /done N — отметить пункт\n\n"
         "📣 /mentions — требующие ответа\n"
@@ -493,7 +503,7 @@ async def cmd_cl_my(m: Message):
         await m.answer(f"Нет задач за {days} дней")
         return
     
-    text, _, item_mapping = build_checklist_response(issues, "✅ *Задачи с моим согласованием:*")
+    text, _, item_mapping = build_checklist_response(issues, "✅ *Задачи с моим ОК:*")
     state.checklist_cache.set(f"cl:{tg_id}", item_mapping)
     
     for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
@@ -559,7 +569,8 @@ async def cmd_cl_my_open(m: Message):
     
     text, keyboard, item_mapping = build_checklist_response(
         issues, "❔ *Ожидают согласование:*",
-        include_checked=False, add_buttons=True, show_all_items=True
+        include_checked=False, add_buttons=True, show_all_items=True,
+        add_comment_buttons=True
     )
     state.checklist_cache.set(f"cl:{tg_id}", item_mapping)
     
@@ -698,6 +709,17 @@ async def handle_callback(c: CallbackQuery):
     
     if data.startswith("chk:"):
         await handle_check_callback(c)
+    elif data.startswith("cmt_cancel:"):
+        # Cancel comment
+        state.pending_comment.pop(c.from_user.id, None)
+        await c.answer("Отменено")
+        if c.message:
+            try:
+                await c.message.delete()
+            except Exception:
+                pass
+    elif data.startswith("cmt:"):
+        await handle_comment_callback(c)
     elif data.startswith("st:"):
         await handle_settings_callback(c)
     elif data.startswith("sum:"):
@@ -740,6 +762,30 @@ async def handle_check_callback(c: CallbackQuery):
                 await c.message.edit_text(text, reply_markup=new_markup)
             except Exception:
                 pass
+
+
+async def handle_comment_callback(c: CallbackQuery):
+    """Handle comment button from checklist."""
+    parts = c.data.split(":", 1)
+    if len(parts) < 2:
+        await c.answer("❌ Ошибка", show_alert=True)
+        return
+    
+    _, issue_key = parts
+    tg_id = c.from_user.id
+    
+    # Store pending comment
+    state.pending_comment[tg_id] = issue_key
+    await c.answer()
+    
+    if c.message:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="❌ Отмена", callback_data=f"cmt_cancel:{issue_key}")
+        await c.message.reply(
+            f"💬 Напишите комментарий для *{issue_key}*:\n\n_Отправьте текст следующим сообщением_",
+            parse_mode="Markdown",
+            reply_markup=kb.as_markup()
+        )
 
 
 async def handle_summary_callback(c: CallbackQuery):
@@ -1025,7 +1071,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="connect", description="🔗 Привязать аккаунт"),
         BotCommand(command="me", description="👤 Проверить доступ"),
         BotCommand(command="settings", description="⚙️ Настройки"),
-        BotCommand(command="cl_my", description="✅ Задачи с моим согласованием"),
+        BotCommand(command="cl_my", description="✅ Задачи с моим ОК"),
         BotCommand(command="cl_my_open", description="❔ Ожидают согласование"),
         BotCommand(command="done", description="✔️ Отметить пункт"),
         BotCommand(command="mentions", description="📣 Требующие ответа"),
