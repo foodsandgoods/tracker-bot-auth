@@ -311,6 +311,20 @@ class TrackerClient:
         )
         return r.status_code, safe_json(r)
 
+    @with_retry(max_attempts=2, base_delay=0.5)
+    async def create_issue(
+        self, access_token: str, issue_data: dict
+    ) -> tuple[int, Any]:
+        """Create new issue."""
+        client = await get_client()
+        headers = {**self._headers(access_token), "Content-Type": "application/json"}
+        r = await client.post(
+            f"{self._api_base}/issues",
+            headers=headers,
+            json=issue_data
+        )
+        return r.status_code, safe_json(r)
+
 
 # =============================================================================
 # Service Layer
@@ -940,6 +954,51 @@ class TrackerService:
             }
         }
 
+    async def create_issue(
+        self, tg_id: int, queue: str, summary: str,
+        description: str = "", assignee: str = "",
+        pending_reply_from: str = "", followers: list = None
+    ) -> dict:
+        """Create new issue in Tracker."""
+        access, err = await self._get_valid_access_token(tg_id)
+        if err:
+            return err
+
+        issue_data = {
+            "queue": queue.upper(),
+            "summary": summary,
+        }
+        
+        if description:
+            issue_data["description"] = description
+        if assignee:
+            issue_data["assignee"] = assignee
+        if pending_reply_from:
+            issue_data["pendingReplyFrom"] = pending_reply_from
+        if followers:
+            issue_data["followers"] = followers
+
+        try:
+            st, resp = await self.tracker.create_issue(access, issue_data)  # type: ignore
+        except Exception as e:
+            logger.error(f"Create issue failed: {type(e).__name__}: {e}")
+            return {"http_status": 503, "body": {"error": f"Create issue failed: {type(e).__name__}"}}
+
+        if st not in (200, 201):
+            error_msg = resp.get("errorMessages", [resp]) if isinstance(resp, dict) else str(resp)
+            return {"http_status": st, "body": {"error": error_msg, "response": resp}}
+
+        issue_key = resp.get("key", "") if isinstance(resp, dict) else ""
+        return {
+            "http_status": 201,
+            "body": {
+                "status": "ok",
+                "issue_key": issue_key,
+                "issue_url": f"https://tracker.yandex.ru/{issue_key}",
+                "response": resp
+            }
+        }
+
 
 # =============================================================================
 # FastAPI Application
@@ -1221,6 +1280,28 @@ async def tracker_add_comment(
     if err:
         return err
     result = await _service.add_comment(tg, issue_key, text)  # type: ignore
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.post("/tracker/issue/create")
+async def tracker_create_issue(
+    tg: int = Query(..., ge=1),
+    queue: str = Query(..., min_length=1, max_length=20),
+    summary: str = Query(..., min_length=1, max_length=500),
+    description: str = Query(""),
+    assignee: str = Query(""),
+    pending_reply_from: str = Query(""),
+    followers: str = Query("")  # comma-separated
+):
+    """Create new issue in Tracker."""
+    err = _check_config()
+    if err:
+        return err
+    followers_list = [f.strip() for f in followers.split(",") if f.strip()] if followers else []
+    metrics.inc("api.create_issue")
+    result = await _service.create_issue(  # type: ignore
+        tg, queue, summary, description, assignee, pending_reply_from, followers_list
+    )
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 

@@ -127,7 +127,8 @@ class AppState:
     __slots__ = (
         'bot', 'dispatcher', 'shutdown_event',
         'checklist_cache', 'summary_cache',
-        'pending_comment', 'pending_summary', 'pending_ai_search', 'last_reminder'
+        'pending_comment', 'pending_summary', 'pending_ai_search', 
+        'pending_new_issue', 'last_reminder'
     )
     
     def __init__(self):
@@ -147,6 +148,7 @@ class AppState:
         self.pending_comment = PendingState(max_age=settings.cache.pending_state_ttl)
         self.pending_summary = PendingState(max_age=settings.cache.pending_state_ttl)
         self.pending_ai_search = PendingState(max_age=settings.cache.pending_state_ttl)
+        self.pending_new_issue: Dict[int, dict] = {}  # tg_id -> issue draft
         self.last_reminder: Dict[int, float] = {}
 
 
@@ -330,6 +332,72 @@ def kb_settings_queues(queues: List[str]) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+# New issue keyboards
+QUEUES_LIST = ["INV", "DOC", "HR", "BB", "KOMDEP", "FINANCE", "BDEV"]
+
+
+def kb_new_issue_queue() -> InlineKeyboardMarkup:
+    """Queue selection keyboard for new issue."""
+    kb = InlineKeyboardBuilder()
+    for q in QUEUES_LIST:
+        kb.button(text=q, callback_data=f"new:queue:{q}")
+    kb.button(text="❌ Отмена", callback_data="new:cancel")
+    kb.adjust(4, 3, 1)
+    return kb.as_markup()
+
+
+def kb_new_issue_assignee() -> InlineKeyboardMarkup:
+    """Assignee selection keyboard."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👤 На себя", callback_data="new:assignee:me")
+    kb.button(text="🔍 Ввести логин", callback_data="new:assignee:input")
+    kb.button(text="⏭ Пропустить", callback_data="new:assignee:skip")
+    kb.adjust(2, 1)
+    return kb.as_markup()
+
+
+def kb_new_issue_confirm(draft: dict) -> InlineKeyboardMarkup:
+    """Confirmation keyboard for new issue."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Создать", callback_data="new:confirm")
+    kb.button(text="✏️ Изменить", callback_data="new:edit")
+    kb.button(text="❌ Отмена", callback_data="new:cancel")
+    kb.adjust(2, 1)
+    return kb.as_markup()
+
+
+def kb_new_issue_edit() -> InlineKeyboardMarkup:
+    """Edit fields keyboard."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📝 Очередь", callback_data="new:edit:queue")
+    kb.button(text="📋 Название", callback_data="new:edit:summary")
+    kb.button(text="📄 Описание", callback_data="new:edit:description")
+    kb.button(text="👤 Исполнитель", callback_data="new:edit:assignee")
+    kb.button(text="📣 Нужен ответ от", callback_data="new:edit:pending")
+    kb.button(text="⬅️ Назад", callback_data="new:back")
+    kb.adjust(3, 2, 1)
+    return kb.as_markup()
+
+
+def render_new_issue_draft(draft: dict) -> str:
+    """Render issue draft for display."""
+    lines = ["✅ Подтвердите создание:\n"]
+    lines.append(f"📝 Очередь: {draft.get('queue', '—')}")
+    lines.append(f"📋 Название: {draft.get('summary', '—')}")
+    
+    desc = draft.get('description', '')
+    if desc:
+        lines.append(f"📄 Описание: {desc[:100]}{'...' if len(desc) > 100 else ''}")
+    else:
+        lines.append("📄 Описание: —")
+    
+    lines.append(f"👤 Исполнитель: {draft.get('assignee', '—') or '—'}")
+    lines.append(f"📣 Нужен ответ от: {draft.get('pending_reply_from', '—') or '—'}")
+    lines.append("👁 Наблюдатели: вы")
+    
+    return "\n".join(lines)
+
+
 def kb_settings_days(days: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for d in [7, 15, 30, 90, 180]:
@@ -474,7 +542,8 @@ async def cmd_menu(m: Message):
         "❓ /cl\\_my\\_open — ожидают согласование\n\n"
         "📣 /mentions — требующие ответа\n"
         "🤖 /summary ISSUE — резюме (ИИ)\n"
-        "🔍 /ai ЗАПРОС — поиск (ИИ)",
+        "🔍 /ai ЗАПРОС — поиск (ИИ)\n"
+        "📝 /new — создать задачу",
         parse_mode="Markdown"
     )
 
@@ -767,6 +836,30 @@ async def cmd_ai_search(m: Message):
     await process_ai_search(m, query, m.from_user.id)
 
 
+@router.message(Command("new"))
+@require_base_url
+async def cmd_new_issue(m: Message):
+    """Start new issue creation dialog."""
+    tg_id = m.from_user.id
+    
+    # Initialize draft
+    state.pending_new_issue[tg_id] = {
+        "step": "queue",
+        "queue": "",
+        "summary": "",
+        "description": "",
+        "assignee": "",
+        "pending_reply_from": "",
+        "message_id": None
+    }
+    
+    msg = await m.answer(
+        "📝 Создание задачи\n\nВыберите очередь:",
+        reply_markup=kb_new_issue_queue()
+    )
+    state.pending_new_issue[tg_id]["message_id"] = msg.message_id
+
+
 async def process_ai_search(m: Message, query: str, tg_id: int):
     """Process AI search request."""
     query_lower = query.lower()
@@ -881,6 +974,8 @@ async def handle_callback(c: CallbackQuery):
         await handle_settings_callback(c)
     elif data.startswith("sum:"):
         await handle_summary_callback(c)
+    elif data.startswith("new:"):
+        await handle_new_issue_callback(c)
     else:
         await c.answer()
 
@@ -1099,6 +1194,197 @@ async def handle_summary_callback(c: CallbackQuery):
     await c.answer()
 
 
+async def handle_new_issue_callback(c: CallbackQuery):
+    """Handle new issue dialog callbacks."""
+    tg_id = c.from_user.id
+    data = c.data or ""
+    parts = data.split(":")
+    
+    if len(parts) < 2:
+        await c.answer("❌ Ошибка", show_alert=True)
+        return
+    
+    action = parts[1]
+    draft = state.pending_new_issue.get(tg_id, {})
+    
+    # Cancel action
+    if action == "cancel":
+        state.pending_new_issue.pop(tg_id, None)
+        await c.answer("Отменено")
+        if c.message:
+            try:
+                await c.message.delete()
+            except Exception:
+                pass
+        return
+    
+    # Queue selection
+    if action == "queue" and len(parts) >= 3:
+        queue = parts[2].upper()
+        draft["queue"] = queue
+        draft["step"] = "summary"
+        state.pending_new_issue[tg_id] = draft
+        await c.answer()
+        if c.message:
+            from aiogram.types import ForceReply
+            await c.message.edit_text(f"📝 Очередь: {queue}\n\nВведите название задачи:")
+            await c.message.answer("📋 Название:", reply_markup=ForceReply(input_field_placeholder="Название задачи"))
+        return
+    
+    # Assignee selection
+    if action == "assignee" and len(parts) >= 3:
+        choice = parts[2]
+        if choice == "me":
+            # Get user's tracker login
+            sc, data_resp = await api_request("GET", "/tracker/user_by_tg", {"tg": tg_id})
+            if sc == 200 and isinstance(data_resp, dict):
+                login = data_resp.get("tracker_login", "")
+                draft["assignee"] = login
+            else:
+                draft["assignee"] = ""
+        elif choice == "skip":
+            draft["assignee"] = ""
+        elif choice == "input":
+            draft["step"] = "assignee_input"
+            state.pending_new_issue[tg_id] = draft
+            await c.answer()
+            if c.message:
+                from aiogram.types import ForceReply
+                await c.message.edit_text("👤 Введите логин исполнителя:")
+                await c.message.answer("Логин:", reply_markup=ForceReply(input_field_placeholder="login"))
+            return
+        
+        draft["step"] = "pending_reply"
+        state.pending_new_issue[tg_id] = draft
+        await c.answer()
+        if c.message:
+            from aiogram.types import ForceReply
+            assignee_text = f"@{draft['assignee']}" if draft.get("assignee") else "—"
+            await c.message.edit_text(
+                f"📝 Очередь: {draft.get('queue')}\n"
+                f"📋 Название: {draft.get('summary')}\n"
+                f"📄 Описание: {draft.get('description') or '—'}\n"
+                f"👤 Исполнитель: {assignee_text}\n\n"
+                f"Нужен ответ от? (введите логин или '-' чтобы пропустить):"
+            )
+            await c.message.answer("📣 Нужен ответ от:", reply_markup=ForceReply(input_field_placeholder="login или -"))
+        return
+    
+    # Confirm creation
+    if action == "confirm":
+        await c.answer("⏳ Создаю...")
+        
+        # Get user's login for followers
+        sc, user_data = await api_request("GET", "/tracker/user_by_tg", {"tg": tg_id})
+        my_login = ""
+        if sc == 200 and isinstance(user_data, dict):
+            my_login = user_data.get("tracker_login", "")
+        
+        followers = [my_login] if my_login else []
+        
+        sc, result = await api_request(
+            "POST", "/tracker/issue/create",
+            {
+                "tg": tg_id,
+                "queue": draft.get("queue", ""),
+                "summary": draft.get("summary", ""),
+                "description": draft.get("description", ""),
+                "assignee": draft.get("assignee", ""),
+                "pending_reply_from": draft.get("pending_reply_from", ""),
+                "followers": ",".join(followers)
+            }
+        )
+        
+        state.pending_new_issue.pop(tg_id, None)
+        
+        if sc not in (200, 201):
+            error = result.get("error", "Ошибка создания") if isinstance(result, dict) else str(result)
+            if c.message:
+                await c.message.edit_text(f"❌ {error}"[:500])
+            return
+        
+        issue_key = result.get("issue_key", "") if isinstance(result, dict) else ""
+        issue_url = result.get("issue_url", f"https://tracker.yandex.ru/{issue_key}") if isinstance(result, dict) else ""
+        
+        kb = InlineKeyboardBuilder()
+        kb.button(text="📋 Резюме", callback_data=f"sum:refresh:{issue_key}")
+        kb.button(text="💬 Комментарий", callback_data=f"sum:comment:{issue_key}")
+        kb.adjust(2)
+        
+        if c.message:
+            await c.message.edit_text(
+                f"✅ Задача создана!\n\n"
+                f"{issue_key}: {draft.get('summary', '')}\n"
+                f"🔗 {issue_url}",
+                reply_markup=kb.as_markup()
+            )
+        return
+    
+    # Edit menu
+    if action == "edit":
+        await c.answer()
+        if c.message:
+            await c.message.edit_text(
+                "Что изменить?",
+                reply_markup=kb_new_issue_edit()
+            )
+        return
+    
+    # Back to confirm
+    if action == "back":
+        draft["step"] = "confirm"
+        state.pending_new_issue[tg_id] = draft
+        await c.answer()
+        if c.message:
+            await c.message.edit_text(
+                render_new_issue_draft(draft),
+                reply_markup=kb_new_issue_confirm(draft)
+            )
+        return
+    
+    # Edit specific field
+    if action == "edit" and len(parts) >= 3:
+        field = parts[2]
+        from aiogram.types import ForceReply
+        
+        if field == "queue":
+            draft["step"] = "queue"
+            state.pending_new_issue[tg_id] = draft
+            await c.answer()
+            if c.message:
+                await c.message.edit_text("📝 Выберите очередь:", reply_markup=kb_new_issue_queue())
+        elif field == "summary":
+            draft["step"] = "summary"
+            state.pending_new_issue[tg_id] = draft
+            await c.answer()
+            if c.message:
+                await c.message.edit_text("📋 Введите название:")
+                await c.message.answer("Название:", reply_markup=ForceReply(input_field_placeholder="Название"))
+        elif field == "description":
+            draft["step"] = "description"
+            state.pending_new_issue[tg_id] = draft
+            await c.answer()
+            if c.message:
+                await c.message.edit_text("📄 Введите описание:")
+                await c.message.answer("Описание:", reply_markup=ForceReply(input_field_placeholder="Описание"))
+        elif field == "assignee":
+            draft["step"] = "assignee"
+            state.pending_new_issue[tg_id] = draft
+            await c.answer()
+            if c.message:
+                await c.message.edit_text("👤 Назначить исполнителя?", reply_markup=kb_new_issue_assignee())
+        elif field == "pending":
+            draft["step"] = "pending_reply"
+            state.pending_new_issue[tg_id] = draft
+            await c.answer()
+            if c.message:
+                await c.message.edit_text("📣 Введите логин:")
+                await c.message.answer("Нужен ответ от:", reply_markup=ForceReply(input_field_placeholder="login"))
+        return
+    
+    await c.answer()
+
+
 async def handle_settings_callback(c: CallbackQuery):
     """Handle settings callbacks."""
     if not settings.base_url:
@@ -1246,6 +1532,82 @@ async def handle_text_message(m: Message):
         await process_ai_search(m, text, tg_id)
         return
     
+    # Check if awaiting new issue input
+    draft = state.pending_new_issue.get(tg_id)
+    if draft:
+        step = draft.get("step", "")
+        
+        if step == "summary":
+            if len(text) < 3:
+                await m.answer("❌ Название слишком короткое (минимум 3 символа)")
+                return
+            draft["summary"] = text[:500]
+            draft["step"] = "description"
+            state.pending_new_issue[tg_id] = draft
+            from aiogram.types import ForceReply
+            await m.answer(
+                f"📝 Очередь: {draft.get('queue')}\n"
+                f"📋 Название: {text[:50]}{'...' if len(text) > 50 else ''}\n\n"
+                f"Введите описание (или '-' чтобы пропустить):",
+                reply_markup=ForceReply(input_field_placeholder="Описание или -")
+            )
+            return
+        
+        if step == "description":
+            draft["description"] = "" if text == "-" else text[:2000]
+            draft["step"] = "assignee"
+            state.pending_new_issue[tg_id] = draft
+            await m.answer(
+                f"📝 Очередь: {draft.get('queue')}\n"
+                f"📋 Название: {draft.get('summary', '')[:50]}\n"
+                f"📄 Описание: {(draft.get('description') or '—')[:50]}\n\n"
+                f"Назначить исполнителя?",
+                reply_markup=kb_new_issue_assignee()
+            )
+            return
+        
+        if step == "assignee_input":
+            draft["assignee"] = text.strip().replace("@", "")
+            draft["step"] = "pending_reply"
+            state.pending_new_issue[tg_id] = draft
+            from aiogram.types import ForceReply
+            await m.answer(
+                f"👤 Исполнитель: @{draft['assignee']}\n\n"
+                f"Нужен ответ от? (введите логин или '-' чтобы пропустить):",
+                reply_markup=ForceReply(input_field_placeholder="login или -")
+            )
+            return
+        
+        if step == "pending_reply":
+            draft["pending_reply_from"] = "" if text == "-" else text.strip().replace("@", "")
+            draft["step"] = "confirm"
+            state.pending_new_issue[tg_id] = draft
+            await m.answer(
+                render_new_issue_draft(draft),
+                reply_markup=kb_new_issue_confirm(draft)
+            )
+            return
+        
+        # If editing specific field, go back to confirm
+        if step in ("edit_summary", "edit_description", "edit_assignee", "edit_pending"):
+            field = step.replace("edit_", "")
+            if field == "summary":
+                draft["summary"] = text[:500]
+            elif field == "description":
+                draft["description"] = "" if text == "-" else text[:2000]
+            elif field == "assignee":
+                draft["assignee"] = text.strip().replace("@", "")
+            elif field == "pending":
+                draft["pending_reply_from"] = "" if text == "-" else text.strip().replace("@", "")
+            
+            draft["step"] = "confirm"
+            state.pending_new_issue[tg_id] = draft
+            await m.answer(
+                render_new_issue_draft(draft),
+                reply_markup=kb_new_issue_confirm(draft)
+            )
+            return
+    
     # Check if awaiting comment input
     issue_key = state.pending_comment.pop(tg_id, None)
     if issue_key:
@@ -1277,6 +1639,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="mentions", description="📣 Требующие ответа"),
         BotCommand(command="summary", description="🤖 Резюме (ИИ)"),
         BotCommand(command="ai", description="🔍 Поиск (ИИ)"),
+        BotCommand(command="new", description="📝 Создать задачу"),
     ])
 
 
