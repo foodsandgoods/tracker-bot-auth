@@ -985,11 +985,22 @@ class TrackerService:
             return {"http_status": 503, "body": {"error": f"Create issue failed: {type(e).__name__}"}}
 
         if st not in (200, 201):
+            error_msg = ""
             if isinstance(resp, dict):
-                errors = resp.get("errorMessages", [])
-                if isinstance(errors, list) and errors:
-                    error_msg = "; ".join(str(e) for e in errors)
-                else:
+                # Check errorMessages array first
+                error_messages = resp.get("errorMessages", [])
+                if isinstance(error_messages, list) and error_messages:
+                    error_msg = "; ".join(str(e) for e in error_messages)
+                # Check errors dict (field-level errors)
+                errors_dict = resp.get("errors", {})
+                if isinstance(errors_dict, dict) and errors_dict:
+                    field_errors = [f"{k}: {v}" for k, v in errors_dict.items()]
+                    if error_msg:
+                        error_msg += "; " + "; ".join(field_errors)
+                    else:
+                        error_msg = "; ".join(field_errors)
+                # Fallback to message
+                if not error_msg:
                     error_msg = resp.get("message", str(resp))
             else:
                 error_msg = str(resp)

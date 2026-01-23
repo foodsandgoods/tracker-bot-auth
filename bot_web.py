@@ -1250,8 +1250,8 @@ async def handle_new_issue_callback(c: CallbackQuery):
             await c.answer()
             if c.message:
                 from aiogram.types import ForceReply
-                await c.message.edit_text("👤 Введите логин исполнителя:")
-                await c.message.answer("Логин:", reply_markup=ForceReply(input_field_placeholder="login"))
+                await c.message.edit_text("👤 Введите логин исполнителя\n(логин Tracker, например: ivanov)")
+                await c.message.answer("Логин Tracker:", reply_markup=ForceReply(input_field_placeholder="login"))
             return
         
         draft["step"] = "pending_reply"
@@ -1265,9 +1265,9 @@ async def handle_new_issue_callback(c: CallbackQuery):
                 f"📋 Название: {draft.get('summary')}\n"
                 f"📄 Описание: {draft.get('description') or '—'}\n"
                 f"👤 Исполнитель: {assignee_text}\n\n"
-                f"Нужен ответ от? (введите логин или '-' чтобы пропустить):"
+                f"📣 Нужен ответ от?\n(введите логин Tracker, например: ivanov или '-' чтобы пропустить)"
             )
-            await c.message.answer("📣 Нужен ответ от:", reply_markup=ForceReply(input_field_placeholder="login или -"))
+            await c.message.answer("Логин Tracker:", reply_markup=ForceReply(input_field_placeholder="login или -"))
         return
     
     # Confirm creation
@@ -1368,8 +1368,8 @@ async def handle_new_issue_callback(c: CallbackQuery):
             state.pending_new_issue[tg_id] = draft
             await c.answer()
             if c.message:
-                await c.message.edit_text("📣 Введите логин (или '-'):")
-                await c.message.answer("Нужен ответ от:", reply_markup=ForceReply(input_field_placeholder="login или -"))
+                await c.message.edit_text("📣 Нужен ответ от?\n(введите логин Tracker, например: ivanov или '-' чтобы пропустить)")
+                await c.message.answer("Логин Tracker:", reply_markup=ForceReply(input_field_placeholder="login или -"))
         return
     
     # Edit menu (just "new:edit" without field)
@@ -1573,7 +1573,7 @@ async def handle_text_message(m: Message):
             from aiogram.types import ForceReply
             await m.answer(
                 f"👤 Исполнитель: @{draft['assignee']}\n\n"
-                f"Нужен ответ от? (введите логин или '-' чтобы пропустить):",
+                f"📣 Нужен ответ от?\n(введите логин Tracker, например: ivanov или '-' чтобы пропустить)",
                 reply_markup=ForceReply(input_field_placeholder="login или -")
             )
             return
