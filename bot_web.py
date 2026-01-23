@@ -1221,11 +1221,16 @@ async def process_ai_search(m: Message, query: str, tg_id: int):
     
     text = "\n".join(lines)
     
-    if len(text) > 4000:
-        await loading.edit_text(text[:4000], parse_mode="Markdown")
-        await m.answer(text[4000:], parse_mode="Markdown")
-    else:
-        await loading.edit_text(text, parse_mode="Markdown")
+    try:
+        if len(text) > 4000:
+            await loading.edit_text(text[:4000], parse_mode="Markdown")
+            await m.answer(text[4000:], parse_mode="Markdown")
+        else:
+            await loading.edit_text(text, parse_mode="Markdown")
+    except Exception:
+        # Fallback without Markdown
+        plain = text.replace("*", "").replace("_", "")
+        await loading.edit_text(plain[:4000])
 
 
 async def process_custom_stats(m: Message, text: str, pending: dict):
@@ -1296,7 +1301,10 @@ async def process_custom_stats(m: Message, text: str, pending: dict):
     kb.button(text="📋 Другая очередь", callback_data="stats:back")
     kb.adjust(2)
     
-    await loading.edit_text(result_text, parse_mode="Markdown", reply_markup=kb.as_markup())
+    try:
+        await loading.edit_text(result_text, parse_mode="Markdown", reply_markup=kb.as_markup())
+    except Exception:
+        await loading.edit_text(result_text.replace("*", "").replace("_", ""), reply_markup=kb.as_markup())
 
 
 # =============================================================================
@@ -1871,7 +1879,10 @@ async def handle_report_callback(c: CallbackQuery):
         kb.adjust(2, 1)
         
         if c.message:
-            await c.message.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
+            try:
+                await c.message.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
+            except Exception:
+                await c.message.edit_text(text[:4000].replace("*", "").replace("_", ""), reply_markup=kb.as_markup())
         return
     
     if action == "evening":
@@ -1917,7 +1928,10 @@ async def handle_report_callback(c: CallbackQuery):
         kb.adjust(2, 1)
         
         if c.message:
-            await c.message.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
+            try:
+                await c.message.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
+            except Exception:
+                await c.message.edit_text(text[:4000].replace("*", "").replace("_", ""), reply_markup=kb.as_markup())
         return
     
     if action == "stats":
@@ -2047,7 +2061,10 @@ async def handle_stats_callback(c: CallbackQuery):
         kb.adjust(1, 2)
         
         if c.message:
-            await c.message.edit_text(text, parse_mode="Markdown", reply_markup=kb.as_markup())
+            try:
+                await c.message.edit_text(text, parse_mode="Markdown", reply_markup=kb.as_markup())
+            except Exception:
+                await c.message.edit_text(text.replace("*", "").replace("_", ""), reply_markup=kb.as_markup())
         return
     
     await c.answer()
