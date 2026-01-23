@@ -437,6 +437,9 @@ class TrackerService:
             "morning_report_queue": s.get("morning_report_queue", ""),
             "morning_report_limit": s.get("morning_report_limit", 10),
             "evening_report_enabled": s.get("evening_report_enabled", False),
+            "report_enabled": s.get("report_enabled", False),
+            "report_queue": s.get("report_queue", ""),
+            "report_period": s.get("report_period", "week"),
         }
         _settings_cache.set(tg_id, body)
         return {"http_status": 200, "body": body}
@@ -480,6 +483,24 @@ class TrackerService:
         await self.storage.set_evening_report_enabled(tg_id, enabled)
         _settings_cache.invalidate(tg_id)
         return await self.settings_get(tg_id)
+
+    async def settings_set_report_enabled(self, tg_id: int, enabled: bool) -> dict:
+        await self.storage.set_report_enabled(tg_id, enabled)
+        _settings_cache.invalidate(tg_id)
+        return await self.settings_get(tg_id)
+
+    async def settings_set_report_queue(self, tg_id: int, queue: str) -> dict:
+        await self.storage.set_report_queue(tg_id, queue)
+        _settings_cache.invalidate(tg_id)
+        return await self.settings_get(tg_id)
+
+    async def settings_set_report_period(self, tg_id: int, period: str) -> dict:
+        await self.storage.set_report_period(tg_id, period)
+        _settings_cache.invalidate(tg_id)
+        return await self.settings_get(tg_id)
+
+    async def get_users_with_report(self) -> list[dict]:
+        return await self.storage.get_users_with_report()
 
     async def get_users_with_morning_report(self) -> list[dict]:
         return await self.storage.get_users_with_morning_report()
@@ -1501,6 +1522,33 @@ async def tg_settings_evening_enabled(tg: int = Query(..., ge=1), enabled: bool 
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
+@app.post("/tg/settings/report_enabled")
+async def tg_settings_report_enabled(tg: int = Query(..., ge=1), enabled: bool = Query(...)):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.settings_set_report_enabled(tg, enabled)  # type: ignore
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.post("/tg/settings/report_queue")
+async def tg_settings_report_queue(tg: int = Query(..., ge=1), queue: str = Query(...)):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.settings_set_report_queue(tg, queue)  # type: ignore
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.post("/tg/settings/report_period")
+async def tg_settings_report_period(tg: int = Query(..., ge=1), period: str = Query(...)):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.settings_set_report_period(tg, period)  # type: ignore
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
 @app.get("/tracker/morning_report")
 async def tracker_morning_report(
     tg: int = Query(..., ge=1),
@@ -1534,12 +1582,17 @@ async def tracker_evening_report(
 async def tracker_queue_stats(
     tg: int = Query(..., ge=1),
     queue: str = Query(..., min_length=1),
-    period: str = Query("today")
+    period: str = Query("today"),
+    date_from: str = Query(""),
+    date_to: str = Query("")
 ):
     """Get queue statistics: created, in_progress, closed."""
     err = _check_config()
     if err:
         return err
+    # For custom period, use comma-separated dates
+    if period == "custom" and date_from and date_to:
+        period = f"{date_from},{date_to}"
     result = await _service.queue_stats(tg, queue, period)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
@@ -1568,6 +1621,15 @@ async def tg_users_with_evening_report():
     if err:
         return err
     users = await _service.get_users_with_evening_report()  # type: ignore
+    return JSONResponse({"users": users})
+
+
+@app.get("/tg/users_with_report")
+async def tg_users_with_report():
+    err = _check_config()
+    if err:
+        return err
+    users = await _service.get_users_with_report()  # type: ignore
     return JSONResponse({"users": users})
 
 

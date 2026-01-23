@@ -128,7 +128,7 @@ class AppState:
         'bot', 'dispatcher', 'shutdown_event',
         'checklist_cache', 'summary_cache',
         'pending_comment', 'pending_summary', 'pending_ai_search', 
-        'pending_new_issue', 'last_reminder'
+        'pending_new_issue', 'pending_stats_dates', 'last_reminder'
     )
     
     def __init__(self):
@@ -149,6 +149,7 @@ class AppState:
         self.pending_summary = PendingState(max_age=settings.cache.pending_state_ttl)
         self.pending_ai_search = PendingState(max_age=settings.cache.pending_state_ttl)
         self.pending_new_issue: Dict[int, dict] = {}  # tg_id -> issue draft
+        self.pending_stats_dates: Dict[int, dict] = {}  # tg_id -> {queue, msg_id}
         self.last_reminder: Dict[int, float] = {}
 
 
@@ -321,8 +322,9 @@ def kb_settings_main() -> InlineKeyboardMarkup:
     kb.button(text="🔔 Напоминание", callback_data="st:reminder")
     kb.button(text="🌅 Утренний отчёт", callback_data="st:morning")
     kb.button(text="🌆 Вечерний отчёт", callback_data="st:evening")
+    kb.button(text="📊 Итоговый отчёт", callback_data="st:report")
     kb.button(text="Закрыть", callback_data="st:close")
-    kb.adjust(2, 2, 2, 1)
+    kb.adjust(2, 2, 3, 1)
     return kb.as_markup()
 
 
@@ -486,6 +488,41 @@ def kb_settings_evening(enabled: bool, queue: str) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+def kb_settings_report(enabled: bool, queue: str, period: str) -> InlineKeyboardMarkup:
+    """Итоговый отчёт settings keyboard."""
+    period_names = {"today": "сегодня", "week": "неделя", "month": "месяц"}
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text=f"{'✅' if enabled else '❌'} Авто (19:00): {'Вкл' if enabled else 'Выкл'}",
+        callback_data="st:report_toggle"
+    )
+    kb.button(text=f"📋 Очередь: {queue or '—'}", callback_data="st:report_queue")
+    kb.button(text=f"📅 Период: {period_names.get(period, period)}", callback_data="st:report_period")
+    kb.button(text="Назад", callback_data="st:back")
+    kb.adjust(1, 2, 1)
+    return kb.as_markup()
+
+
+def kb_report_queue_select(current: str) -> InlineKeyboardMarkup:
+    """Queue selection for итоговый отчёт."""
+    kb = InlineKeyboardBuilder()
+    for q in QUEUES_LIST:
+        kb.button(text=f"{'✅' if q == current else '⬜'} {q}", callback_data=f"st:report_qset:{q}")
+    kb.button(text="Назад", callback_data="st:report")
+    kb.adjust(4, 3, 1)
+    return kb.as_markup()
+
+
+def kb_report_period_select(current: str) -> InlineKeyboardMarkup:
+    """Period selection for итоговый отчёт settings."""
+    kb = InlineKeyboardBuilder()
+    for val, label in [("today", "Сегодня"), ("week", "Неделя"), ("month", "Месяц")]:
+        kb.button(text=f"{'✅' if val == current else '⬜'} {label}", callback_data=f"st:report_pset:{val}")
+    kb.button(text="Назад", callback_data="st:report")
+    kb.adjust(3, 1)
+    return kb.as_markup()
+
+
 def kb_summary_actions(issue_key: str, extended: bool = False) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="🔄 Обновить", callback_data=f"sum:refresh:{issue_key}")
@@ -539,6 +576,9 @@ async def get_full_settings(tg_id: int) -> Optional[dict]:
         "morning_queue": data.get("morning_report_queue", ""),
         "morning_limit": int(data.get("morning_report_limit", 10)),
         "evening_enabled": bool(data.get("evening_report_enabled", False)),
+        "report_enabled": bool(data.get("report_enabled", False)),
+        "report_queue": data.get("report_queue", ""),
+        "report_period": data.get("report_period", "week"),
     }
 
 
@@ -614,7 +654,7 @@ async def cmd_menu(m: Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="🌅 Утренний", callback_data="report:morning")
     kb.button(text="🌆 Вечерний", callback_data="report:evening")
-    kb.button(text="📊 Статистика", callback_data="report:stats")
+    kb.button(text="📊 Отчёт", callback_data="report:stats")
     kb.adjust(3)
     
     await m.answer(
@@ -935,12 +975,12 @@ async def cmd_evening(m: Message):
     await loading.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
 
 
-@router.message(Command("stats"))
+@router.message(Command("report"))
 @require_base_url
-async def cmd_stats(m: Message):
-    """Get queue statistics."""
+async def cmd_report(m: Message):
+    """Get итоговый отчёт."""
     await m.answer(
-        "📊 *Статистика по очереди*\n\nВыберите очередь:",
+        "📊 *Итоговый отчёт*\n\nВыберите очередь:",
         parse_mode="Markdown",
         reply_markup=kb_stats_queue()
     )
@@ -962,8 +1002,9 @@ def kb_stats_period(queue: str) -> InlineKeyboardMarkup:
     kb.button(text="📆 Сегодня", callback_data=f"stats:period:{queue}:today")
     kb.button(text="📅 Неделя", callback_data=f"stats:period:{queue}:week")
     kb.button(text="🗓 Месяц", callback_data=f"stats:period:{queue}:month")
+    kb.button(text="📆 Выбрать даты", callback_data=f"stats:custom:{queue}")
     kb.button(text="⬅️ Назад", callback_data="stats:back")
-    kb.adjust(3, 1)
+    kb.adjust(3, 1, 1)
     return kb.as_markup()
 
 
@@ -1178,6 +1219,77 @@ async def process_ai_search(m: Message, query: str, tg_id: int):
         await m.answer(text[4000:], parse_mode="Markdown")
     else:
         await loading.edit_text(text, parse_mode="Markdown")
+
+
+async def process_custom_stats(m: Message, text: str, pending: dict):
+    """Process custom date range for stats."""
+    import re
+    tg_id = m.from_user.id
+    queue = pending.get("queue", "")
+    
+    # Parse date range: DD.MM.YYYY — DD.MM.YYYY or DD.MM.YYYY - DD.MM.YYYY
+    pattern = r"(\d{1,2})\.(\d{1,2})\.(\d{4})\s*[-—]\s*(\d{1,2})\.(\d{1,2})\.(\d{4})"
+    match = re.search(pattern, text)
+    
+    if not match:
+        await m.answer(
+            "❌ Неверный формат дат.\n\n"
+            "Пример: `15.01.2026 — 23.01.2026`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        d1, m1, y1 = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        d2, m2, y2 = int(match.group(4)), int(match.group(5)), int(match.group(6))
+        
+        date_from = datetime(y1, m1, d1)
+        date_to = datetime(y2, m2, d2)
+        
+        if date_from > date_to:
+            date_from, date_to = date_to, date_from
+    except ValueError:
+        await m.answer("❌ Неверная дата")
+        return
+    
+    loading = await m.answer("⏳ Загружаю...")
+    
+    # Request with custom dates
+    sc, data = await api_request(
+        "GET", "/tracker/queue_stats",
+        {
+            "tg": tg_id, 
+            "queue": queue, 
+            "period": "custom",
+            "date_from": date_from.strftime("%Y-%m-%d"),
+            "date_to": date_to.strftime("%Y-%m-%d")
+        },
+        long_timeout=True
+    )
+    
+    if sc != 200:
+        await loading.edit_text(f"❌ Ошибка {sc}: {data.get('error', data)}"[:500])
+        return
+    
+    created = data.get("created", 0)
+    in_progress = data.get("in_progress", 0)
+    closed = data.get("closed", 0)
+    
+    period_text = f"{date_from.strftime('%d.%m.%Y')} — {date_to.strftime('%d.%m.%Y')}"
+    
+    result_text = (
+        f"📊 *Итоговый отчёт — {queue}* ({period_text})\n\n"
+        f"📝 Создано: {created}\n"
+        f"🔄 В работе: {in_progress}\n"
+        f"✅ Закрыто: {closed}"
+    )
+    
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📅 Другой период", callback_data=f"stats:queue:{queue}")
+    kb.button(text="📋 Другая очередь", callback_data="stats:back")
+    kb.adjust(2)
+    
+    await loading.edit_text(result_text, parse_mode="Markdown", reply_markup=kb.as_markup())
 
 
 # =============================================================================
@@ -1805,7 +1917,7 @@ async def handle_report_callback(c: CallbackQuery):
         await c.answer()
         if c.message:
             await c.message.edit_text(
-                "📊 *Статистика по очереди*\n\nВыберите очередь:",
+                "📊 *Итоговый отчёт*\n\nВыберите очередь:",
                 parse_mode="Markdown",
                 reply_markup=kb_stats_queue()
             )
@@ -1841,7 +1953,7 @@ async def handle_stats_callback(c: CallbackQuery):
         await c.answer()
         if c.message:
             await c.message.edit_text(
-                "📊 *Статистика по очереди*\n\nВыберите очередь:",
+                "📊 *Итоговый отчёт*\n\nВыберите очередь:",
                 parse_mode="Markdown",
                 reply_markup=kb_stats_queue()
             )
@@ -1853,9 +1965,27 @@ async def handle_stats_callback(c: CallbackQuery):
         await c.answer()
         if c.message:
             await c.message.edit_text(
-                f"📊 *Статистика — {queue}*\n\nВыберите период:",
+                f"📊 *Итоговый отчёт — {queue}*\n\nВыберите период:",
                 parse_mode="Markdown",
                 reply_markup=kb_stats_period(queue)
+            )
+        return
+    
+    # Custom date range
+    if action == "custom" and len(parts) >= 3:
+        queue = parts[2].upper()
+        await c.answer()
+        if c.message:
+            state.pending_stats_dates[tg_id] = {"queue": queue, "msg_id": c.message.message_id}
+            await c.message.edit_text(
+                f"📊 *Итоговый отчёт — {queue}*\n\n"
+                "Введите период в формате:\n"
+                "`ДД.ММ.ГГГГ — ДД.ММ.ГГГГ`\n\n"
+                "Пример: `15.01.2026 — 23.01.2026`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardBuilder().button(
+                    text="⬅️ Назад", callback_data=f"stats:queue:{queue}"
+                ).as_markup()
             )
         return
     
@@ -1897,7 +2027,7 @@ async def handle_stats_callback(c: CallbackQuery):
             period_text = period
         
         text = (
-            f"📊 *Статистика — {queue}* ({period_text})\n\n"
+            f"📊 *Итоговый отчёт — {queue}* ({period_text})\n\n"
             f"📝 Создано: {created}\n"
             f"🔄 В работе: {in_progress}\n"
             f"✅ Закрыто: {closed}"
@@ -2152,6 +2282,95 @@ async def handle_settings_callback(c: CallbackQuery):
         await c.answer("Очередь берётся из утреннего отчёта", show_alert=True)
         return
 
+    # Итоговый отчёт settings
+    if action == "report":
+        full_settings = await get_full_settings(tg_id)
+        if full_settings and c.message:
+            await c.message.edit_text(
+                "📊 *Итоговый отчёт*\n\n"
+                "Статистика: создано, в работе, закрыто.\n"
+                "Авто-отправка в 19:00 вместе с вечерним.",
+                parse_mode="Markdown",
+                reply_markup=kb_settings_report(
+                    full_settings["report_enabled"],
+                    full_settings["report_queue"],
+                    full_settings["report_period"]
+                )
+            )
+        await c.answer()
+        return
+
+    if action == "report_toggle":
+        full_settings = await get_full_settings(tg_id)
+        if full_settings:
+            new_val = not full_settings["report_enabled"]
+            sc2, _ = await api_request("POST", "/tg/settings/report_enabled", {"tg": tg_id, "enabled": new_val})
+            if sc2 == 200 and c.message:
+                await c.message.edit_reply_markup(
+                    reply_markup=kb_settings_report(new_val, full_settings["report_queue"], full_settings["report_period"])
+                )
+            await c.answer("✅" if sc2 == 200 else f"❌ {sc2}")
+        return
+
+    if action == "report_queue":
+        full_settings = await get_full_settings(tg_id)
+        if full_settings and c.message:
+            await c.message.edit_text(
+                "📊 Выберите очередь для итогового отчёта:",
+                reply_markup=kb_report_queue_select(full_settings["report_queue"])
+            )
+        await c.answer()
+        return
+
+    if action == "report_qset":
+        q = arg.upper()
+        sc2, _ = await api_request("POST", "/tg/settings/report_queue", {"tg": tg_id, "queue": q})
+        if sc2 == 200:
+            full_settings = await get_full_settings(tg_id)
+            if full_settings and c.message:
+                await c.message.edit_text(
+                    "📊 *Итоговый отчёт*\n\n"
+                    "Статистика: создано, в работе, закрыто.\n"
+                    "Авто-отправка в 19:00 вместе с вечерним.",
+                    parse_mode="Markdown",
+                    reply_markup=kb_settings_report(
+                        full_settings["report_enabled"],
+                        full_settings["report_queue"],
+                        full_settings["report_period"]
+                    )
+                )
+        await c.answer("✅" if sc2 == 200 else f"❌ {sc2}")
+        return
+
+    if action == "report_period":
+        full_settings = await get_full_settings(tg_id)
+        if full_settings and c.message:
+            await c.message.edit_text(
+                "📊 Выберите период по умолчанию:",
+                reply_markup=kb_report_period_select(full_settings["report_period"])
+            )
+        await c.answer()
+        return
+
+    if action == "report_pset":
+        sc2, _ = await api_request("POST", "/tg/settings/report_period", {"tg": tg_id, "period": arg})
+        if sc2 == 200:
+            full_settings = await get_full_settings(tg_id)
+            if full_settings and c.message:
+                await c.message.edit_text(
+                    "📊 *Итоговый отчёт*\n\n"
+                    "Статистика: создано, в работе, закрыто.\n"
+                    "Авто-отправка в 19:00 вместе с вечерним.",
+                    parse_mode="Markdown",
+                    reply_markup=kb_settings_report(
+                        full_settings["report_enabled"],
+                        full_settings["report_queue"],
+                        full_settings["report_period"]
+                    )
+                )
+        await c.answer("✅" if sc2 == 200 else f"❌ {sc2}")
+        return
+
     await c.answer()
 
 
@@ -2185,6 +2404,12 @@ async def handle_text_message(m: Message):
             await m.answer("❌ Слишком короткий запрос")
             return
         await process_ai_search(m, text, tg_id)
+        return
+    
+    # Check if awaiting custom stats date range
+    stats_pending = state.pending_stats_dates.pop(tg_id, None)
+    if stats_pending:
+        await process_custom_stats(m, text, stats_pending)
         return
     
     # Check if awaiting new issue input
@@ -2295,7 +2520,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="mentions", description="📣 Требующие ответа"),
         BotCommand(command="morning", description="🌅 Утренний отчёт"),
         BotCommand(command="evening", description="🌆 Вечерний отчёт"),
-        BotCommand(command="stats", description="📊 Статистика"),
+        BotCommand(command="report", description="📊 Итоговый отчёт"),
         BotCommand(command="summary", description="🤖 Резюме (ИИ)"),
         BotCommand(command="ai", description="🔍 Поиск (ИИ)"),
         BotCommand(command="new", description="📝 Создать задачу"),
@@ -2557,10 +2782,11 @@ async def morning_report_worker():
 
 
 async def evening_report_worker():
-    """Send evening reports at 19:00 Moscow time."""
+    """Send evening reports and итоговый отчёт at 19:00 Moscow time."""
     await asyncio.sleep(180)  # Wait for startup
     
-    last_sent_date: Dict[int, str] = {}  # tg_id -> date string
+    last_sent_evening: Dict[int, str] = {}  # tg_id -> date string
+    last_sent_report: Dict[int, str] = {}  # tg_id -> date string
     
     while not state.shutdown_event.is_set():
         try:
@@ -2571,7 +2797,7 @@ async def evening_report_worker():
             # Send between 19:00 and 19:30
             if now.hour == 19 and now.minute < 30:
                 if state.bot and settings.base_url:
-                    # Get users with evening report enabled
+                    # --- Send evening reports ---
                     sc, data = await api_request("GET", "/tg/users_with_evening_report", {})
                     if sc == 200:
                         for user in data.get("users", []):
@@ -2581,8 +2807,7 @@ async def evening_report_worker():
                             if not tg_id or not queue:
                                 continue
                             
-                            # Check if already sent today
-                            if last_sent_date.get(tg_id) == today_str:
+                            if last_sent_evening.get(tg_id) == today_str:
                                 continue
                             
                             try:
@@ -2611,7 +2836,57 @@ async def evening_report_worker():
                                         tg_id, "\n".join(lines), parse_mode="Markdown"
                                     )
                                     
-                                    last_sent_date[tg_id] = today_str
+                                    last_sent_evening[tg_id] = today_str
+                            except Exception:
+                                pass
+                            
+                            await asyncio.sleep(0.5)
+                    
+                    # --- Send итоговый отчёт ---
+                    sc_r, data_r = await api_request("GET", "/tg/users_with_report", {})
+                    if sc_r == 200:
+                        for user in data_r.get("users", []):
+                            tg_id = user.get("tg_id")
+                            queue = user.get("report_queue", "")
+                            period = user.get("report_period", "week")
+                            
+                            if not tg_id or not queue:
+                                continue
+                            
+                            if last_sent_report.get(tg_id) == today_str:
+                                continue
+                            
+                            try:
+                                sc3, data3 = await api_request(
+                                    "GET", "/tracker/queue_stats",
+                                    {"tg": tg_id, "queue": queue, "period": period},
+                                    long_timeout=True
+                                )
+                                
+                                if sc3 == 200:
+                                    created = data3.get("created", 0)
+                                    in_progress = data3.get("in_progress", 0)
+                                    closed = data3.get("closed", 0)
+                                    
+                                    period_names = {
+                                        "today": "сегодня",
+                                        "week": "неделя",
+                                        "month": "месяц"
+                                    }
+                                    period_text = period_names.get(period, period)
+                                    
+                                    text = (
+                                        f"📊 *Итоговый отчёт — {queue}* ({period_text})\n\n"
+                                        f"📝 Создано: {created}\n"
+                                        f"🔄 В работе: {in_progress}\n"
+                                        f"✅ Закрыто: {closed}"
+                                    )
+                                    
+                                    await state.bot.send_message(
+                                        tg_id, text, parse_mode="Markdown"
+                                    )
+                                    
+                                    last_sent_report[tg_id] = today_str
                             except Exception:
                                 pass
                             

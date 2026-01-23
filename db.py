@@ -139,6 +139,19 @@ class TokenStorage:
                 ALTER TABLE tg_settings
                 ADD COLUMN IF NOT EXISTS evening_report_enabled BOOLEAN NOT NULL DEFAULT FALSE;
             """)
+            # Columns for итоговый отчёт (report)
+            await conn.execute("""
+                ALTER TABLE tg_settings
+                ADD COLUMN IF NOT EXISTS report_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+            """)
+            await conn.execute("""
+                ALTER TABLE tg_settings
+                ADD COLUMN IF NOT EXISTS report_queue TEXT NOT NULL DEFAULT '';
+            """)
+            await conn.execute("""
+                ALTER TABLE tg_settings
+                ADD COLUMN IF NOT EXISTS report_period TEXT NOT NULL DEFAULT 'week';
+            """)
             logger.info("Database schema ready")
         finally:
             await self._pool.release(conn)  # type: ignore
@@ -235,7 +248,8 @@ class TokenStorage:
             row = await conn.fetchrow(
                 """SELECT queues_csv, days, limit_results, reminder_hours,
                           morning_report_enabled, morning_report_queue, morning_report_limit,
-                          evening_report_enabled
+                          evening_report_enabled,
+                          report_enabled, report_queue, report_period
                    FROM tg_settings WHERE tg_id=$1""",
                 tg_id
             )
@@ -244,7 +258,8 @@ class TokenStorage:
             return {
                 "queues_csv": "", "days": 30, "limit_results": 10, "reminder_hours": 0,
                 "morning_report_enabled": False, "morning_report_queue": "", "morning_report_limit": 10,
-                "evening_report_enabled": False
+                "evening_report_enabled": False,
+                "report_enabled": False, "report_queue": "", "report_period": "week"
             }
         finally:
             await self._pool.release(conn)  # type: ignore
@@ -386,6 +401,54 @@ class TokenStorage:
                 UPDATE tg_settings SET evening_report_enabled = $2, updated_at = NOW()
                 WHERE tg_id = $1;
             """, tg_id, enabled)
+        finally:
+            await self._pool.release(conn)  # type: ignore
+
+    async def set_report_enabled(self, tg_id: int, enabled: bool) -> None:
+        """Toggle итоговый отчёт on/off."""
+        conn = await self._acquire()
+        try:
+            await conn.execute("""
+                UPDATE tg_settings SET report_enabled = $2, updated_at = NOW()
+                WHERE tg_id = $1;
+            """, tg_id, enabled)
+        finally:
+            await self._pool.release(conn)  # type: ignore
+
+    async def set_report_queue(self, tg_id: int, queue: str) -> None:
+        """Set итоговый отчёт queue."""
+        queue = queue.upper().strip()
+        conn = await self._acquire()
+        try:
+            await conn.execute("""
+                UPDATE tg_settings SET report_queue = $2, updated_at = NOW()
+                WHERE tg_id = $1;
+            """, tg_id, queue)
+        finally:
+            await self._pool.release(conn)  # type: ignore
+
+    async def set_report_period(self, tg_id: int, period: str) -> None:
+        """Set итоговый отчёт default period."""
+        period = period if period in ("today", "week", "month") else "week"
+        conn = await self._acquire()
+        try:
+            await conn.execute("""
+                UPDATE tg_settings SET report_period = $2, updated_at = NOW()
+                WHERE tg_id = $1;
+            """, tg_id, period)
+        finally:
+            await self._pool.release(conn)  # type: ignore
+
+    async def get_users_with_report(self) -> list[dict]:
+        """Get all users with итоговый отчёт enabled."""
+        conn = await self._acquire()
+        try:
+            rows = await conn.fetch(
+                """SELECT tg_id, report_queue, report_period
+                   FROM tg_settings 
+                   WHERE report_enabled = TRUE AND report_queue != ''"""
+            )
+            return [dict(r) for r in rows] if rows else []
         finally:
             await self._pool.release(conn)  # type: ignore
 
