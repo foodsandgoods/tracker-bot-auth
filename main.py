@@ -985,7 +985,15 @@ class TrackerService:
             return {"http_status": 503, "body": {"error": f"Create issue failed: {type(e).__name__}"}}
 
         if st not in (200, 201):
-            error_msg = resp.get("errorMessages", [resp]) if isinstance(resp, dict) else str(resp)
+            if isinstance(resp, dict):
+                errors = resp.get("errorMessages", [])
+                if isinstance(errors, list) and errors:
+                    error_msg = "; ".join(str(e) for e in errors)
+                else:
+                    error_msg = resp.get("message", str(resp))
+            else:
+                error_msg = str(resp)
+            logger.warning(f"Create issue failed: st={st}, error={error_msg}")
             return {"http_status": st, "body": {"error": error_msg, "response": resp}}
 
         issue_key = resp.get("key", "") if isinstance(resp, dict) else ""

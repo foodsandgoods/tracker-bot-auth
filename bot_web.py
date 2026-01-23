@@ -1320,16 +1320,6 @@ async def handle_new_issue_callback(c: CallbackQuery):
             )
         return
     
-    # Edit menu
-    if action == "edit":
-        await c.answer()
-        if c.message:
-            await c.message.edit_text(
-                "Что изменить?",
-                reply_markup=kb_new_issue_edit()
-            )
-        return
-    
     # Back to confirm
     if action == "back":
         draft["step"] = "confirm"
@@ -1342,7 +1332,7 @@ async def handle_new_issue_callback(c: CallbackQuery):
             )
         return
     
-    # Edit specific field
+    # Edit specific field (new:edit:queue, new:edit:summary, etc.)
     if action == "edit" and len(parts) >= 3:
         field = parts[2]
         from aiogram.types import ForceReply
@@ -1354,18 +1344,18 @@ async def handle_new_issue_callback(c: CallbackQuery):
             if c.message:
                 await c.message.edit_text("📝 Выберите очередь:", reply_markup=kb_new_issue_queue())
         elif field == "summary":
-            draft["step"] = "summary"
+            draft["step"] = "edit_summary"
             state.pending_new_issue[tg_id] = draft
             await c.answer()
             if c.message:
-                await c.message.edit_text("📋 Введите название:")
+                await c.message.edit_text("📋 Введите новое название:")
                 await c.message.answer("Название:", reply_markup=ForceReply(input_field_placeholder="Название"))
         elif field == "description":
-            draft["step"] = "description"
+            draft["step"] = "edit_description"
             state.pending_new_issue[tg_id] = draft
             await c.answer()
             if c.message:
-                await c.message.edit_text("📄 Введите описание:")
+                await c.message.edit_text("📄 Введите новое описание (или '-'):")
                 await c.message.answer("Описание:", reply_markup=ForceReply(input_field_placeholder="Описание"))
         elif field == "assignee":
             draft["step"] = "assignee"
@@ -1374,12 +1364,22 @@ async def handle_new_issue_callback(c: CallbackQuery):
             if c.message:
                 await c.message.edit_text("👤 Назначить исполнителя?", reply_markup=kb_new_issue_assignee())
         elif field == "pending":
-            draft["step"] = "pending_reply"
+            draft["step"] = "edit_pending"
             state.pending_new_issue[tg_id] = draft
             await c.answer()
             if c.message:
-                await c.message.edit_text("📣 Введите логин:")
-                await c.message.answer("Нужен ответ от:", reply_markup=ForceReply(input_field_placeholder="login"))
+                await c.message.edit_text("📣 Введите логин (или '-'):")
+                await c.message.answer("Нужен ответ от:", reply_markup=ForceReply(input_field_placeholder="login или -"))
+        return
+    
+    # Edit menu (just "new:edit" without field)
+    if action == "edit":
+        await c.answer()
+        if c.message:
+            await c.message.edit_text(
+                "Что изменить?",
+                reply_markup=kb_new_issue_edit()
+            )
         return
     
     await c.answer()
