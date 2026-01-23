@@ -346,13 +346,23 @@ def kb_new_issue_queue() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+def kb_new_issue_back(prev_step: str) -> InlineKeyboardMarkup:
+    """Back button keyboard for text input steps."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ Назад", callback_data=f"new:goback:{prev_step}")
+    kb.button(text="❌ Отмена", callback_data="new:cancel")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
 def kb_new_issue_assignee() -> InlineKeyboardMarkup:
     """Assignee selection keyboard."""
     kb = InlineKeyboardBuilder()
     kb.button(text="👤 На себя", callback_data="new:assignee:me")
     kb.button(text="🔍 Ввести логин", callback_data="new:assignee:input")
     kb.button(text="⏭ Пропустить", callback_data="new:assignee:skip")
-    kb.adjust(2, 1)
+    kb.button(text="⬅️ Назад", callback_data="new:goback:description")
+    kb.adjust(2, 1, 1)
     return kb.as_markup()
 
 
@@ -1218,6 +1228,66 @@ async def handle_new_issue_callback(c: CallbackQuery):
                 pass
         return
     
+    # Go back to previous step
+    if action == "goback" and len(parts) >= 3:
+        prev_step = parts[2]
+        await c.answer()
+        
+        if prev_step == "queue":
+            draft["step"] = "queue"
+            state.pending_new_issue[tg_id] = draft
+            if c.message:
+                await c.message.edit_text("📝 Создание задачи\n\nВыберите очередь:", reply_markup=kb_new_issue_queue())
+        elif prev_step == "summary":
+            draft["step"] = "summary"
+            state.pending_new_issue[tg_id] = draft
+            if c.message:
+                from aiogram.types import ForceReply
+                await c.message.edit_text(
+                    f"📝 Очередь: {draft.get('queue')}\n\nВведите название задачи:",
+                    reply_markup=kb_new_issue_back("queue")
+                )
+                await c.message.answer("📋 Название:", reply_markup=ForceReply(input_field_placeholder="Название задачи"))
+        elif prev_step == "description":
+            draft["step"] = "description"
+            state.pending_new_issue[tg_id] = draft
+            if c.message:
+                from aiogram.types import ForceReply
+                await c.message.edit_text(
+                    f"📝 Очередь: {draft.get('queue')}\n"
+                    f"📋 Название: {draft.get('summary', '')[:50]}\n\n"
+                    f"Введите описание (или '-' чтобы пропустить):",
+                    reply_markup=kb_new_issue_back("summary")
+                )
+                await c.message.answer("📄 Описание:", reply_markup=ForceReply(input_field_placeholder="Описание или -"))
+        elif prev_step == "assignee":
+            draft["step"] = "assignee"
+            state.pending_new_issue[tg_id] = draft
+            if c.message:
+                await c.message.edit_text(
+                    f"📝 Очередь: {draft.get('queue')}\n"
+                    f"📋 Название: {draft.get('summary', '')[:50]}\n"
+                    f"📄 Описание: {(draft.get('description') or '—')[:50]}\n\n"
+                    f"Назначить исполнителя?",
+                    reply_markup=kb_new_issue_assignee()
+                )
+        elif prev_step == "pending":
+            draft["step"] = "pending_reply"
+            state.pending_new_issue[tg_id] = draft
+            if c.message:
+                from aiogram.types import ForceReply
+                assignee_text = f"@{draft.get('assignee')}" if draft.get('assignee') else "—"
+                await c.message.edit_text(
+                    f"📝 Очередь: {draft.get('queue')}\n"
+                    f"📋 Название: {draft.get('summary', '')[:50]}\n"
+                    f"📄 Описание: {(draft.get('description') or '—')[:50]}\n"
+                    f"👤 Исполнитель: {assignee_text}\n\n"
+                    f"📣 Нужен ответ от?\n(введите логин Tracker, например: ivanov или '-' чтобы пропустить)",
+                    reply_markup=kb_new_issue_back("assignee")
+                )
+                await c.message.answer("Логин Tracker:", reply_markup=ForceReply(input_field_placeholder="login или -"))
+        return
+    
     # Queue selection
     if action == "queue" and len(parts) >= 3:
         queue = parts[2].upper()
@@ -1227,7 +1297,10 @@ async def handle_new_issue_callback(c: CallbackQuery):
         await c.answer()
         if c.message:
             from aiogram.types import ForceReply
-            await c.message.edit_text(f"📝 Очередь: {queue}\n\nВведите название задачи:")
+            await c.message.edit_text(
+                f"📝 Очередь: {queue}\n\nВведите название задачи:",
+                reply_markup=kb_new_issue_back("queue")
+            )
             await c.message.answer("📋 Название:", reply_markup=ForceReply(input_field_placeholder="Название задачи"))
         return
     
@@ -1250,7 +1323,10 @@ async def handle_new_issue_callback(c: CallbackQuery):
             await c.answer()
             if c.message:
                 from aiogram.types import ForceReply
-                await c.message.edit_text("👤 Введите логин исполнителя\n(логин Tracker, например: ivanov)")
+                await c.message.edit_text(
+                    "👤 Введите логин исполнителя\n(логин Tracker, например: ivanov)",
+                    reply_markup=kb_new_issue_back("description")
+                )
                 await c.message.answer("Логин Tracker:", reply_markup=ForceReply(input_field_placeholder="login"))
             return
         
@@ -1265,7 +1341,8 @@ async def handle_new_issue_callback(c: CallbackQuery):
                 f"📋 Название: {draft.get('summary')}\n"
                 f"📄 Описание: {draft.get('description') or '—'}\n"
                 f"👤 Исполнитель: {assignee_text}\n\n"
-                f"📣 Нужен ответ от?\n(введите логин Tracker, например: ivanov или '-' чтобы пропустить)"
+                f"📣 Нужен ответ от?\n(введите логин Tracker, например: ivanov или '-' чтобы пропустить)",
+                reply_markup=kb_new_issue_back("assignee")
             )
             await c.message.answer("Логин Tracker:", reply_markup=ForceReply(input_field_placeholder="login или -"))
         return
@@ -1549,8 +1626,9 @@ async def handle_text_message(m: Message):
                 f"📝 Очередь: {draft.get('queue')}\n"
                 f"📋 Название: {text[:50]}{'...' if len(text) > 50 else ''}\n\n"
                 f"Введите описание (или '-' чтобы пропустить):",
-                reply_markup=ForceReply(input_field_placeholder="Описание или -")
+                reply_markup=kb_new_issue_back("summary")
             )
+            await m.answer("📄 Описание:", reply_markup=ForceReply(input_field_placeholder="Описание или -"))
             return
         
         if step == "description":
@@ -1574,8 +1652,9 @@ async def handle_text_message(m: Message):
             await m.answer(
                 f"👤 Исполнитель: @{draft['assignee']}\n\n"
                 f"📣 Нужен ответ от?\n(введите логин Tracker, например: ivanov или '-' чтобы пропустить)",
-                reply_markup=ForceReply(input_field_placeholder="login или -")
+                reply_markup=kb_new_issue_back("assignee")
             )
+            await m.answer("Логин Tracker:", reply_markup=ForceReply(input_field_placeholder="login или -"))
             return
         
         if step == "pending_reply":
