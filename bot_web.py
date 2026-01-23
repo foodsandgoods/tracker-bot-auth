@@ -910,14 +910,18 @@ async def cmd_morning(m: Message):
     for idx, issue in enumerate(issues, 1):
         key = issue.get("key", "")
         summary = escape_md(issue.get("summary", "")[:50])
-        status = issue.get("status", "")
+        status = escape_md(issue.get("status", ""))
         url = issue.get("url", f"https://tracker.yandex.ru/{key}")
         lines.append(f"{idx}. [{key}]({url}): {summary}")
         if status:
             lines.append(f"   _{status}_")
     
     text = "\n".join(lines)
-    await loading.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
+    try:
+        await loading.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
+    except Exception:
+        # Fallback without Markdown if parsing fails
+        await loading.edit_text(text[:4000].replace("*", "").replace("_", "").replace("[", "").replace("]", "").replace("(", " ").replace(")", ""), reply_markup=kb.as_markup())
 
 
 @router.message(Command("evening"))
@@ -972,7 +976,10 @@ async def cmd_evening(m: Message):
         lines.append(f"{idx}. [{key}]({url}): {summary}")
     
     text = "\n".join(lines)
-    await loading.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
+    try:
+        await loading.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
+    except Exception:
+        await loading.edit_text(text[:4000].replace("*", "").replace("_", ""), reply_markup=kb.as_markup())
 
 
 @router.message(Command("report"))
@@ -1199,8 +1206,8 @@ async def process_ai_search(m: Message, query: str, tg_id: int):
     for idx, issue in enumerate(issues, 1):
         key = issue.get("key", "")
         summary = escape_md((issue.get("summary") or "")[:50])
-        status = issue.get("status", "")
-        description = (issue.get("description") or "")[:80]
+        status = escape_md(issue.get("status", ""))
+        description = escape_md((issue.get("description") or "")[:80])
         url = issue.get("url", f"https://tracker.yandex.ru/{key}")
         
         line = f"{idx}. [{key}: {summary}]({url})"
