@@ -216,17 +216,20 @@ class TrackerClient:
 
     @with_retry(max_attempts=3, base_delay=0.5)
     async def search_issues(
-        self, access_token: str, query: str, limit: int = 50
+        self, access_token: str, query: str, limit: int = 50, order: str = ""
     ) -> tuple[int, Any]:
         """Search issues."""
         client = await get_client()
         headers = {**self._headers(access_token), "Content-Type": "application/json"}
         params = {"page": 1, "perPage": limit}
+        body: dict = {"query": query}
+        if order:
+            body["order"] = order
         r = await client.post(
             f"{self._api_base}/issues/_search",
             headers=headers,
             params=params,
-            json={"query": query}
+            json=body
         )
         return r.status_code, safe_json(r)
 
@@ -529,12 +532,12 @@ class TrackerService:
 
         # For today: open issues. For past dates: issues updated on or before that date
         if date_offset == 0:
-            query = f"Queue: {queue} AND Resolution: empty() Sort by: Updated DESC"
+            query = f"Queue: {queue} AND Resolution: empty()"
         else:
-            query = f"Queue: {queue} AND Resolution: empty() AND Updated: <= now()-{date_offset}d Sort by: Updated DESC"
+            query = f"Queue: {queue} AND Resolution: empty() AND Updated: <= now()-{date_offset}d"
 
         try:
-            st, payload = await self.tracker.search_issues(access, query=query, limit=limit)
+            st, payload = await self.tracker.search_issues(access, query=query, limit=limit, order="-updated")
         except Exception as e:
             return {"http_status": 503, "body": {"error": f"Search failed: {type(e).__name__}"}}
 
@@ -581,13 +584,13 @@ class TrackerService:
 
         # Closed on specific day
         if date_offset == 0:
-            query = f'Queue: {queue} AND Resolution: !empty() AND Resolved: >= today() Sort by: Resolved DESC'
+            query = f'Queue: {queue} AND Resolution: !empty() AND Resolved: >= today()'
         else:
             # Closed on that specific day: >= start of day AND < start of next day
-            query = f'Queue: {queue} AND Resolution: !empty() AND Resolved: >= now()-{date_offset}d AND Resolved: < now()-{date_offset - 1}d Sort by: Resolved DESC'
+            query = f'Queue: {queue} AND Resolution: !empty() AND Resolved: >= now()-{date_offset}d AND Resolved: < now()-{date_offset - 1}d'
 
         try:
-            st, payload = await self.tracker.search_issues(access, query=query, limit=50)
+            st, payload = await self.tracker.search_issues(access, query=query, limit=50, order="-resolved")
         except Exception as e:
             return {"http_status": 503, "body": {"error": f"Search failed: {type(e).__name__}"}}
 
