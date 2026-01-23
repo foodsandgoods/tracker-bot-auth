@@ -7,7 +7,7 @@ import logging
 import re
 import time
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -204,7 +204,7 @@ def fmt_item(item: dict, highlight_mine: bool = False) -> str:
 
 
 def fmt_date(date_str: Optional[str]) -> str:
-    """Format ISO date to DD.MM.YYYY HH:MM."""
+    """Format ISO date to DD.MM.YYYY HH:MM in Moscow timezone (UTC+3)."""
     if not date_str:
         return ""
     try:
@@ -213,7 +213,11 @@ def fmt_date(date_str: Optional[str]) -> str:
             parts = clean.rsplit("+", 1)
             if len(parts[1]) == 4:
                 clean = f"{parts[0]}+{parts[1][:2]}:{parts[1][2:]}"
-        return datetime.fromisoformat(clean).strftime("%d.%m.%Y %H:%M")
+        dt = datetime.fromisoformat(clean)
+        # Convert to Moscow time (UTC+3)
+        moscow_tz = timezone(timedelta(hours=3))
+        dt_moscow = dt.astimezone(moscow_tz)
+        return dt_moscow.strftime("%d.%m.%Y %H:%M")
     except Exception:
         return date_str[:16] if len(date_str) > 16 else date_str
 
@@ -680,7 +684,7 @@ async def cmd_cl_my_open(m: Message):
         return
     
     text, keyboard, item_mapping = build_checklist_response(
-        issues, "❓ *Ожидают согласование:*",
+        issues, "❓ *Ждут моего ОК:*",
         include_checked=False, add_buttons=True, show_all_items=True,
         add_comment_buttons=True
     )
@@ -915,7 +919,7 @@ async def process_ai_search(m: Message, query: str, tg_id: int):
             await loading.edit_text(
                 "📋 Для поиска по чеклистам используйте:\n"
                 "• /cl_my — задачи с моим ОК\n"
-                "• /cl_my_open — ожидают согласования"
+                "• /cl_my_open — ждут моего ОК"
             )
         elif redirect == "summons":
             await loading.edit_text(
@@ -1713,7 +1717,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="me", description="👤 Проверить доступ"),
         BotCommand(command="settings", description="⚙️ Настройки"),
         BotCommand(command="cl_my", description="✅ Задачи с моим ОК"),
-        BotCommand(command="cl_my_open", description="❓ Ожидают согласование"),
+        BotCommand(command="cl_my_open", description="❓ Ждут моего ОК"),
         # BotCommand(command="done", description="✔️ Отметить пункт"),  # TODO: временно отключено
         BotCommand(command="mentions", description="📣 Требующие ответа"),
         BotCommand(command="summary", description="🤖 Резюме (ИИ)"),
@@ -1818,7 +1822,8 @@ async def reminder_worker():
     
     while not state.shutdown_event.is_set():
         try:
-            now = datetime.now()
+            moscow_tz = timezone(timedelta(hours=3))
+            now = datetime.now(moscow_tz)
             if not (9 <= now.hour < 19):
                 await asyncio.sleep(300)
                 continue
@@ -1859,7 +1864,7 @@ async def reminder_worker():
                         issues = data1.get("issues", [])
                         if issues:
                             has_items = True
-                            lines.append("❓ *Ожидают согласование:*")
+                            lines.append("❓ *Ждут моего ОК:*")
                             for idx, issue in enumerate(issues[:3], 1):
                                 lines.append(f"{idx}. {fmt_issue_link(issue, show_date=False)}")
                             if len(issues) > 3:
