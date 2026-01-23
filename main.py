@@ -430,7 +430,11 @@ class TrackerService:
             "queues": queues_list(s.get("queues_csv", "")),
             "days": s.get("days", 30),
             "limit": s.get("limit_results", 10),
-            "reminder": s.get("reminder_hours", 0)
+            "reminder": s.get("reminder_hours", 0),
+            "morning_report_enabled": s.get("morning_report_enabled", False),
+            "morning_report_queue": s.get("morning_report_queue", ""),
+            "morning_report_limit": s.get("morning_report_limit", 10),
+            "evening_report_enabled": s.get("evening_report_enabled", False),
         }
         _settings_cache.set(tg_id, body)
         return {"http_status": 200, "body": body}
@@ -454,6 +458,183 @@ class TrackerService:
         await self.storage.set_reminder(tg_id, hours)
         _settings_cache.invalidate(tg_id)
         return await self.settings_get(tg_id)
+
+    async def settings_set_morning_enabled(self, tg_id: int, enabled: bool) -> dict:
+        await self.storage.set_morning_report_enabled(tg_id, enabled)
+        _settings_cache.invalidate(tg_id)
+        return await self.settings_get(tg_id)
+
+    async def settings_set_morning_queue(self, tg_id: int, queue: str) -> dict:
+        await self.storage.set_morning_report_queue(tg_id, queue)
+        _settings_cache.invalidate(tg_id)
+        return await self.settings_get(tg_id)
+
+    async def settings_set_morning_limit(self, tg_id: int, limit: int) -> dict:
+        await self.storage.set_morning_report_limit(tg_id, limit)
+        _settings_cache.invalidate(tg_id)
+        return await self.settings_get(tg_id)
+
+    async def settings_set_evening_enabled(self, tg_id: int, enabled: bool) -> dict:
+        await self.storage.set_evening_report_enabled(tg_id, enabled)
+        _settings_cache.invalidate(tg_id)
+        return await self.settings_get(tg_id)
+
+    async def get_users_with_morning_report(self) -> list[dict]:
+        return await self.storage.get_users_with_morning_report()
+
+    async def get_users_with_evening_report(self) -> list[dict]:
+        return await self.storage.get_users_with_evening_report()
+
+    async def morning_report(self, tg_id: int, queue: str = "", limit: int = 10) -> dict:
+        """Get morning report: open issues in queue."""
+        access, err = await self._get_valid_access_token(tg_id)
+        if err:
+            return err
+
+        # Use provided queue or get from settings
+        if not queue:
+            s = await self.storage.get_settings(tg_id)
+            queue = s.get("morning_report_queue", "")
+            limit = s.get("morning_report_limit", 10)
+
+        if not queue:
+            return {"http_status": 400, "body": {"error": "Очередь не указана"}}
+
+        query = f"Queue: {queue} AND Resolution: empty() Sort by: Updated DESC"
+
+        try:
+            st, payload = await self.tracker.search_issues(access, query=query, limit=limit)
+        except Exception as e:
+            return {"http_status": 503, "body": {"error": f"Search failed: {type(e).__name__}"}}
+
+        if st != 200:
+            return {"http_status": 200, "body": {"status_code": st, "response": payload}}
+
+        issues_raw = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
+
+        issues = []
+        for issue in issues_raw[:limit]:
+            issues.append({
+                "key": issue.get("key", ""),
+                "summary": issue.get("summary", ""),
+                "status": (issue.get("status") or {}).get("display", ""),
+                "updatedAt": issue.get("updatedAt", ""),
+                "url": f"https://tracker.yandex.ru/{issue.get('key', '')}"
+            })
+
+        return {
+            "http_status": 200,
+            "body": {
+                "queue": queue,
+                "count": len(issues),
+                "issues": issues
+            }
+        }
+
+    async def evening_report(self, tg_id: int, queue: str = "") -> dict:
+        """Get evening report: issues closed today in queue."""
+        access, err = await self._get_valid_access_token(tg_id)
+        if err:
+            return err
+
+        # Use provided queue or get from settings (same as morning)
+        if not queue:
+            s = await self.storage.get_settings(tg_id)
+            queue = s.get("morning_report_queue", "")
+
+        if not queue:
+            return {"http_status": 400, "body": {"error": "Очередь не указана"}}
+
+        # Closed today
+        query = f'Queue: {queue} AND Resolution: !empty() AND Resolved: >= today() Sort by: Resolved DESC'
+
+        try:
+            st, payload = await self.tracker.search_issues(access, query=query, limit=50)
+        except Exception as e:
+            return {"http_status": 503, "body": {"error": f"Search failed: {type(e).__name__}"}}
+
+        if st != 200:
+            return {"http_status": 200, "body": {"status_code": st, "response": payload}}
+
+        issues_raw = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
+
+        issues = []
+        for issue in issues_raw:
+            issues.append({
+                "key": issue.get("key", ""),
+                "summary": issue.get("summary", ""),
+                "status": (issue.get("status") or {}).get("display", ""),
+                "resolvedAt": issue.get("resolvedAt", ""),
+                "url": f"https://tracker.yandex.ru/{issue.get('key', '')}"
+            })
+
+        return {
+            "http_status": 200,
+            "body": {
+                "queue": queue,
+                "count": len(issues),
+                "issues": issues
+            }
+        }
+
+    async def queue_stats(self, tg_id: int, queue: str, period: str = "today") -> dict:
+        """Get queue statistics for period."""
+        access, err = await self._get_valid_access_token(tg_id)
+        if err:
+            return err
+
+        if not queue:
+            return {"http_status": 400, "body": {"error": "Очередь не указана"}}
+
+        # Build date filter based on period
+        if period == "today":
+            date_filter = "today()"
+        elif period == "week":
+            date_filter = "now()-7d"
+        elif period == "month":
+            date_filter = "now()-30d"
+        else:
+            # Custom date range: period = "2024-01-01,2024-01-31"
+            if "," in period:
+                start, end = period.split(",", 1)
+                date_filter = None  # Will use custom filter
+            else:
+                date_filter = "now()-7d"  # default to week
+
+        stats = {"queue": queue, "period": period, "created": 0, "in_progress": 0, "closed": 0}
+
+        try:
+            # Count created
+            if date_filter:
+                query = f"Queue: {queue} AND Created: >= {date_filter}"
+            else:
+                query = f'Queue: {queue} AND Created: >= "{start}" AND Created: <= "{end}"'
+            st, payload = await self.tracker.search_issues(access, query=query, limit=200)
+            if st == 200:
+                issues = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
+                stats["created"] = len(issues)
+
+            # Count in progress (open)
+            query = f"Queue: {queue} AND Resolution: empty()"
+            st, payload = await self.tracker.search_issues(access, query=query, limit=200)
+            if st == 200:
+                issues = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
+                stats["in_progress"] = len(issues)
+
+            # Count closed in period
+            if date_filter:
+                query = f"Queue: {queue} AND Resolved: >= {date_filter}"
+            else:
+                query = f'Queue: {queue} AND Resolved: >= "{start}" AND Resolved: <= "{end}"'
+            st, payload = await self.tracker.search_issues(access, query=query, limit=200)
+            if st == 200:
+                issues = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
+                stats["closed"] = len(issues)
+
+        except Exception as e:
+            return {"http_status": 503, "body": {"error": f"Stats failed: {type(e).__name__}"}}
+
+        return {"http_status": 200, "body": stats}
 
     async def get_users_with_reminder(self) -> list[dict]:
         return await self.storage.get_users_with_reminder()
@@ -1266,12 +1447,104 @@ async def tg_settings_reminder(tg: int = Query(..., ge=1), hours: int = Query(..
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
+@app.post("/tg/settings/morning_enabled")
+async def tg_settings_morning_enabled(tg: int = Query(..., ge=1), enabled: bool = Query(...)):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.settings_set_morning_enabled(tg, enabled)  # type: ignore
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.post("/tg/settings/morning_queue")
+async def tg_settings_morning_queue(tg: int = Query(..., ge=1), queue: str = Query(...)):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.settings_set_morning_queue(tg, queue)  # type: ignore
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.post("/tg/settings/morning_limit")
+async def tg_settings_morning_limit(tg: int = Query(..., ge=1), limit: int = Query(..., ge=5, le=20)):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.settings_set_morning_limit(tg, limit)  # type: ignore
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.post("/tg/settings/evening_enabled")
+async def tg_settings_evening_enabled(tg: int = Query(..., ge=1), enabled: bool = Query(...)):
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.settings_set_evening_enabled(tg, enabled)  # type: ignore
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.get("/tracker/morning_report")
+async def tracker_morning_report(
+    tg: int = Query(..., ge=1),
+    queue: str = Query(""),
+    limit: int = Query(10, ge=1, le=50)
+):
+    """Get morning report: open issues in queue."""
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.morning_report(tg, queue, limit)  # type: ignore
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.get("/tracker/evening_report")
+async def tracker_evening_report(tg: int = Query(..., ge=1), queue: str = Query("")):
+    """Get evening report: issues closed today in queue."""
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.evening_report(tg, queue)  # type: ignore
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.get("/tracker/queue_stats")
+async def tracker_queue_stats(
+    tg: int = Query(..., ge=1),
+    queue: str = Query(..., min_length=1),
+    period: str = Query("today")
+):
+    """Get queue statistics: created, in_progress, closed."""
+    err = _check_config()
+    if err:
+        return err
+    result = await _service.queue_stats(tg, queue, period)  # type: ignore
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
 @app.get("/tg/users_with_reminder")
 async def tg_users_with_reminder():
     err = _check_config()
     if err:
         return err
     users = await _service.get_users_with_reminder()  # type: ignore
+    return JSONResponse({"users": users})
+
+
+@app.get("/tg/users_with_morning_report")
+async def tg_users_with_morning_report():
+    err = _check_config()
+    if err:
+        return err
+    users = await _service.get_users_with_morning_report()  # type: ignore
+    return JSONResponse({"users": users})
+
+
+@app.get("/tg/users_with_evening_report")
+async def tg_users_with_evening_report():
+    err = _check_config()
+    if err:
+        return err
+    users = await _service.get_users_with_evening_report()  # type: ignore
     return JSONResponse({"users": users})
 
 

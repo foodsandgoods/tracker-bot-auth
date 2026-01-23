@@ -321,8 +321,10 @@ def kb_settings_main() -> InlineKeyboardMarkup:
     kb.button(text="Период", callback_data="st:days")
     kb.button(text="Лимит", callback_data="st:limit")
     kb.button(text="🔔 Напоминание", callback_data="st:reminder")
+    kb.button(text="🌅 Утренний отчёт", callback_data="st:morning")
+    kb.button(text="🌆 Вечерний отчёт", callback_data="st:evening")
     kb.button(text="Закрыть", callback_data="st:close")
-    kb.adjust(2, 2, 1)
+    kb.adjust(2, 2, 2, 1)
     return kb.as_markup()
 
 
@@ -439,6 +441,53 @@ def kb_settings_reminder(reminder: int) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+def kb_settings_morning(enabled: bool, queue: str, limit: int) -> InlineKeyboardMarkup:
+    """Morning report settings keyboard."""
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text=f"{'✅' if enabled else '❌'} {'Включён' if enabled else 'Выключен'}",
+        callback_data=f"st:morning_toggle"
+    )
+    kb.button(text=f"📋 Очередь: {queue or '—'}", callback_data="st:morning_queue")
+    kb.button(text=f"🔢 Лимит: {limit}", callback_data="st:morning_limit")
+    kb.button(text="Назад", callback_data="st:back")
+    kb.adjust(1, 2, 1)
+    return kb.as_markup()
+
+
+def kb_morning_queue_select(current: str) -> InlineKeyboardMarkup:
+    """Queue selection for morning report."""
+    kb = InlineKeyboardBuilder()
+    for q in QUEUES_LIST:
+        kb.button(text=f"{'✅' if q == current else '⬜'} {q}", callback_data=f"st:morning_qset:{q}")
+    kb.button(text="Назад", callback_data="st:morning")
+    kb.adjust(4, 3, 1)
+    return kb.as_markup()
+
+
+def kb_morning_limit_select(current: int) -> InlineKeyboardMarkup:
+    """Limit selection for morning report."""
+    kb = InlineKeyboardBuilder()
+    for n in [5, 10, 20]:
+        kb.button(text=f"{'✅' if n == current else '⬜'} {n}", callback_data=f"st:morning_lset:{n}")
+    kb.button(text="Назад", callback_data="st:morning")
+    kb.adjust(3, 1)
+    return kb.as_markup()
+
+
+def kb_settings_evening(enabled: bool, queue: str) -> InlineKeyboardMarkup:
+    """Evening report settings keyboard."""
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text=f"{'✅' if enabled else '❌'} {'Включён' if enabled else 'Выключен'}",
+        callback_data=f"st:evening_toggle"
+    )
+    kb.button(text=f"📋 Очередь: {queue or '(= утренняя)'}", callback_data="st:evening_info")
+    kb.button(text="Назад", callback_data="st:back")
+    kb.adjust(1, 1, 1)
+    return kb.as_markup()
+
+
 def kb_summary_actions(issue_key: str, extended: bool = False) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="🔄 Обновить", callback_data=f"sum:refresh:{issue_key}")
@@ -476,6 +525,23 @@ async def get_settings(tg_id: int) -> Optional[Tuple[List[str], int, int, int]]:
         int(data.get("limit", 10)),
         int(data.get("reminder", 0))
     )
+
+
+async def get_full_settings(tg_id: int) -> Optional[dict]:
+    """Get all user settings as a dict."""
+    sc, data = await api_request("GET", "/tg/settings", {"tg": tg_id})
+    if sc != 200:
+        return None
+    return {
+        "queues": data.get("queues") or [],
+        "days": int(data.get("days", 30)),
+        "limit": int(data.get("limit", 10)),
+        "reminder": int(data.get("reminder", 0)),
+        "morning_enabled": bool(data.get("morning_report_enabled", False)),
+        "morning_queue": data.get("morning_report_queue", ""),
+        "morning_limit": int(data.get("morning_report_limit", 10)),
+        "evening_enabled": bool(data.get("evening_report_enabled", False)),
+    }
 
 
 def build_checklist_response(
@@ -553,8 +619,11 @@ async def cmd_menu(m: Message):
         "👤 /me — проверить доступ\n"
         "⚙️ /settings — настройки\n\n"
         "✅ /cl\\_my — задачи с моим ОК\n"
-        "❓ /cl\\_my\\_open — ожидают согласование\n\n"
-        "📣 /mentions — требующие ответа\n"
+        "❓ /cl\\_my\\_open — ждут моего ОК\n"
+        "📣 /mentions — требующие ответа\n\n"
+        "🌅 /morning — утренний отчёт\n"
+        "🌆 /evening — вечерний отчёт\n"
+        "📊 /stats — статистика\n\n"
         "🤖 /summary ISSUE — резюме (ИИ)\n"
         "🔍 /ai ЗАПРОС — поиск (ИИ)\n"
         "📝 /new — создать задачу",
@@ -748,6 +817,128 @@ async def cmd_cl_done(m: Message):
         await m.answer(f"✅ Отмечен: {issue_key} / {item_id}")
     else:
         await m.answer(f"❌ Ошибка {sc}: {data}"[:200])
+
+
+@router.message(Command("morning"))
+@require_base_url
+async def cmd_morning(m: Message):
+    """Get morning report: open issues in queue."""
+    tg_id = m.from_user.id
+    full_settings = await get_full_settings(tg_id)
+    
+    queue = full_settings.get("morning_queue", "") if full_settings else ""
+    limit = full_settings.get("morning_limit", 10) if full_settings else 10
+    
+    if not queue:
+        await m.answer("❌ Очередь не настроена. /settings → Утренний отчёт")
+        return
+    
+    loading = await m.answer(f"🌅 Загружаю открытые задачи {queue}...")
+    
+    sc, data = await api_request(
+        "GET", "/tracker/morning_report",
+        {"tg": tg_id, "queue": queue, "limit": limit},
+        long_timeout=True
+    )
+    
+    if sc != 200:
+        await loading.edit_text(f"❌ Ошибка {sc}: {data.get('error', data)}"[:500])
+        return
+    
+    issues = data.get("issues", [])
+    count = data.get("count", 0)
+    
+    if not issues:
+        await loading.edit_text(f"🌅 *{queue}*: нет открытых задач", parse_mode="Markdown")
+        return
+    
+    lines = [f"🌅 *Утренний отчёт — {queue}* ({count} задач)\n"]
+    for idx, issue in enumerate(issues, 1):
+        key = issue.get("key", "")
+        summary = escape_md(issue.get("summary", "")[:50])
+        status = issue.get("status", "")
+        url = issue.get("url", f"https://tracker.yandex.ru/{key}")
+        lines.append(f"{idx}. [{key}]({url}): {summary}")
+        if status:
+            lines.append(f"   _{status}_")
+    
+    text = "\n".join(lines)
+    await loading.edit_text(text[:4000], parse_mode="Markdown")
+
+
+@router.message(Command("evening"))
+@require_base_url
+async def cmd_evening(m: Message):
+    """Get evening report: issues closed today."""
+    tg_id = m.from_user.id
+    full_settings = await get_full_settings(tg_id)
+    
+    queue = full_settings.get("morning_queue", "") if full_settings else ""
+    
+    if not queue:
+        await m.answer("❌ Очередь не настроена. /settings → Утренний отчёт")
+        return
+    
+    loading = await m.answer(f"🌆 Загружаю закрытые сегодня задачи {queue}...")
+    
+    sc, data = await api_request(
+        "GET", "/tracker/evening_report",
+        {"tg": tg_id, "queue": queue},
+        long_timeout=True
+    )
+    
+    if sc != 200:
+        await loading.edit_text(f"❌ Ошибка {sc}: {data.get('error', data)}"[:500])
+        return
+    
+    issues = data.get("issues", [])
+    count = data.get("count", 0)
+    
+    if not issues:
+        await loading.edit_text(f"🌆 *{queue}*: сегодня ничего не закрыто", parse_mode="Markdown")
+        return
+    
+    lines = [f"🌆 *Вечерний отчёт — {queue}* ({count} закрыто сегодня)\n"]
+    for idx, issue in enumerate(issues, 1):
+        key = issue.get("key", "")
+        summary = escape_md(issue.get("summary", "")[:50])
+        url = issue.get("url", f"https://tracker.yandex.ru/{key}")
+        lines.append(f"{idx}. [{key}]({url}): {summary}")
+    
+    text = "\n".join(lines)
+    await loading.edit_text(text[:4000], parse_mode="Markdown")
+
+
+@router.message(Command("stats"))
+@require_base_url
+async def cmd_stats(m: Message):
+    """Get queue statistics."""
+    await m.answer(
+        "📊 *Статистика по очереди*\n\nВыберите очередь:",
+        parse_mode="Markdown",
+        reply_markup=kb_stats_queue()
+    )
+
+
+def kb_stats_queue() -> InlineKeyboardMarkup:
+    """Queue selection for stats."""
+    kb = InlineKeyboardBuilder()
+    for q in QUEUES_LIST:
+        kb.button(text=q, callback_data=f"stats:queue:{q}")
+    kb.button(text="❌ Отмена", callback_data="stats:cancel")
+    kb.adjust(4, 3, 1)
+    return kb.as_markup()
+
+
+def kb_stats_period(queue: str) -> InlineKeyboardMarkup:
+    """Period selection for stats."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📆 Сегодня", callback_data=f"stats:period:{queue}:today")
+    kb.button(text="📅 Неделя", callback_data=f"stats:period:{queue}:week")
+    kb.button(text="🗓 Месяц", callback_data=f"stats:period:{queue}:month")
+    kb.button(text="⬅️ Назад", callback_data="stats:back")
+    kb.adjust(3, 1)
+    return kb.as_markup()
 
 
 async def process_summary(m: Message, issue_key: str, tg_id: int):
@@ -990,6 +1181,8 @@ async def handle_callback(c: CallbackQuery):
         await handle_summary_callback(c)
     elif data.startswith("new:"):
         await handle_new_issue_callback(c)
+    elif data.startswith("stats:"):
+        await handle_stats_callback(c)
     else:
         await c.answer()
 
@@ -1466,6 +1659,95 @@ async def handle_new_issue_callback(c: CallbackQuery):
     await c.answer()
 
 
+async def handle_stats_callback(c: CallbackQuery):
+    """Handle stats callbacks."""
+    tg_id = c.from_user.id
+    data = c.data or ""
+    parts = data.split(":")
+    
+    if len(parts) < 2:
+        await c.answer()
+        return
+    
+    action = parts[1]
+    
+    # Cancel
+    if action == "cancel":
+        await c.answer("Отменено")
+        if c.message:
+            try:
+                await c.message.delete()
+            except Exception:
+                pass
+        return
+    
+    # Back to queue selection
+    if action == "back":
+        await c.answer()
+        if c.message:
+            await c.message.edit_text(
+                "📊 *Статистика по очереди*\n\nВыберите очередь:",
+                parse_mode="Markdown",
+                reply_markup=kb_stats_queue()
+            )
+        return
+    
+    # Queue selected
+    if action == "queue" and len(parts) >= 3:
+        queue = parts[2].upper()
+        await c.answer()
+        if c.message:
+            await c.message.edit_text(
+                f"📊 *Статистика — {queue}*\n\nВыберите период:",
+                parse_mode="Markdown",
+                reply_markup=kb_stats_period(queue)
+            )
+        return
+    
+    # Period selected - show stats
+    if action == "period" and len(parts) >= 4:
+        queue = parts[2].upper()
+        period = parts[3]
+        await c.answer("⏳ Загружаю...")
+        
+        sc, data_resp = await api_request(
+            "GET", "/tracker/queue_stats",
+            {"tg": tg_id, "queue": queue, "period": period},
+            long_timeout=True
+        )
+        
+        if sc != 200:
+            if c.message:
+                await c.message.edit_text(f"❌ Ошибка {sc}: {data_resp.get('error', data_resp)}"[:500])
+            return
+        
+        created = data_resp.get("created", 0)
+        in_progress = data_resp.get("in_progress", 0)
+        closed = data_resp.get("closed", 0)
+        
+        period_names = {"today": "сегодня", "week": "за неделю", "month": "за месяц"}
+        period_text = period_names.get(period, period)
+        
+        text = (
+            f"📊 *Статистика — {queue}* ({period_text})\n\n"
+            f"📝 Создано: {created}\n"
+            f"🔄 В работе: {in_progress}\n"
+            f"✅ Закрыто: {closed}"
+        )
+        
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔄 Обновить", callback_data=f"stats:period:{queue}:{period}")
+        kb.button(text="⬅️ Другой период", callback_data=f"stats:queue:{queue}")
+        kb.button(text="📋 Другая очередь", callback_data="stats:back")
+        kb.adjust(1, 2)
+        
+        if c.message:
+            await c.message.edit_text(text, parse_mode="Markdown", reply_markup=kb.as_markup())
+        return
+    
+    await c.answer()
+
+
 async def handle_settings_callback(c: CallbackQuery):
     """Handle settings callbacks."""
     if not settings.base_url:
@@ -1576,6 +1858,130 @@ async def handle_settings_callback(c: CallbackQuery):
         if sc2 == 200 and c.message:
             await c.message.edit_reply_markup(reply_markup=kb_settings_reminder(int(data2.get("reminder", h))))
         await c.answer("✅" if sc2 == 200 else f"❌ {sc2}")
+        return
+
+    # Morning report settings
+    if action == "morning":
+        full_settings = await get_full_settings(tg_id)
+        if full_settings and c.message:
+            await c.message.edit_text(
+                "🌅 *Утренний отчёт* (09:00)\n\n"
+                "Список открытых задач из выбранной очереди.",
+                parse_mode="Markdown",
+                reply_markup=kb_settings_morning(
+                    full_settings["morning_enabled"],
+                    full_settings["morning_queue"],
+                    full_settings["morning_limit"]
+                )
+            )
+        await c.answer()
+        return
+
+    if action == "morning_toggle":
+        full_settings = await get_full_settings(tg_id)
+        if full_settings:
+            new_val = not full_settings["morning_enabled"]
+            sc2, _ = await api_request("POST", "/tg/settings/morning_enabled", {"tg": tg_id, "enabled": new_val})
+            if sc2 == 200 and c.message:
+                await c.message.edit_reply_markup(
+                    reply_markup=kb_settings_morning(new_val, full_settings["morning_queue"], full_settings["morning_limit"])
+                )
+            await c.answer("✅" if sc2 == 200 else f"❌ {sc2}")
+        return
+
+    if action == "morning_queue":
+        full_settings = await get_full_settings(tg_id)
+        if full_settings and c.message:
+            await c.message.edit_text(
+                "🌅 Выберите очередь для утреннего отчёта:",
+                reply_markup=kb_morning_queue_select(full_settings["morning_queue"])
+            )
+        await c.answer()
+        return
+
+    if action == "morning_qset":
+        q = arg.upper()
+        sc2, _ = await api_request("POST", "/tg/settings/morning_queue", {"tg": tg_id, "queue": q})
+        if sc2 == 200:
+            full_settings = await get_full_settings(tg_id)
+            if full_settings and c.message:
+                await c.message.edit_text(
+                    "🌅 *Утренний отчёт* (09:00)\n\n"
+                    "Список открытых задач из выбранной очереди.",
+                    parse_mode="Markdown",
+                    reply_markup=kb_settings_morning(
+                        full_settings["morning_enabled"],
+                        full_settings["morning_queue"],
+                        full_settings["morning_limit"]
+                    )
+                )
+        await c.answer("✅" if sc2 == 200 else f"❌ {sc2}")
+        return
+
+    if action == "morning_limit":
+        full_settings = await get_full_settings(tg_id)
+        if full_settings and c.message:
+            await c.message.edit_text(
+                "🌅 Выберите лимит задач:",
+                reply_markup=kb_morning_limit_select(full_settings["morning_limit"])
+            )
+        await c.answer()
+        return
+
+    if action == "morning_lset":
+        try:
+            n = int(arg)
+        except ValueError:
+            await c.answer("❌ Ошибка", show_alert=True)
+            return
+        sc2, _ = await api_request("POST", "/tg/settings/morning_limit", {"tg": tg_id, "limit": n})
+        if sc2 == 200:
+            full_settings = await get_full_settings(tg_id)
+            if full_settings and c.message:
+                await c.message.edit_text(
+                    "🌅 *Утренний отчёт* (09:00)\n\n"
+                    "Список открытых задач из выбранной очереди.",
+                    parse_mode="Markdown",
+                    reply_markup=kb_settings_morning(
+                        full_settings["morning_enabled"],
+                        full_settings["morning_queue"],
+                        full_settings["morning_limit"]
+                    )
+                )
+        await c.answer("✅" if sc2 == 200 else f"❌ {sc2}")
+        return
+
+    # Evening report settings
+    if action == "evening":
+        full_settings = await get_full_settings(tg_id)
+        if full_settings and c.message:
+            await c.message.edit_text(
+                "🌆 *Вечерний отчёт* (19:00)\n\n"
+                "Список закрытых сегодня задач.\n"
+                "Очередь = утренняя.",
+                parse_mode="Markdown",
+                reply_markup=kb_settings_evening(
+                    full_settings["evening_enabled"],
+                    full_settings["morning_queue"]
+                )
+            )
+        await c.answer()
+        return
+
+    if action == "evening_toggle":
+        full_settings = await get_full_settings(tg_id)
+        if full_settings:
+            new_val = not full_settings["evening_enabled"]
+            sc2, _ = await api_request("POST", "/tg/settings/evening_enabled", {"tg": tg_id, "enabled": new_val})
+            if sc2 == 200 and c.message:
+                await c.message.edit_reply_markup(
+                    reply_markup=kb_settings_evening(new_val, full_settings["morning_queue"])
+                )
+            await c.answer("✅" if sc2 == 200 else f"❌ {sc2}")
+        return
+
+    if action == "evening_info":
+        await c.answer("Очередь берётся из утреннего отчёта", show_alert=True)
         return
 
     await c.answer()
@@ -1718,8 +2124,10 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="settings", description="⚙️ Настройки"),
         BotCommand(command="cl_my", description="✅ Задачи с моим ОК"),
         BotCommand(command="cl_my_open", description="❓ Ждут моего ОК"),
-        # BotCommand(command="done", description="✔️ Отметить пункт"),  # TODO: временно отключено
         BotCommand(command="mentions", description="📣 Требующие ответа"),
+        BotCommand(command="morning", description="🌅 Утренний отчёт"),
+        BotCommand(command="evening", description="🌆 Вечерний отчёт"),
+        BotCommand(command="stats", description="📊 Статистика"),
         BotCommand(command="summary", description="🤖 Резюме (ИИ)"),
         BotCommand(command="ai", description="🔍 Поиск (ИИ)"),
         BotCommand(command="new", description="📝 Создать задачу"),
@@ -1910,6 +2318,146 @@ async def reminder_worker():
             continue
 
 
+async def morning_report_worker():
+    """Send morning reports at 09:00 Moscow time."""
+    await asyncio.sleep(120)  # Wait for startup
+    
+    last_sent_date: Dict[int, str] = {}  # tg_id -> date string
+    
+    while not state.shutdown_event.is_set():
+        try:
+            moscow_tz = timezone(timedelta(hours=3))
+            now = datetime.now(moscow_tz)
+            today_str = now.strftime("%Y-%m-%d")
+            
+            # Send between 09:00 and 09:30
+            if now.hour == 9 and now.minute < 30:
+                if state.bot and settings.base_url:
+                    # Get users with morning report enabled
+                    sc, data = await api_request("GET", "/tg/users_with_morning_report", {})
+                    if sc == 200:
+                        for user in data.get("users", []):
+                            tg_id = user.get("tg_id")
+                            queue = user.get("morning_report_queue", "")
+                            limit = user.get("morning_report_limit", 10)
+                            
+                            if not tg_id or not queue:
+                                continue
+                            
+                            # Check if already sent today
+                            if last_sent_date.get(tg_id) == today_str:
+                                continue
+                            
+                            try:
+                                sc2, data2 = await api_request(
+                                    "GET", "/tracker/morning_report",
+                                    {"tg": tg_id, "queue": queue, "limit": limit},
+                                    long_timeout=True
+                                )
+                                
+                                if sc2 == 200:
+                                    issues = data2.get("issues", [])
+                                    count = data2.get("count", 0)
+                                    
+                                    if issues:
+                                        lines = [f"🌅 *Утренний отчёт — {queue}* ({count} задач)\n"]
+                                        for idx, issue in enumerate(issues[:10], 1):
+                                            key = issue.get("key", "")
+                                            summary = escape_md(issue.get("summary", "")[:40])
+                                            url = issue.get("url", "")
+                                            lines.append(f"{idx}. [{key}]({url}): {summary}")
+                                        
+                                        await state.bot.send_message(
+                                            tg_id, "\n".join(lines), parse_mode="Markdown"
+                                        )
+                                    
+                                    last_sent_date[tg_id] = today_str
+                            except Exception:
+                                pass
+                            
+                            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.debug(f"Morning report worker error: {e}")
+        
+        # Check every 5 minutes
+        try:
+            await asyncio.wait_for(state.shutdown_event.wait(), timeout=300)
+            break
+        except asyncio.TimeoutError:
+            continue
+
+
+async def evening_report_worker():
+    """Send evening reports at 19:00 Moscow time."""
+    await asyncio.sleep(180)  # Wait for startup
+    
+    last_sent_date: Dict[int, str] = {}  # tg_id -> date string
+    
+    while not state.shutdown_event.is_set():
+        try:
+            moscow_tz = timezone(timedelta(hours=3))
+            now = datetime.now(moscow_tz)
+            today_str = now.strftime("%Y-%m-%d")
+            
+            # Send between 19:00 and 19:30
+            if now.hour == 19 and now.minute < 30:
+                if state.bot and settings.base_url:
+                    # Get users with evening report enabled
+                    sc, data = await api_request("GET", "/tg/users_with_evening_report", {})
+                    if sc == 200:
+                        for user in data.get("users", []):
+                            tg_id = user.get("tg_id")
+                            queue = user.get("queue", "")
+                            
+                            if not tg_id or not queue:
+                                continue
+                            
+                            # Check if already sent today
+                            if last_sent_date.get(tg_id) == today_str:
+                                continue
+                            
+                            try:
+                                sc2, data2 = await api_request(
+                                    "GET", "/tracker/evening_report",
+                                    {"tg": tg_id, "queue": queue},
+                                    long_timeout=True
+                                )
+                                
+                                if sc2 == 200:
+                                    issues = data2.get("issues", [])
+                                    count = data2.get("count", 0)
+                                    
+                                    lines = [f"🌆 *Вечерний отчёт — {queue}*\n"]
+                                    if issues:
+                                        lines[0] = f"🌆 *Вечерний отчёт — {queue}* ({count} закрыто)\n"
+                                        for idx, issue in enumerate(issues[:10], 1):
+                                            key = issue.get("key", "")
+                                            summary = escape_md(issue.get("summary", "")[:40])
+                                            url = issue.get("url", "")
+                                            lines.append(f"{idx}. [{key}]({url}): {summary}")
+                                    else:
+                                        lines.append("Сегодня ничего не закрыто")
+                                    
+                                    await state.bot.send_message(
+                                        tg_id, "\n".join(lines), parse_mode="Markdown"
+                                    )
+                                    
+                                    last_sent_date[tg_id] = today_str
+                            except Exception:
+                                pass
+                            
+                            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.debug(f"Evening report worker error: {e}")
+        
+        # Check every 5 minutes
+        try:
+            await asyncio.wait_for(state.shutdown_event.wait(), timeout=300)
+            break
+        except asyncio.TimeoutError:
+            continue
+
+
 async def shutdown():
     """Graceful shutdown."""
     logger.info("Shutting down...")
@@ -1933,6 +2481,8 @@ async def main():
         "bot": asyncio.create_task(run_bot()),
         "keepalive": asyncio.create_task(keep_alive()),
         "reminder": asyncio.create_task(reminder_worker()),
+        "morning_report": asyncio.create_task(morning_report_worker()),
+        "evening_report": asyncio.create_task(evening_report_worker()),
     }
     
     logger.info(f"Starting tracker-bot on port {settings.port}")

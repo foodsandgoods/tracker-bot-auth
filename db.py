@@ -122,6 +122,23 @@ class TokenStorage:
                 ALTER TABLE tg_settings
                 ADD COLUMN IF NOT EXISTS reminder_hours INT NOT NULL DEFAULT 0;
             """)
+            # New columns for morning/evening reports
+            await conn.execute("""
+                ALTER TABLE tg_settings
+                ADD COLUMN IF NOT EXISTS morning_report_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+            """)
+            await conn.execute("""
+                ALTER TABLE tg_settings
+                ADD COLUMN IF NOT EXISTS morning_report_queue TEXT NOT NULL DEFAULT '';
+            """)
+            await conn.execute("""
+                ALTER TABLE tg_settings
+                ADD COLUMN IF NOT EXISTS morning_report_limit INT NOT NULL DEFAULT 10;
+            """)
+            await conn.execute("""
+                ALTER TABLE tg_settings
+                ADD COLUMN IF NOT EXISTS evening_report_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+            """)
             logger.info("Database schema ready")
         finally:
             await self._pool.release(conn)  # type: ignore
@@ -216,12 +233,19 @@ class TokenStorage:
         conn = await self._acquire()
         try:
             row = await conn.fetchrow(
-                "SELECT queues_csv, days, limit_results, reminder_hours FROM tg_settings WHERE tg_id=$1",
+                """SELECT queues_csv, days, limit_results, reminder_hours,
+                          morning_report_enabled, morning_report_queue, morning_report_limit,
+                          evening_report_enabled
+                   FROM tg_settings WHERE tg_id=$1""",
                 tg_id
             )
             if row:
                 return dict(row)
-            return {"queues_csv": "", "days": 30, "limit_results": 10, "reminder_hours": 0}
+            return {
+                "queues_csv": "", "days": 30, "limit_results": 10, "reminder_hours": 0,
+                "morning_report_enabled": False, "morning_report_queue": "", "morning_report_limit": 10,
+                "evening_report_enabled": False
+            }
         finally:
             await self._pool.release(conn)  # type: ignore
 
@@ -291,6 +315,101 @@ class TokenStorage:
         try:
             rows = await conn.fetch(
                 "SELECT tg_id, reminder_hours FROM tg_settings WHERE reminder_hours > 0"
+            )
+            return [dict(r) for r in rows] if rows else []
+        finally:
+            await self._pool.release(conn)  # type: ignore
+
+    # -------------------------------------------------------------------------
+    # Morning/Evening report settings
+    # -------------------------------------------------------------------------
+    async def set_morning_report(
+        self, tg_id: int, enabled: bool, queue: str = "", limit: int = 10
+    ) -> None:
+        """Set morning report settings."""
+        limit = limit if limit in (5, 10, 20) else 10
+        queue = queue.upper().strip()
+        conn = await self._acquire()
+        try:
+            await conn.execute("""
+                INSERT INTO tg_settings (tg_id, morning_report_enabled, morning_report_queue, morning_report_limit, updated_at)
+                VALUES ($1, $2, $3, $4, NOW())
+                ON CONFLICT (tg_id) DO UPDATE SET
+                    morning_report_enabled = EXCLUDED.morning_report_enabled,
+                    morning_report_queue = EXCLUDED.morning_report_queue,
+                    morning_report_limit = EXCLUDED.morning_report_limit,
+                    updated_at = NOW();
+            """, tg_id, enabled, queue, limit)
+        finally:
+            await self._pool.release(conn)  # type: ignore
+
+    async def set_morning_report_enabled(self, tg_id: int, enabled: bool) -> None:
+        """Toggle morning report on/off."""
+        conn = await self._acquire()
+        try:
+            await conn.execute("""
+                UPDATE tg_settings SET morning_report_enabled = $2, updated_at = NOW()
+                WHERE tg_id = $1;
+            """, tg_id, enabled)
+        finally:
+            await self._pool.release(conn)  # type: ignore
+
+    async def set_morning_report_queue(self, tg_id: int, queue: str) -> None:
+        """Set morning report queue."""
+        queue = queue.upper().strip()
+        conn = await self._acquire()
+        try:
+            await conn.execute("""
+                UPDATE tg_settings SET morning_report_queue = $2, updated_at = NOW()
+                WHERE tg_id = $1;
+            """, tg_id, queue)
+        finally:
+            await self._pool.release(conn)  # type: ignore
+
+    async def set_morning_report_limit(self, tg_id: int, limit: int) -> None:
+        """Set morning report limit."""
+        limit = limit if limit in (5, 10, 20) else 10
+        conn = await self._acquire()
+        try:
+            await conn.execute("""
+                UPDATE tg_settings SET morning_report_limit = $2, updated_at = NOW()
+                WHERE tg_id = $1;
+            """, tg_id, limit)
+        finally:
+            await self._pool.release(conn)  # type: ignore
+
+    async def set_evening_report_enabled(self, tg_id: int, enabled: bool) -> None:
+        """Toggle evening report on/off."""
+        conn = await self._acquire()
+        try:
+            await conn.execute("""
+                UPDATE tg_settings SET evening_report_enabled = $2, updated_at = NOW()
+                WHERE tg_id = $1;
+            """, tg_id, enabled)
+        finally:
+            await self._pool.release(conn)  # type: ignore
+
+    async def get_users_with_morning_report(self) -> list[dict]:
+        """Get all users with morning report enabled."""
+        conn = await self._acquire()
+        try:
+            rows = await conn.fetch(
+                """SELECT tg_id, morning_report_queue, morning_report_limit 
+                   FROM tg_settings 
+                   WHERE morning_report_enabled = TRUE AND morning_report_queue != ''"""
+            )
+            return [dict(r) for r in rows] if rows else []
+        finally:
+            await self._pool.release(conn)  # type: ignore
+
+    async def get_users_with_evening_report(self) -> list[dict]:
+        """Get all users with evening report enabled."""
+        conn = await self._acquire()
+        try:
+            rows = await conn.fetch(
+                """SELECT tg_id, morning_report_queue as queue
+                   FROM tg_settings 
+                   WHERE evening_report_enabled = TRUE AND morning_report_queue != ''"""
             )
             return [dict(r) for r in rows] if rows else []
         finally:
