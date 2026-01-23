@@ -882,7 +882,7 @@ async def cmd_morning(m: Message):
     
     sc, data = await api_request(
         "GET", "/tracker/morning_report",
-        {"tg": tg_id, "queue": queue, "limit": limit},
+        {"tg": tg_id, "queue": queue, "limit": limit, "date_offset": 0},
         long_timeout=True
     )
     
