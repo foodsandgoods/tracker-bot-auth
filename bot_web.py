@@ -2016,13 +2016,13 @@ async def handle_stats_callback(c: CallbackQuery):
         today_str = now.strftime("%d.%m")
         
         if period == "today":
-            period_text = f"сегодня ({today_str})"
+            period_text = f"сегодня {today_str}"
         elif period == "week":
             week_ago = now - timedelta(days=7)
-            period_text = f"за неделю ({week_ago.strftime('%d.%m')} — {today_str})"
+            period_text = f"за неделю {week_ago.strftime('%d.%m')} — {today_str}"
         elif period == "month":
             month_ago = now - timedelta(days=30)
-            period_text = f"за месяц ({month_ago.strftime('%d.%m')} — {today_str})"
+            period_text = f"за месяц {month_ago.strftime('%d.%m')} — {today_str}"
         else:
             period_text = period
         
@@ -2868,12 +2868,17 @@ async def evening_report_worker():
                                     in_progress = data3.get("in_progress", 0)
                                     closed = data3.get("closed", 0)
                                     
-                                    period_names = {
-                                        "today": "сегодня",
-                                        "week": "неделя",
-                                        "month": "месяц"
-                                    }
-                                    period_text = period_names.get(period, period)
+                                    today_fmt = now.strftime("%d.%m")
+                                    if period == "today":
+                                        period_text = f"сегодня {today_fmt}"
+                                    elif period == "week":
+                                        week_ago = now - timedelta(days=7)
+                                        period_text = f"за неделю {week_ago.strftime('%d.%m')} — {today_fmt}"
+                                    elif period == "month":
+                                        month_ago = now - timedelta(days=30)
+                                        period_text = f"за месяц {month_ago.strftime('%d.%m')} — {today_fmt}"
+                                    else:
+                                        period_text = period
                                     
                                     text = (
                                         f"📊 *Итоговый отчёт — {queue}* ({period_text})\n\n"
