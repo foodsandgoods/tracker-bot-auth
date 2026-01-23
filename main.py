@@ -10,6 +10,8 @@ from collections import defaultdict
 from typing import Any, Optional
 from urllib.parse import urlencode
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
@@ -485,8 +487,12 @@ class TrackerService:
     async def get_users_with_evening_report(self) -> list[dict]:
         return await self.storage.get_users_with_evening_report()
 
-    async def morning_report(self, tg_id: int, queue: str = "", limit: int = 10) -> dict:
-        """Get morning report: open issues in queue."""
+    async def morning_report(self, tg_id: int, queue: str = "", limit: int = 10, date_offset: int = 0) -> dict:
+        """Get morning report: open issues in queue.
+        
+        date_offset: 0 = today, 1 = yesterday, etc.
+        For historical dates, shows issues that were open on that date (updated before or on that date).
+        """
         access, err = await self._get_valid_access_token(tg_id)
         if err:
             return err
@@ -500,7 +506,11 @@ class TrackerService:
         if not queue:
             return {"http_status": 400, "body": {"error": "Очередь не указана"}}
 
-        query = f"Queue: {queue} AND Resolution: empty() Sort by: Updated DESC"
+        # For today: open issues. For past dates: issues updated on or before that date
+        if date_offset == 0:
+            query = f"Queue: {queue} AND Resolution: empty() Sort by: Updated DESC"
+        else:
+            query = f"Queue: {queue} AND Resolution: empty() AND Updated: <= now()-{date_offset}d Sort by: Updated DESC"
 
         try:
             st, payload = await self.tracker.search_issues(access, query=query, limit=limit)
@@ -531,8 +541,11 @@ class TrackerService:
             }
         }
 
-    async def evening_report(self, tg_id: int, queue: str = "") -> dict:
-        """Get evening report: issues closed today in queue."""
+    async def evening_report(self, tg_id: int, queue: str = "", date_offset: int = 0) -> dict:
+        """Get evening report: issues closed on a specific day.
+        
+        date_offset: 0 = today, 1 = yesterday, etc.
+        """
         access, err = await self._get_valid_access_token(tg_id)
         if err:
             return err
@@ -545,8 +558,12 @@ class TrackerService:
         if not queue:
             return {"http_status": 400, "body": {"error": "Очередь не указана"}}
 
-        # Closed today
-        query = f'Queue: {queue} AND Resolution: !empty() AND Resolved: >= today() Sort by: Resolved DESC'
+        # Closed on specific day
+        if date_offset == 0:
+            query = f'Queue: {queue} AND Resolution: !empty() AND Resolved: >= today() Sort by: Resolved DESC'
+        else:
+            # Closed on that specific day: >= start of day AND < start of next day
+            query = f'Queue: {queue} AND Resolution: !empty() AND Resolved: >= now()-{date_offset}d AND Resolved: < now()-{date_offset - 1}d Sort by: Resolved DESC'
 
         try:
             st, payload = await self.tracker.search_issues(access, query=query, limit=50)
@@ -1200,16 +1217,48 @@ class TrackerService:
         }
 
 
-# =============================================================================
-# FastAPI Application
-# =============================================================================
-app = FastAPI(title="Tracker Bot Auth", version="2.2.0")
-
-# Global service instances
+# Global service instances (initialized in lifespan)
 _storage: Optional[TokenStorage] = None
 _oauth: Optional[OAuthClient] = None
 _tracker: Optional[TrackerClient] = None
-_service: Optional[TrackerService] = None
+_service: Optional["TrackerService"] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan: startup and shutdown."""
+    global _storage, _oauth, _tracker, _service
+
+    # Startup
+    logger.info("Starting tracker-bot-auth service...")
+
+    if settings.database:
+        _storage = TokenStorage(settings.database)
+        await _storage.connect()
+        await _storage.ensure_schema()
+
+    if settings.is_configured and _storage:
+        _oauth = OAuthClient()
+        _tracker = TrackerClient()
+        _service = TrackerService(_storage, _oauth, _tracker)
+        logger.info("Service layer initialized")
+    else:
+        logger.warning(f"Service not fully configured. Missing: {settings.missing_vars}")
+
+    yield  # Application runs here
+
+    # Shutdown
+    if _storage:
+        await _storage.close()
+
+    await close_client()
+    logger.info("Shutdown complete")
+
+
+# =============================================================================
+# FastAPI Application
+# =============================================================================
+app = FastAPI(title="Tracker Bot Auth", version="2.2.0", lifespan=lifespan)
 
 
 def _check_config() -> Optional[JSONResponse]:
@@ -1238,37 +1287,6 @@ async def _check_rate_limit(tg_id: int) -> Optional[JSONResponse]:
     return None
 
 
-@app.on_event("startup")
-async def startup():
-    """Initialize services on startup."""
-    global _storage, _oauth, _tracker, _service
-
-    logger.info("Starting tracker-bot-auth service...")
-
-    if settings.database:
-        _storage = TokenStorage(settings.database)
-        await _storage.connect()
-        await _storage.ensure_schema()
-
-    if settings.is_configured and _storage:
-        _oauth = OAuthClient()
-        _tracker = TrackerClient()
-        _service = TrackerService(_storage, _oauth, _tracker)
-        logger.info("Service layer initialized")
-    else:
-        logger.warning(f"Service not fully configured. Missing: {settings.missing_vars}")
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    """Cleanup on shutdown."""
-    global _storage
-    
-    if _storage:
-        await _storage.close()
-    
-    await close_client()
-    logger.info("Shutdown complete")
 
 
 # =============================================================================
@@ -1487,23 +1505,28 @@ async def tg_settings_evening_enabled(tg: int = Query(..., ge=1), enabled: bool 
 async def tracker_morning_report(
     tg: int = Query(..., ge=1),
     queue: str = Query(""),
-    limit: int = Query(10, ge=1, le=50)
+    limit: int = Query(10, ge=1, le=50),
+    date_offset: int = Query(0, ge=0, le=30)
 ):
     """Get morning report: open issues in queue."""
     err = _check_config()
     if err:
         return err
-    result = await _service.morning_report(tg, queue, limit)  # type: ignore
+    result = await _service.morning_report(tg, queue, limit, date_offset)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
 @app.get("/tracker/evening_report")
-async def tracker_evening_report(tg: int = Query(..., ge=1), queue: str = Query("")):
-    """Get evening report: issues closed today in queue."""
+async def tracker_evening_report(
+    tg: int = Query(..., ge=1),
+    queue: str = Query(""),
+    date_offset: int = Query(0, ge=0, le=30)
+):
+    """Get evening report: issues closed on specific day."""
     err = _check_config()
     if err:
         return err
-    result = await _service.evening_report(tg, queue)  # type: ignore
+    result = await _service.evening_report(tg, queue, date_offset)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 

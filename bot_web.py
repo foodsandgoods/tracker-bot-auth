@@ -174,9 +174,7 @@ async def root_with_bot_status():
     }
 
 
-@app.on_event("shutdown")
-async def bot_app_shutdown():
-    await close_client()
+# Note: shutdown is handled via lifespan in main.py
 
 
 # =============================================================================
@@ -613,6 +611,12 @@ async def cmd_start(m: Message):
 
 @router.message(Command("menu"))
 async def cmd_menu(m: Message):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🌅 Утренний", callback_data="report:morning")
+    kb.button(text="🌆 Вечерний", callback_data="report:evening")
+    kb.button(text="📊 Статистика", callback_data="report:stats")
+    kb.adjust(3)
+    
     await m.answer(
         "📋 *Меню:*\n\n"
         "🔗 /connect — привязать аккаунт\n"
@@ -621,13 +625,11 @@ async def cmd_menu(m: Message):
         "✅ /cl\\_my — задачи с моим ОК\n"
         "❓ /cl\\_my\\_open — ждут моего ОК\n"
         "📣 /mentions — требующие ответа\n\n"
-        "🌅 /morning — утренний отчёт\n"
-        "🌆 /evening — вечерний отчёт\n"
-        "📊 /stats — статистика\n\n"
         "🤖 /summary ISSUE — резюме (ИИ)\n"
         "🔍 /ai ЗАПРОС — поиск (ИИ)\n"
         "📝 /new — создать задачу",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=kb.as_markup()
     )
 
 
@@ -835,6 +837,9 @@ async def cmd_morning(m: Message):
     
     loading = await m.answer(f"🌅 Загружаю открытые задачи {queue}...")
     
+    moscow_tz = timezone(timedelta(hours=3))
+    today_str = datetime.now(moscow_tz).strftime("%d.%m.%Y")
+    
     sc, data = await api_request(
         "GET", "/tracker/morning_report",
         {"tg": tg_id, "queue": queue, "limit": limit},
@@ -848,11 +853,20 @@ async def cmd_morning(m: Message):
     issues = data.get("issues", [])
     count = data.get("count", 0)
     
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📆 Вчера", callback_data="report:morning:1")
+    kb.button(text="🔄 Обновить", callback_data="report:morning:0")
+    kb.adjust(2)
+    
     if not issues:
-        await loading.edit_text(f"🌅 *{queue}*: нет открытых задач", parse_mode="Markdown")
+        await loading.edit_text(
+            f"🌅 *{queue}* ({today_str}): нет открытых задач",
+            parse_mode="Markdown",
+            reply_markup=kb.as_markup()
+        )
         return
     
-    lines = [f"🌅 *Утренний отчёт — {queue}* ({count} задач)\n"]
+    lines = [f"🌅 *Утренний отчёт — {queue}* ({today_str}, {count} задач)\n"]
     for idx, issue in enumerate(issues, 1):
         key = issue.get("key", "")
         summary = escape_md(issue.get("summary", "")[:50])
@@ -863,7 +877,7 @@ async def cmd_morning(m: Message):
             lines.append(f"   _{status}_")
     
     text = "\n".join(lines)
-    await loading.edit_text(text[:4000], parse_mode="Markdown")
+    await loading.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
 
 
 @router.message(Command("evening"))
@@ -881,6 +895,9 @@ async def cmd_evening(m: Message):
     
     loading = await m.answer(f"🌆 Загружаю закрытые сегодня задачи {queue}...")
     
+    moscow_tz = timezone(timedelta(hours=3))
+    today_str = datetime.now(moscow_tz).strftime("%d.%m.%Y")
+    
     sc, data = await api_request(
         "GET", "/tracker/evening_report",
         {"tg": tg_id, "queue": queue},
@@ -894,11 +911,20 @@ async def cmd_evening(m: Message):
     issues = data.get("issues", [])
     count = data.get("count", 0)
     
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📆 Вчера", callback_data="report:evening:1")
+    kb.button(text="🔄 Обновить", callback_data="report:evening:0")
+    kb.adjust(2)
+    
     if not issues:
-        await loading.edit_text(f"🌆 *{queue}*: сегодня ничего не закрыто", parse_mode="Markdown")
+        await loading.edit_text(
+            f"🌆 *{queue}* ({today_str}): ничего не закрыто",
+            parse_mode="Markdown",
+            reply_markup=kb.as_markup()
+        )
         return
     
-    lines = [f"🌆 *Вечерний отчёт — {queue}* ({count} закрыто сегодня)\n"]
+    lines = [f"🌆 *Вечерний отчёт — {queue}* ({today_str}, {count} закрыто)\n"]
     for idx, issue in enumerate(issues, 1):
         key = issue.get("key", "")
         summary = escape_md(issue.get("summary", "")[:50])
@@ -906,7 +932,7 @@ async def cmd_evening(m: Message):
         lines.append(f"{idx}. [{key}]({url}): {summary}")
     
     text = "\n".join(lines)
-    await loading.edit_text(text[:4000], parse_mode="Markdown")
+    await loading.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
 
 
 @router.message(Command("stats"))
@@ -1183,6 +1209,8 @@ async def handle_callback(c: CallbackQuery):
         await handle_new_issue_callback(c)
     elif data.startswith("stats:"):
         await handle_stats_callback(c)
+    elif data.startswith("report:"):
+        await handle_report_callback(c)
     else:
         await c.answer()
 
@@ -1659,6 +1687,133 @@ async def handle_new_issue_callback(c: CallbackQuery):
     await c.answer()
 
 
+async def handle_report_callback(c: CallbackQuery):
+    """Handle report callbacks from menu."""
+    tg_id = c.from_user.id
+    data = c.data or ""
+    parts = data.split(":")
+    
+    if len(parts) < 2:
+        await c.answer()
+        return
+    
+    action = parts[1]
+    date_offset = int(parts[2]) if len(parts) > 2 else 0  # 0 = today, 1 = yesterday, etc.
+    
+    full_settings = await get_full_settings(tg_id)
+    queue = full_settings.get("morning_queue", "") if full_settings else ""
+    limit = full_settings.get("morning_limit", 10) if full_settings else 10
+    
+    if not queue:
+        await c.answer("❌ Очередь не настроена. /settings → Утренний отчёт", show_alert=True)
+        return
+    
+    if action == "morning":
+        await c.answer("⏳ Загружаю...")
+        
+        # Calculate date for display
+        moscow_tz = timezone(timedelta(hours=3))
+        target_date = datetime.now(moscow_tz) - timedelta(days=date_offset)
+        date_str = target_date.strftime("%d.%m.%Y")
+        
+        sc, data_resp = await api_request(
+            "GET", "/tracker/morning_report",
+            {"tg": tg_id, "queue": queue, "limit": limit, "date_offset": date_offset},
+            long_timeout=True
+        )
+        
+        if sc != 200:
+            if c.message:
+                await c.message.edit_text(f"❌ Ошибка {sc}: {data_resp.get('error', data_resp)}"[:500])
+            return
+        
+        issues = data_resp.get("issues", [])
+        count = data_resp.get("count", 0)
+        
+        if not issues:
+            text = f"🌅 *{queue}* ({date_str}): нет открытых задач"
+        else:
+            lines = [f"🌅 *Утренний отчёт — {queue}* ({date_str}, {count} задач)\n"]
+            for idx, issue in enumerate(issues[:10], 1):
+                key = issue.get("key", "")
+                summary = escape_md(issue.get("summary", "")[:40])
+                url = issue.get("url", f"https://tracker.yandex.ru/{key}")
+                lines.append(f"{idx}. [{key}]({url}): {summary}")
+            text = "\n".join(lines)
+        
+        kb = InlineKeyboardBuilder()
+        if date_offset == 0:
+            kb.button(text="📆 Вчера", callback_data="report:morning:1")
+        else:
+            kb.button(text="📅 Сегодня", callback_data="report:morning:0")
+            if date_offset < 7:
+                kb.button(text="◀️ Раньше", callback_data=f"report:morning:{date_offset + 1}")
+        kb.button(text="🔄 Обновить", callback_data=f"report:morning:{date_offset}")
+        kb.adjust(2, 1)
+        
+        if c.message:
+            await c.message.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
+        return
+    
+    if action == "evening":
+        await c.answer("⏳ Загружаю...")
+        
+        moscow_tz = timezone(timedelta(hours=3))
+        target_date = datetime.now(moscow_tz) - timedelta(days=date_offset)
+        date_str = target_date.strftime("%d.%m.%Y")
+        
+        sc, data_resp = await api_request(
+            "GET", "/tracker/evening_report",
+            {"tg": tg_id, "queue": queue, "date_offset": date_offset},
+            long_timeout=True
+        )
+        
+        if sc != 200:
+            if c.message:
+                await c.message.edit_text(f"❌ Ошибка {sc}: {data_resp.get('error', data_resp)}"[:500])
+            return
+        
+        issues = data_resp.get("issues", [])
+        count = data_resp.get("count", 0)
+        
+        if not issues:
+            text = f"🌆 *{queue}* ({date_str}): ничего не закрыто"
+        else:
+            lines = [f"🌆 *Вечерний отчёт — {queue}* ({date_str}, {count} закрыто)\n"]
+            for idx, issue in enumerate(issues[:10], 1):
+                key = issue.get("key", "")
+                summary = escape_md(issue.get("summary", "")[:40])
+                url = issue.get("url", f"https://tracker.yandex.ru/{key}")
+                lines.append(f"{idx}. [{key}]({url}): {summary}")
+            text = "\n".join(lines)
+        
+        kb = InlineKeyboardBuilder()
+        if date_offset == 0:
+            kb.button(text="📆 Вчера", callback_data="report:evening:1")
+        else:
+            kb.button(text="📅 Сегодня", callback_data="report:evening:0")
+            if date_offset < 7:
+                kb.button(text="◀️ Раньше", callback_data=f"report:evening:{date_offset + 1}")
+        kb.button(text="🔄 Обновить", callback_data=f"report:evening:{date_offset}")
+        kb.adjust(2, 1)
+        
+        if c.message:
+            await c.message.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
+        return
+    
+    if action == "stats":
+        await c.answer()
+        if c.message:
+            await c.message.edit_text(
+                "📊 *Статистика по очереди*\n\nВыберите очередь:",
+                parse_mode="Markdown",
+                reply_markup=kb_stats_queue()
+            )
+        return
+    
+    await c.answer()
+
+
 async def handle_stats_callback(c: CallbackQuery):
     """Handle stats callbacks."""
     tg_id = c.from_user.id
@@ -1725,8 +1880,21 @@ async def handle_stats_callback(c: CallbackQuery):
         in_progress = data_resp.get("in_progress", 0)
         closed = data_resp.get("closed", 0)
         
-        period_names = {"today": "сегодня", "week": "за неделю", "month": "за месяц"}
-        period_text = period_names.get(period, period)
+        # Calculate date range for display
+        moscow_tz = timezone(timedelta(hours=3))
+        now = datetime.now(moscow_tz)
+        today_str = now.strftime("%d.%m")
+        
+        if period == "today":
+            period_text = f"сегодня ({today_str})"
+        elif period == "week":
+            week_ago = now - timedelta(days=7)
+            period_text = f"за неделю ({week_ago.strftime('%d.%m')} — {today_str})"
+        elif period == "month":
+            month_ago = now - timedelta(days=30)
+            period_text = f"за месяц ({month_ago.strftime('%d.%m')} — {today_str})"
+        else:
+            period_text = period
         
         text = (
             f"📊 *Статистика — {queue}* ({period_text})\n\n"
@@ -2151,7 +2319,7 @@ async def run_bot():
     
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        await asyncio.sleep(2)
+        await asyncio.sleep(5)  # Wait for old instance to fully stop
     except Exception:
         pass
     
@@ -2174,7 +2342,8 @@ async def run_bot():
         except Exception as e:
             error_str = str(e)
             if ("Conflict" in error_str or "terminated" in error_str) and attempt < max_retries - 1:
-                await asyncio.sleep(5 * (attempt + 1))
+                logger.warning(f"Bot conflict, retrying in {10 * (attempt + 1)}s... (attempt {attempt + 1}/{max_retries})")
+                await asyncio.sleep(10 * (attempt + 1))  # 10, 20, 30, 40 seconds
                 try:
                     await bot.delete_webhook(drop_pending_updates=True)
                 except Exception:
