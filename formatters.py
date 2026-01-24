@@ -20,6 +20,12 @@ FORMAT_MORNING = ListFormatConfig(summary_limit=50, show_status=True)
 FORMAT_EVENING = ListFormatConfig(summary_limit=50, show_status=False)
 FORMAT_DEFAULT = ListFormatConfig(summary_limit=50, show_status=True)
 
+# For reminder notifications (short lists, 3 items max)
+FORMAT_REMINDER = ListFormatConfig(summary_limit=40, show_status=False, items_limit=3)
+
+# For background workers (morning/evening auto-send, 10 items max)
+FORMAT_WORKER = ListFormatConfig(summary_limit=40, show_status=False, items_limit=10)
+
 
 def escape_md(text: str) -> str:
     """Escape Markdown special characters."""
@@ -104,4 +110,33 @@ async def safe_edit_markdown(
         await message.edit_text(
             strip_markdown(text)[:max_length],
             reply_markup=reply_markup
+        )
+
+
+async def safe_send_markdown(
+    bot,
+    chat_id: int,
+    text: str,
+    max_length: int = 4000
+) -> None:
+    """
+    Send message with Markdown, fallback to plain text on error.
+    
+    Args:
+        bot: Telegram Bot instance
+        chat_id: Chat ID to send to
+        text: Markdown text
+        max_length: Max message length
+    """
+    try:
+        await bot.send_message(
+            chat_id,
+            text[:max_length],
+            parse_mode="Markdown"
+        )
+    except Exception:
+        # Fallback without Markdown if parsing fails
+        await bot.send_message(
+            chat_id,
+            strip_markdown(text)[:max_length]
         )

@@ -20,8 +20,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import settings
 from http_client import get_client, close_client, get_timeout
 from formatters import (
-    format_issue_list, safe_edit_markdown, strip_markdown, escape_md,
-    FORMAT_MORNING, FORMAT_EVENING, ListFormatConfig
+    format_issue_list, safe_edit_markdown, safe_send_markdown,
+    strip_markdown, escape_md,
+    FORMAT_MORNING, FORMAT_EVENING, FORMAT_REMINDER, FORMAT_WORKER,
+    ListFormatConfig
 )
 
 # =============================================================================
@@ -2727,16 +2729,9 @@ async def morning_report_worker():
                                     count = data2.get("count", 0)
                                     
                                     if issues:
-                                        lines = [f"🌅 *Утренний отчёт — {queue}* ({count} задач)\n"]
-                                        for idx, issue in enumerate(issues[:10], 1):
-                                            key = issue.get("key", "")
-                                            summary = escape_md(issue.get("summary", "")[:40])
-                                            url = issue.get("url", "")
-                                            lines.append(f"{idx}. [{key}]({url}): {summary}")
-                                        
-                                        await state.bot.send_message(
-                                            tg_id, "\n".join(lines), parse_mode="Markdown"
-                                        )
+                                        title = f"🌅 *Утренний отчёт — {queue}* ({count} задач)\n"
+                                        text = format_issue_list(issues, title, FORMAT_WORKER)
+                                        await safe_send_markdown(state.bot, tg_id, text)
                                     
                                     last_sent_date[tg_id] = today_str
                             except Exception:
@@ -2794,20 +2789,13 @@ async def evening_report_worker():
                                     issues = data2.get("issues", [])
                                     count = data2.get("count", 0)
                                     
-                                    lines = [f"🌆 *Вечерний отчёт — {queue}*\n"]
                                     if issues:
-                                        lines[0] = f"🌆 *Вечерний отчёт — {queue}* ({count} закрыто)\n"
-                                        for idx, issue in enumerate(issues[:10], 1):
-                                            key = issue.get("key", "")
-                                            summary = escape_md(issue.get("summary", "")[:40])
-                                            url = issue.get("url", "")
-                                            lines.append(f"{idx}. [{key}]({url}): {summary}")
+                                        title = f"🌆 *Вечерний отчёт — {queue}* ({count} закрыто)\n"
+                                        text = format_issue_list(issues, title, FORMAT_WORKER)
                                     else:
-                                        lines.append("Сегодня ничего не закрыто")
+                                        text = f"🌆 *Вечерний отчёт — {queue}*\n\nСегодня ничего не закрыто"
                                     
-                                    await state.bot.send_message(
-                                        tg_id, "\n".join(lines), parse_mode="Markdown"
-                                    )
+                                    await safe_send_markdown(state.bot, tg_id, text)
                                     
                                     last_sent_evening[tg_id] = today_str
                             except Exception:
