@@ -1820,9 +1820,9 @@ async def handle_report_callback(c: CallbackQuery):
         if date_offset == 0:
             kb.button(text="📆 Вчера", callback_data="report:morning:1")
         else:
-            kb.button(text="📅 Сегодня", callback_data="report:morning:0")
             if date_offset < 7:
                 kb.button(text="◀️ Раньше", callback_data=f"report:morning:{date_offset + 1}")
+            kb.button(text="📅 Сегодня", callback_data="report:morning:0")
         kb.adjust(2)
         
         if c.message:
@@ -1860,9 +1860,9 @@ async def handle_report_callback(c: CallbackQuery):
         if date_offset == 0:
             kb.button(text="📆 Вчера", callback_data="report:evening:1")
         else:
-            kb.button(text="📅 Сегодня", callback_data="report:evening:0")
             if date_offset < 7:
                 kb.button(text="◀️ Раньше", callback_data=f"report:evening:{date_offset + 1}")
+            kb.button(text="📅 Сегодня", callback_data="report:evening:0")
         kb.adjust(2)
         
         if c.message:
