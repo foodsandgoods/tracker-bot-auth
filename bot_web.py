@@ -127,6 +127,46 @@ class PendingState:
 # =============================================================================
 # Application State
 # =============================================================================
+class ChatHistory:
+    """Chat history storage with TTL and message limit."""
+    
+    def __init__(self, max_messages: int = 10, ttl: int = 3600):
+        self._history: Dict[int, List[dict]] = {}
+        self._timestamps: Dict[int, float] = {}
+        self._max_messages = max_messages  # 5 pairs = 10 messages
+        self._ttl = ttl  # 1 hour
+    
+    def add(self, user_id: int, role: str, content: str):
+        """Add message to history."""
+        now = time.time()
+        # Clear expired
+        if user_id in self._timestamps and now - self._timestamps[user_id] > self._ttl:
+            self._history[user_id] = []
+        
+        if user_id not in self._history:
+            self._history[user_id] = []
+        
+        self._history[user_id].append({"role": role, "content": content})
+        self._timestamps[user_id] = now
+        
+        # Limit history size
+        if len(self._history[user_id]) > self._max_messages:
+            self._history[user_id] = self._history[user_id][-self._max_messages:]
+    
+    def get(self, user_id: int) -> List[dict]:
+        """Get history for user."""
+        now = time.time()
+        if user_id in self._timestamps and now - self._timestamps[user_id] > self._ttl:
+            self._history[user_id] = []
+            return []
+        return self._history.get(user_id, [])
+    
+    def clear(self, user_id: int):
+        """Clear history for user."""
+        self._history.pop(user_id, None)
+        self._timestamps.pop(user_id, None)
+
+
 class AppState:
     """Application state container."""
     
@@ -134,7 +174,8 @@ class AppState:
         'bot', 'dispatcher', 'shutdown_event',
         'checklist_cache', 'summary_cache',
         'pending_comment', 'pending_summary', 'pending_ai_search', 
-        'pending_new_issue', 'pending_stats_dates', 'last_reminder'
+        'pending_new_issue', 'pending_stats_dates', 'last_reminder',
+        'chat_history'
     )
     
     def __init__(self):
@@ -157,6 +198,7 @@ class AppState:
         self.pending_new_issue: Dict[int, dict] = {}  # tg_id -> issue draft
         self.pending_stats_dates: Dict[int, dict] = {}  # tg_id -> {queue, msg_id}
         self.last_reminder: Dict[int, float] = {}
+        self.chat_history = ChatHistory(max_messages=10, ttl=3600)  # 5 pairs, 1 hour TTL
 
 
 state = AppState()
@@ -2460,6 +2502,70 @@ async def handle_text_message(m: Message):
         else:
             await loading.edit_text(f"✅ Комментарий добавлен к *{issue_key}*", parse_mode="Markdown")
         return
+    
+    # =========================================================================
+    # AI Chat - handle all other text messages
+    # =========================================================================
+    await process_chat_message(m, text, tg_id)
+
+
+async def process_chat_message(m: Message, text: str, tg_id: int):
+    """Process chat message with AI assistant."""
+    import re
+    from ai_service import chat_with_ai, _format_issue_context
+    
+    # Check for issue keys in message (e.g., INV-123, DOC-45)
+    issue_pattern = r'\b([A-Z]{2,10}-\d+)\b'
+    issue_keys = re.findall(issue_pattern, text.upper())
+    
+    # Get issue context if mentioned
+    issue_context = None
+    if issue_keys:
+        # Get first mentioned issue
+        issue_key = issue_keys[0]
+        sc, data = await api_request(
+            "GET", f"/tracker/issue/{issue_key}",
+            {"tg": tg_id},
+            long_timeout=True
+        )
+        if sc == 200 and data.get("status_code") == 200:
+            issue_data = data.get("response", {})
+            issue_context = _format_issue_context(issue_data)
+    
+    # Get history
+    history = state.chat_history.get(tg_id)
+    
+    # Show typing indicator
+    loading = await m.answer("🤔 Думаю...")
+    
+    # Call AI
+    response, error = await chat_with_ai(text, history, issue_context)
+    
+    if error:
+        await loading.edit_text(error)
+        return
+    
+    if response:
+        # Save to history
+        state.chat_history.add(tg_id, "user", text)
+        state.chat_history.add(tg_id, "assistant", response)
+        
+        # Send response (split if too long)
+        await loading.delete()
+        for chunk in [response[i:i+4000] for i in range(0, len(response), 4000)]:
+            await m.answer(chunk)
+    else:
+        await loading.edit_text("❌ Не удалось получить ответ")
+
+
+@router.message(Command("clear"))
+async def cmd_clear(m: Message):
+    """Clear chat history."""
+    if not m.from_user:
+        return
+    tg_id = m.from_user.id
+    state.chat_history.clear(tg_id)
+    await m.answer("🗑️ История чата очищена")
 
 
 # =============================================================================
@@ -2481,6 +2587,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="summary", description="🤖 Резюме (ИИ)"),
         BotCommand(command="ai", description="🔍 Поиск (ИИ)"),
         BotCommand(command="new", description="📝 Создать задачу"),
+        BotCommand(command="clear", description="🗑️ Очистить историю чата"),
     ])
 
 

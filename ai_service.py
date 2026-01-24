@@ -417,3 +417,211 @@ async def generate_search_query(
     
     metrics.inc("ai.search_failed")
     return None, FALLBACK_MESSAGES["unknown"]
+
+
+# Chat system prompt
+CHAT_SYSTEM_PROMPT = """Ты — ИИ‑ассистент для работы с задачами в Яндекс Трекере. Твоя специализация: отчетность, статусы, релиз‑ноты и краткие summary по задачам.
+
+Ты не имеешь права создавать/изменять задачи и поля в Трекере, не пишешь "я изменил/обновил" — ты только рекомендуешь готовый текст, который пользователь может вставить в Трекер.
+
+1) Контекст и область
+
+Очереди/направления: doc, inv, hr, komdep, finance, bdev, bb.
+Ты работаешь в рамках предоставленной пользователем информации о задаче: название, описание, приоритет, исполнитель, нужен ответ пользователя, дедлайн, комментарии.
+Если данных недостаточно для корректного резюме/статуса/релиз‑ноты — задавай минимум уточняющих вопросов (1–3), только по критичным пробелам.
+
+2) Основные задачи
+
+1) Summary по задаче (главный сценарий):
+Коротко: что сделано/что происходит/что блокирует/что дальше.
+Без воды, без общих фраз.
+
+2) Статус для стейкхолдеров (в коммент/отчет):
+Прогресс, риски, блокеры, ETA/дедлайн, кому нужен ответ.
+
+3) Релиз‑ноты:
+Пользовательская ценность и изменения "что изменилось", "для кого", "как проверить/что учитывать", без внутренней кухни (если не попросили).
+
+4) Сводка по списку задач (если пользователь даст несколько):
+Группировка по очередям/приоритетам/дедлайнам; выделение блокеров и просрочек.
+
+3) Требования к стилю
+
+Без воды, короткие предложения, конкретика.
+Если есть даты/цифры — используй их.
+Не выдумывай факты. Если чего-то нет — помечай как "не указано" или спрашивай.
+Не используй канцелярит и чрезмерные вступления.
+
+4) Язык
+
+По умолчанию отвечай на языке пользователя.
+Если пользователь просит RU/EN или "двуязычно" — давай две версии: RU, затем EN.
+
+5) Формат ответов (понятный текст)
+
+Если пользователь не задаёт формат — используй шаблон ниже, подставляя факты:
+
+Summary (1–3 строки):
+Статус: …
+Сделано: …
+Далее: …
+Блокеры/нужен ответ: … (если есть)
+Дедлайн: … (если указан)
+
+Для релиз‑нот:
+Изменение: …
+Польза: …
+Затронуто: …
+Примечания/ограничения: …
+
+6) Уточняющие вопросы (когда нужны)
+
+Задавай вопросы только если без них невозможно сделать точный summary/статус, например:
+текущий этап/статус (в работе/на ревью/готово/ждет ответа),
+что конкретно сделано с последнего обновления,
+есть ли блокер и кто должен ответить,
+целевой дедлайн/ETA, если его нет, но нужен для отчета.
+
+7) Запреты и ограничения
+
+Не утверждай, что что-то выполнено, если это не подтверждено пользователем.
+Не "добавляй" исполнителя/приоритет/дедлайн — только рекомендуй текст.
+Не раскрывай и не запрашивай лишние персональные данные; используй роли ("ответственный", "пользователь", "согласующий"), если имен нет."""
+
+
+def _format_issue_context(issue_data: dict) -> str:
+    """Format issue data as context for chat."""
+    key = issue_data.get("key", "")
+    summary = issue_data.get("summary", "")
+    description = issue_data.get("description", "") or "Нет описания"
+    
+    status = "Не указан"
+    if isinstance(issue_data.get("status"), dict):
+        status = issue_data["status"].get("display", "Не указан")
+    
+    assignee = "Не назначен"
+    if isinstance(issue_data.get("assignee"), dict):
+        assignee = issue_data["assignee"].get("display", "Не назначен")
+    
+    priority = "Не указан"
+    if isinstance(issue_data.get("priority"), dict):
+        priority = issue_data["priority"].get("display", "Не указан")
+    
+    deadline = issue_data.get("deadline") or "Не указан"
+    
+    # Comments
+    comments = issue_data.get("comments", [])
+    comments_text = ""
+    if comments and isinstance(comments, list):
+        comments_list = []
+        for c in comments[-5:]:
+            if isinstance(c, dict):
+                author = "Неизвестно"
+                if isinstance(c.get("createdBy"), dict):
+                    author = c["createdBy"].get("display", "Неизвестно")
+                text = (c.get("text") or "").strip()
+                if text:
+                    comments_list.append(f"  • {author}: {text[:200]}")
+        if comments_list:
+            comments_text = "\n".join(comments_list)
+    
+    return f"""Задача: {key} — {summary}
+Статус: {status}
+Исполнитель: {assignee}
+Приоритет: {priority}
+Дедлайн: {deadline}
+
+Описание:
+{description[:1000]}
+
+Последние комментарии:
+{comments_text if comments_text else "Нет комментариев"}"""
+
+
+async def chat_with_ai(
+    user_message: str,
+    history: list[dict],
+    issue_context: str | None = None
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Chat with AI assistant.
+    
+    Args:
+        user_message: User's message
+        history: List of previous messages [{"role": "user/assistant", "content": "..."}]
+        issue_context: Optional formatted issue data as context
+    
+    Returns:
+        Tuple of (response_text, error_message)
+    """
+    metrics.inc("ai.chat_requests")
+    
+    if not settings.ai:
+        metrics.inc("ai.not_configured")
+        return None, FALLBACK_MESSAGES["not_configured"]
+    
+    ai_config = settings.ai
+    
+    # Build messages list
+    messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
+    
+    # Add issue context if provided
+    if issue_context:
+        messages.append({
+            "role": "system",
+            "content": f"Контекст задачи:\n\n{issue_context}"
+        })
+    
+    # Add history
+    messages.extend(history)
+    
+    # Add current message
+    messages.append({"role": "user", "content": user_message})
+    
+    payload = {
+        "model": ai_config.model,
+        "messages": messages,
+        "useWalletBalance": True,
+        "max_tokens": ai_config.max_tokens,
+        "temperature": ai_config.temperature,
+    }
+    
+    client = await get_client()
+    timeout = get_timeout(long=True)
+    
+    auth_variants = [
+        {"Authorization": ai_config.api_key, "Content-Type": "application/json"},
+        {"Authorization": f"Bearer {ai_config.api_key}", "Content-Type": "application/json"},
+    ]
+    
+    for headers in auth_variants:
+        try:
+            status, data = await _make_request(
+                client, ai_config.api_url, headers, payload, timeout
+            )
+            
+            if status == 200:
+                content = _extract_content(data)
+                if content:
+                    metrics.inc("ai.chat_success")
+                    return content, None
+            
+            if status == 401:
+                continue
+            
+            if status == 429:
+                metrics.inc("ai.rate_limited")
+                return None, FALLBACK_MESSAGES["rate_limit"]
+            
+            if status >= 500:
+                return None, FALLBACK_MESSAGES["server_error"]
+                
+        except asyncio.TimeoutError:
+            metrics.inc("ai.timeout")
+            return None, FALLBACK_MESSAGES["timeout"]
+        except Exception as e:
+            logger.debug(f"AI chat error: {e}")
+            continue
+    
+    metrics.inc("ai.chat_failed")
+    return None, FALLBACK_MESSAGES["unknown"]
