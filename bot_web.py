@@ -2594,18 +2594,29 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                             else:
                                 search_results = "Задач, требующих ответа, не найдено."
                     else:
+                        # Clean up YQL query - remove Sort by if present (it's an API param, not YQL)
+                        clean_query = yql_query
+                        if "Sort by:" in clean_query:
+                            # Remove Sort by clause
+                            import re as re_clean
+                            clean_query = re_clean.sub(r'\s*\(?\s*Sort by:[^)]*\)?\s*AND\s*', '', clean_query)
+                            clean_query = re_clean.sub(r'\s*AND\s*\(?\s*Sort by:[^)]*\)?\s*', '', clean_query)
+                            clean_query = re_clean.sub(r'\(?\s*Sort by:[^)]*\)?\s*', '', clean_query)
+                        
+                        logger.info(f"Executing search: {clean_query}")
                         # Execute YQL search
                         sc, data = await api_request(
                             "GET", "/tracker/search",
-                            {"tg": tg_id, "query": yql_query, "limit": 10},
+                            {"tg": tg_id, "query": clean_query, "limit": 10},
                             long_timeout=True
                         )
+                        logger.info(f"Search result: sc={sc}, issues={len(data.get('issues', []))}")
                         if sc == 200:
                             issues = data.get("issues", [])
                             if issues:
                                 search_results = _format_search_results(issues, f"Результаты поиска ({len(issues)})")
                             else:
-                                search_results = f"По запросу ничего не найдено.\nYQL: {yql_query}"
+                                search_results = f"По запросу ничего не найдено.\nYQL: {clean_query}"
             except Exception as e:
                 logger.warning(f"Search failed: {e}")
         
