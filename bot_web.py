@@ -21,7 +21,7 @@ from config import settings
 from http_client import get_client, close_client, get_timeout
 from formatters import (
     format_issue_list, safe_edit_markdown, safe_send_markdown,
-    strip_markdown, escape_md,
+    strip_markdown, escape_md, fmt_date, fmt_issue_link,
     FORMAT_MORNING, FORMAT_EVENING, FORMAT_REMINDER, FORMAT_WORKER,
     ListFormatConfig
 )
@@ -208,23 +208,7 @@ def fmt_item(item: dict, highlight_mine: bool = False) -> str:
     return f"{mark} {text}"
 
 
-def fmt_date(date_str: Optional[str]) -> str:
-    """Format ISO date to DD.MM.YYYY HH:MM in Moscow timezone (UTC+3)."""
-    if not date_str:
-        return ""
-    try:
-        clean = date_str.replace("Z", "+00:00")
-        if "+" in clean and ":" not in clean.split("+")[-1]:
-            parts = clean.rsplit("+", 1)
-            if len(parts[1]) == 4:
-                clean = f"{parts[0]}+{parts[1][:2]}:{parts[1][2:]}"
-        dt = datetime.fromisoformat(clean)
-        # Convert to Moscow time (UTC+3)
-        moscow_tz = timezone(timedelta(hours=3))
-        dt_moscow = dt.astimezone(moscow_tz)
-        return dt_moscow.strftime("%d.%m.%Y %H:%M")
-    except Exception:
-        return date_str[:16] if len(date_str) > 16 else date_str
+# fmt_date moved to formatters.py
 
 
 def normalize_issue_key(text: str) -> Optional[str]:
@@ -250,15 +234,7 @@ def normalize_issue_key(text: str) -> Optional[str]:
     return None
 
 
-def fmt_issue_link(issue: dict, prefix: str = "", show_date: bool = True) -> str:
-    """Format issue as Markdown hyperlink."""
-    key = issue.get("key", "")
-    summary = escape_md((issue.get("summary") or "")[:55])
-    url = issue.get("url") or f"https://tracker.yandex.ru/{key}"
-    date_str = fmt_date(issue.get("updatedAt")) if show_date else ""
-    
-    link = f"{prefix}[{key}: {summary}]({url})"
-    return f"{link} ({date_str})" if date_str else link
+# fmt_issue_link moved to formatters.py
 
 
 def parse_response(r) -> dict:
