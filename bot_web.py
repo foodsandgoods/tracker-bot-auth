@@ -2541,11 +2541,13 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
         issue_pattern2 = r'\b([A-Z]{2,10})(\d+)\b'
         
         issue_keys = re.findall(issue_pattern1, text.upper())
+        issue_mentioned_directly = bool(issue_keys)
         
         # Also check for keys without hyphen
         if not issue_keys:
             matches = re.findall(issue_pattern2, text.upper())
             issue_keys = [f"{m[0]}-{m[1]}" for m in matches]
+            issue_mentioned_directly = bool(issue_keys)
         
         # If no issue mentioned, check last discussed issue
         if not issue_keys:
@@ -2591,9 +2593,11 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
         # 2. Check if user is asking for search/list/stats
         search_keywords = [
             "покажи", "найди", "список", "сколько", "последние",
-            "открытые", "закрытые", "статистика", "поиск", "найти"
+            "открытые", "закрытые", "статистика", "поиск", "найти",
+            "незавершённых", "незавершенных", "активных", "в работе"
         ]
-        needs_search = any(kw in text.lower() for kw in search_keywords) and not issue_keys
+        # Only skip search if issue was directly mentioned in this message
+        needs_search = any(kw in text.lower() for kw in search_keywords) and not issue_mentioned_directly
         
         if needs_search:
             try:
