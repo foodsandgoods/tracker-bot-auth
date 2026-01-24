@@ -2567,6 +2567,10 @@ async def setup_bot_commands(bot: Bot):
     """Set up bot commands menu."""
     await bot.set_my_commands([
         BotCommand(command="menu", description="📋 Меню"),
+        BotCommand(command="morning", description="🌅 Утренний отчёт"),
+        BotCommand(command="evening", description="🌆 Вечерний отчёт"),
+        BotCommand(command="report", description="📊 Итоговый отчёт"),
+        BotCommand(command="settings", description="⚙️ Настройки"),
         BotCommand(command="cl_my", description="✅ Задачи с моим ОК"),
         BotCommand(command="cl_my_open", description="❓ Ждут моего ОК"),
         BotCommand(command="mentions", description="📣 Требующие ответа"),
