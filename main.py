@@ -966,7 +966,11 @@ class TrackerService:
         if limit == 10:
             limit = int(s.get("limit_results", 10))
 
-        base_query = f"Updated: >= now()-{days}d"
+        exclude_closed = (
+            'Status: !"Закрыт" AND Status: !"Завершен" AND Status: !"Решен" '
+            'AND Status: !"Closed" AND Status: !"Done" AND Status: !"Resolved"'
+        )
+        base_query = f"Updated: >= now()-{days}d AND {exclude_closed}"
         if queues:
             queue_conditions = [f"Queue: {x}" for x in queues]
             q = " OR ".join(queue_conditions)
