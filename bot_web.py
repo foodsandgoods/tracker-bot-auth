@@ -1885,7 +1885,8 @@ async def handle_report_callback(c: CallbackQuery):
             try:
                 await c.message.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
             except Exception:
-                await c.message.edit_text(text[:4000].replace("*", "").replace("_", ""), reply_markup=kb.as_markup())
+                # Fallback without Markdown if parsing fails
+                await c.message.edit_text(text[:4000].replace("*", "").replace("_", "").replace("[", "").replace("]", "").replace("(", " ").replace(")", ""), reply_markup=kb.as_markup())
         return
     
     if action == "evening":
@@ -1934,7 +1935,8 @@ async def handle_report_callback(c: CallbackQuery):
             try:
                 await c.message.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
             except Exception:
-                await c.message.edit_text(text[:4000].replace("*", "").replace("_", ""), reply_markup=kb.as_markup())
+                # Fallback without Markdown if parsing fails
+                await c.message.edit_text(text[:4000].replace("*", "").replace("_", "").replace("[", "").replace("]", "").replace("(", " ").replace(")", ""), reply_markup=kb.as_markup())
         return
     
     if action == "stats":
