@@ -750,8 +750,6 @@ async def cmd_mentions(m: Message):
         if issue_status:
             lines.append(f"   _{escape_md(issue_status)}_")
     
-    lines.append("\n_✅ — вы ответили, ⏳ — ожидает ответа_")
-    
     text = "\n".join(lines)
     for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
         await m.answer(chunk, parse_mode="Markdown")
