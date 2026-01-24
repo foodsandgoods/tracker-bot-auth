@@ -530,11 +530,11 @@ class TrackerService:
         if not queue:
             return {"http_status": 400, "body": {"error": "Очередь не указана"}}
 
-        # For today: open issues. For past dates: issues updated on or before that date
+        # For today: open issues (exclude closed status). For past dates: issues updated on or before that date
         if date_offset == 0:
-            query = f"Queue: {queue} AND Resolution: empty()"
+            query = f'Queue: {queue} AND Status: !"Закрыт"'
         else:
-            query = f"Queue: {queue} AND Resolution: empty() AND Updated: <= now()-{date_offset}d"
+            query = f'Queue: {queue} AND Status: !"Закрыт" AND Updated: <= now()-{date_offset}d'
 
         try:
             st, payload = await self.tracker.search_issues(access, query=query, limit=limit, order="-updated")
