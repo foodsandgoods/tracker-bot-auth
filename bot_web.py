@@ -944,7 +944,7 @@ async def cmd_evening(m: Message):
     
     sc, data = await api_request(
         "GET", "/tracker/evening_report",
-        {"tg": tg_id, "queue": queue},
+        {"tg": tg_id, "queue": queue, "date_offset": 0},
         long_timeout=True
     )
     

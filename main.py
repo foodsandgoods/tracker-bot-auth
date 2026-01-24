@@ -582,15 +582,16 @@ class TrackerService:
         if not queue:
             return {"http_status": 400, "body": {"error": "Очередь не указана"}}
 
-        # Closed on specific day
+        # Closed on specific day - by status and updated date
+        closed_statuses = '"Закрыт", "Завершен", "Решен", "Closed", "Done", "Resolved"'
         if date_offset == 0:
-            query = f'Queue: {queue} AND Resolution: !empty() AND Resolved: >= today()'
+            query = f'Queue: {queue} AND Status: {closed_statuses} AND Updated: >= today()'
         else:
             # Closed on that specific day: >= start of day AND < start of next day
-            query = f'Queue: {queue} AND Resolution: !empty() AND Resolved: >= now()-{date_offset}d AND Resolved: < now()-{date_offset - 1}d'
+            query = f'Queue: {queue} AND Status: {closed_statuses} AND Updated: >= now()-{date_offset}d AND Updated: < now()-{date_offset - 1}d'
 
         try:
-            st, payload = await self.tracker.search_issues(access, query=query, limit=50, order="-resolved")
+            st, payload = await self.tracker.search_issues(access, query=query, limit=50, order="-updated")
         except Exception as e:
             return {"http_status": 503, "body": {"error": f"Search failed: {type(e).__name__}"}}
 
@@ -605,7 +606,7 @@ class TrackerService:
                 "key": issue.get("key", ""),
                 "summary": issue.get("summary", ""),
                 "status": (issue.get("status") or {}).get("display", ""),
-                "resolvedAt": issue.get("resolvedAt", ""),
+                "updatedAt": issue.get("updatedAt", ""),
                 "url": f"https://tracker.yandex.ru/{issue.get('key', '')}"
             })
 
