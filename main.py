@@ -221,10 +221,10 @@ class TrackerClient:
         """Search issues."""
         client = await get_client()
         headers = {**self._headers(access_token), "Content-Type": "application/json"}
-        params = {"page": 1, "perPage": limit}
-        body: dict = {"query": query}
+        params: dict = {"page": 1, "perPage": limit}
         if order:
-            body["order"] = order
+            params["order"] = order
+        body: dict = {"query": query}
         r = await client.post(
             f"{self._api_base}/issues/_search",
             headers=headers,
