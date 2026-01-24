@@ -19,6 +19,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import settings
 from http_client import get_client, close_client, get_timeout
+from formatters import (
+    format_issue_list, safe_edit_markdown, strip_markdown, escape_md,
+    FORMAT_MORNING, FORMAT_EVENING, ListFormatConfig
+)
 
 # =============================================================================
 # Logging Configuration
@@ -242,11 +246,6 @@ def normalize_issue_key(text: str) -> Optional[str]:
         queue, number = match.groups()
         return f"{queue}-{number}"
     return None
-
-
-def escape_md(text: str) -> str:
-    """Escape special characters for Telegram Markdown link text."""
-    return text.replace("[", "(").replace("]", ")")
 
 
 def fmt_issue_link(issue: dict, prefix: str = "", show_date: bool = True) -> str:
@@ -898,29 +897,12 @@ async def cmd_morning(m: Message):
     kb.adjust(1)
     
     if not issues:
-        await loading.edit_text(
-            f"🌅 *{queue}* ({today_str}): нет открытых задач",
-            parse_mode="Markdown",
-            reply_markup=kb.as_markup()
-        )
-        return
+        text = f"🌅 *{queue}* ({today_str}): нет открытых задач"
+    else:
+        title = f"🌅 *Утренний отчёт — {queue}* ({today_str}, {count} задач)\n"
+        text = format_issue_list(issues, title, FORMAT_MORNING)
     
-    lines = [f"🌅 *Утренний отчёт — {queue}* ({today_str}, {count} задач)\n"]
-    for idx, issue in enumerate(issues, 1):
-        key = issue.get("key", "")
-        summary = escape_md(issue.get("summary", "")[:50])
-        status = escape_md(issue.get("status", ""))
-        url = issue.get("url", f"https://tracker.yandex.ru/{key}")
-        lines.append(f"{idx}. [{key}]({url}): {summary}")
-        if status:
-            lines.append(f"   _{status}_")
-    
-    text = "\n".join(lines)
-    try:
-        await loading.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
-    except Exception:
-        # Fallback without Markdown if parsing fails
-        await loading.edit_text(text[:4000].replace("*", "").replace("_", "").replace("[", "").replace("]", "").replace("(", " ").replace(")", ""), reply_markup=kb.as_markup())
+    await safe_edit_markdown(loading, text, reply_markup=kb.as_markup())
 
 
 @router.message(Command("evening"))
@@ -959,25 +941,12 @@ async def cmd_evening(m: Message):
     kb.adjust(1)
     
     if not issues:
-        await loading.edit_text(
-            f"🌆 *{queue}* ({today_str}): ничего не закрыто",
-            parse_mode="Markdown",
-            reply_markup=kb.as_markup()
-        )
-        return
+        text = f"🌆 *{queue}* ({today_str}): ничего не закрыто"
+    else:
+        title = f"🌆 *Вечерний отчёт — {queue}* ({today_str}, {count} закрыто)\n"
+        text = format_issue_list(issues, title, FORMAT_EVENING)
     
-    lines = [f"🌆 *Вечерний отчёт — {queue}* ({today_str}, {count} закрыто)\n"]
-    for idx, issue in enumerate(issues, 1):
-        key = issue.get("key", "")
-        summary = escape_md(issue.get("summary", "")[:50])
-        url = issue.get("url", f"https://tracker.yandex.ru/{key}")
-        lines.append(f"{idx}. [{key}]({url}): {summary}")
-    
-    text = "\n".join(lines)
-    try:
-        await loading.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
-    except Exception:
-        await loading.edit_text(text[:4000].replace("*", "").replace("_", ""), reply_markup=kb.as_markup())
+    await safe_edit_markdown(loading, text, reply_markup=kb.as_markup())
 
 
 @router.message(Command("report"))
@@ -1858,16 +1827,8 @@ async def handle_report_callback(c: CallbackQuery):
         if not issues:
             text = f"🌅 *{queue}* ({date_str}): нет открытых задач"
         else:
-            lines = [f"🌅 *Утренний отчёт — {queue}* ({date_str}, {count} задач)\n"]
-            for idx, issue in enumerate(issues, 1):
-                key = issue.get("key", "")
-                summary = escape_md(issue.get("summary", "")[:50])
-                status = escape_md(issue.get("status", ""))
-                url = issue.get("url", f"https://tracker.yandex.ru/{key}")
-                lines.append(f"{idx}. [{key}]({url}): {summary}")
-                if status:
-                    lines.append(f"   _{status}_")
-            text = "\n".join(lines)
+            title = f"🌅 *Утренний отчёт — {queue}* ({date_str}, {count} задач)\n"
+            text = format_issue_list(issues, title, FORMAT_MORNING)
         
         kb = InlineKeyboardBuilder()
         if date_offset == 0:
@@ -1879,11 +1840,7 @@ async def handle_report_callback(c: CallbackQuery):
         kb.adjust(2)
         
         if c.message:
-            try:
-                await c.message.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
-            except Exception:
-                # Fallback without Markdown if parsing fails
-                await c.message.edit_text(text[:4000].replace("*", "").replace("_", "").replace("[", "").replace("]", "").replace("(", " ").replace(")", ""), reply_markup=kb.as_markup())
+            await safe_edit_markdown(c.message, text, reply_markup=kb.as_markup())
         return
     
     if action == "evening":
@@ -1910,13 +1867,8 @@ async def handle_report_callback(c: CallbackQuery):
         if not issues:
             text = f"🌆 *{queue}* ({date_str}): ничего не закрыто"
         else:
-            lines = [f"🌆 *Вечерний отчёт — {queue}* ({date_str}, {count} закрыто)\n"]
-            for idx, issue in enumerate(issues, 1):
-                key = issue.get("key", "")
-                summary = escape_md(issue.get("summary", "")[:50])
-                url = issue.get("url", f"https://tracker.yandex.ru/{key}")
-                lines.append(f"{idx}. [{key}]({url}): {summary}")
-            text = "\n".join(lines)
+            title = f"🌆 *Вечерний отчёт — {queue}* ({date_str}, {count} закрыто)\n"
+            text = format_issue_list(issues, title, FORMAT_EVENING)
         
         kb = InlineKeyboardBuilder()
         if date_offset == 0:
@@ -1928,11 +1880,7 @@ async def handle_report_callback(c: CallbackQuery):
         kb.adjust(2)
         
         if c.message:
-            try:
-                await c.message.edit_text(text[:4000], parse_mode="Markdown", reply_markup=kb.as_markup())
-            except Exception:
-                # Fallback without Markdown if parsing fails
-                await c.message.edit_text(text[:4000].replace("*", "").replace("_", "").replace("[", "").replace("]", "").replace("(", " ").replace(")", ""), reply_markup=kb.as_markup())
+            await safe_edit_markdown(c.message, text, reply_markup=kb.as_markup())
         return
     
     if action == "stats":
