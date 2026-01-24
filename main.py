@@ -923,6 +923,41 @@ class TrackerService:
 
         return {"http_status": 200, "body": issue_data}
 
+    async def search_issues(self, tg_id: int, query: str, limit: int = 10) -> dict:
+        """Search issues using YQL query."""
+        access, err = await self._get_valid_access_token(tg_id)
+        if err:
+            return err
+
+        try:
+            st, payload = await self.tracker.search_issues(access, query=query, limit=limit, order="-updated")
+        except Exception as e:
+            return {"http_status": 503, "body": {"error": f"Search failed: {type(e).__name__}"}}
+
+        if st != 200:
+            return {"http_status": st, "body": payload}
+
+        issues_raw = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
+        
+        issues = []
+        for issue in issues_raw[:limit]:
+            issues.append({
+                "key": issue.get("key", ""),
+                "summary": issue.get("summary", ""),
+                "status": issue.get("status", {}),
+                "updatedAt": issue.get("updatedAt", ""),
+                "url": f"https://tracker.yandex.ru/{issue.get('key', '')}"
+            })
+
+        return {
+            "http_status": 200,
+            "body": {
+                "query": query,
+                "count": len(issues),
+                "issues": issues
+            }
+        }
+
     async def get_issue_checklist(self, tg_id: int, issue_key: str) -> dict:
         """Get checklist items for a specific issue."""
         access, err = await self._get_valid_access_token(tg_id)
@@ -1797,6 +1832,25 @@ async def get_issue_endpoint(
     metrics.inc("api.get_issue")
     with Timer("get_issue"):
         result = await _service.get_issue_full(tg, issue_key)  # type: ignore
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.get("/tracker/search")
+async def search_endpoint(
+    tg: int = Query(..., ge=1),
+    query: str = Query(..., min_length=2, max_length=1000),
+    limit: int = Query(10, ge=1, le=50)
+):
+    """Execute YQL search query."""
+    err = _check_config()
+    if err:
+        return err
+    rate_err = await _check_rate_limit(tg)
+    if rate_err:
+        return rate_err
+    metrics.inc("api.search")
+    with Timer("search"):
+        result = await _service.search_issues(tg, query=query, limit=limit)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
