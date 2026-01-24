@@ -633,12 +633,16 @@ async def cmd_start(m: Message):
 @router.message(Command("menu"))
 async def cmd_menu(m: Message):
     kb = InlineKeyboardBuilder()
-    kb.button(text="📊 Отчёты", callback_data="menu:reports")
-    kb.button(text="⚙️ Настройки", callback_data="menu:settings")
-    kb.adjust(2)
+    kb.button(text="🌅 Утренний", callback_data="report:morning")
+    kb.button(text="🌆 Вечерний", callback_data="report:evening")
+    kb.button(text="📊 Отчёт", callback_data="report:stats")
+    kb.adjust(3)
     
     await m.answer(
         "📋 *Меню:*\n\n"
+        "🔗 /connect — привязать аккаунт\n"
+        "👤 /me — проверить доступ\n"
+        "⚙️ /settings — настройки\n\n"
         "✅ /cl\\_my — задачи с моим ОК\n"
         "❓ /cl\\_my\\_open — ждут моего ОК\n"
         "📣 /mentions — требующие ответа\n\n"
@@ -648,108 +652,6 @@ async def cmd_menu(m: Message):
         parse_mode="Markdown",
         reply_markup=kb.as_markup()
     )
-
-
-@router.callback_query(F.data == "menu:reports")
-async def menu_reports(c: CallbackQuery):
-    await c.answer()
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🌅 Утренний", callback_data="report:morning")
-    kb.button(text="🌆 Вечерний", callback_data="report:evening")
-    kb.button(text="📊 Итоговый", callback_data="report:stats")
-    kb.button(text="◀️ Назад", callback_data="menu:back")
-    kb.adjust(3, 1)
-    
-    if c.message:
-        await c.message.edit_text(
-            "📊 *Отчёты:*\n\n"
-            "🌅 Утренний — открытые задачи\n"
-            "🌆 Вечерний — закрытые за день\n"
-            "📊 Итоговый — статистика очереди",
-            parse_mode="Markdown",
-            reply_markup=kb.as_markup()
-        )
-
-
-@router.callback_query(F.data == "menu:settings")
-async def menu_settings(c: CallbackQuery):
-    await c.answer()
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🔗 Привязать аккаунт", callback_data="menu:connect")
-    kb.button(text="👤 Проверить доступ", callback_data="menu:me")
-    kb.button(text="⚙️ Настройки", callback_data="menu:open_settings")
-    kb.button(text="◀️ Назад", callback_data="menu:back")
-    kb.adjust(1)
-    
-    if c.message:
-        await c.message.edit_text(
-            "⚙️ *Настройки и аккаунт:*",
-            parse_mode="Markdown",
-            reply_markup=kb.as_markup()
-        )
-
-
-@router.callback_query(F.data == "menu:back")
-async def menu_back(c: CallbackQuery):
-    await c.answer()
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📊 Отчёты", callback_data="menu:reports")
-    kb.button(text="⚙️ Настройки", callback_data="menu:settings")
-    kb.adjust(2)
-    
-    if c.message:
-        await c.message.edit_text(
-            "📋 *Меню:*\n\n"
-            "✅ /cl\\_my — задачи с моим ОК\n"
-            "❓ /cl\\_my\\_open — ждут моего ОК\n"
-            "📣 /mentions — требующие ответа\n\n"
-            "🤖 /summary ISSUE — резюме (ИИ)\n"
-            "🔍 /ai ЗАПРОС — поиск (ИИ)\n"
-            "📝 /new — создать задачу",
-            parse_mode="Markdown",
-            reply_markup=kb.as_markup()
-        )
-
-
-@router.callback_query(F.data == "menu:connect")
-async def menu_connect(c: CallbackQuery):
-    await c.answer()
-    url = f"{settings.base_url}/oauth/start?tg={c.from_user.id}"
-    if c.message:
-        await c.message.answer(f"Открой ссылку:\n{url}\n\nПосле — /me")
-
-
-@router.callback_query(F.data == "menu:me")
-async def menu_me(c: CallbackQuery):
-    await c.answer()
-    sc, data = await api_request("GET", "/tracker/me_by_tg", {"tg": c.from_user.id})
-    if sc != 200:
-        if c.message:
-            await c.message.answer(f"❌ Ошибка {sc}: {data}")
-        return
-    
-    inner_sc = data.get("status_code")
-    if inner_sc == 200:
-        user = data.get("response", {})
-        login = user.get("login") or user.get("display") or "unknown"
-        if c.message:
-            await c.message.answer(f"✅ Tracker: {login}")
-    else:
-        if c.message:
-            await c.message.answer(f"❌ Tracker: {inner_sc} — {data.get('response')}")
-
-
-@router.callback_query(F.data == "menu:open_settings")
-async def menu_open_settings(c: CallbackQuery):
-    await c.answer()
-    user_settings = await get_settings(c.from_user.id)
-    if not user_settings:
-        if c.message:
-            await c.message.answer("❌ Не удалось получить настройки")
-        return
-    queues, days, limit, reminder = user_settings
-    if c.message:
-        await c.message.answer(render_settings_text(queues, days, limit, reminder), reply_markup=kb_settings_main())
 
 
 @router.message(Command("connect"))
@@ -2567,13 +2469,15 @@ async def setup_bot_commands(bot: Bot):
     """Set up bot commands menu."""
     await bot.set_my_commands([
         BotCommand(command="menu", description="📋 Меню"),
-        BotCommand(command="morning", description="🌅 Утренний отчёт"),
-        BotCommand(command="evening", description="🌆 Вечерний отчёт"),
-        BotCommand(command="report", description="📊 Итоговый отчёт"),
+        BotCommand(command="connect", description="🔗 Привязать аккаунт"),
+        BotCommand(command="me", description="👤 Проверить доступ"),
         BotCommand(command="settings", description="⚙️ Настройки"),
         BotCommand(command="cl_my", description="✅ Задачи с моим ОК"),
         BotCommand(command="cl_my_open", description="❓ Ждут моего ОК"),
         BotCommand(command="mentions", description="📣 Требующие ответа"),
+        BotCommand(command="morning", description="🌅 Утренний отчёт"),
+        BotCommand(command="evening", description="🌆 Вечерний отчёт"),
+        BotCommand(command="report", description="📊 Итоговый отчёт"),
         BotCommand(command="summary", description="🤖 Резюме (ИИ)"),
         BotCommand(command="ai", description="🔍 Поиск (ИИ)"),
         BotCommand(command="new", description="📝 Создать задачу"),
