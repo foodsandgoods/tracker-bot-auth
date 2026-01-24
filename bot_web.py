@@ -2563,7 +2563,9 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
         if needs_search:
             try:
                 # Generate YQL query from natural language
+                logger.info(f"Generating YQL for: {text[:50]}, queues={queues}, days={days}")
                 yql_query, err = await generate_search_query(text, queues, days)
+                logger.info(f"YQL result: query={yql_query}, err={err}")
                 
                 if yql_query and not err:
                     # Handle special commands
@@ -2614,11 +2616,14 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
         if search_results:
             full_context += f"\n\nРезультаты из Tracker:\n{search_results}"
         
+        logger.info(f"AI context length: {len(full_context)}, has_issue={bool(issue_context)}, has_search={bool(search_results)}")
+        
         # Get history
         history = state.chat_history.get(tg_id)
         
         # Call AI with context
         response, error = await chat_with_ai(text, history, full_context if full_context else None)
+        logger.info(f"AI response: len={len(response) if response else 0}, error={error}")
         
         if error:
             await loading.edit_text(error)
