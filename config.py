@@ -74,7 +74,7 @@ class AIConfig:
     api_url: str = "https://gptunnel.ru/v1/chat/completions"
     model: str = "gpt-4o-mini"
     max_tokens: int = 600
-    temperature: float = 0.0  # No creativity, only facts
+    temperature: float = 0.2  # Low creativity, mostly facts
     max_retries: int = 2
 
 
