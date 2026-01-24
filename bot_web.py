@@ -1861,11 +1861,14 @@ async def handle_report_callback(c: CallbackQuery):
             text = f"🌅 *{queue}* ({date_str}): нет открытых задач"
         else:
             lines = [f"🌅 *Утренний отчёт — {queue}* ({date_str}, {count} задач)\n"]
-            for idx, issue in enumerate(issues[:10], 1):
+            for idx, issue in enumerate(issues, 1):
                 key = issue.get("key", "")
-                summary = escape_md(issue.get("summary", "")[:40])
+                summary = escape_md(issue.get("summary", "")[:50])
+                status = escape_md(issue.get("status", ""))
                 url = issue.get("url", f"https://tracker.yandex.ru/{key}")
                 lines.append(f"{idx}. [{key}]({url}): {summary}")
+                if status:
+                    lines.append(f"   _{status}_")
             text = "\n".join(lines)
         
         kb = InlineKeyboardBuilder()
@@ -1910,9 +1913,9 @@ async def handle_report_callback(c: CallbackQuery):
             text = f"🌆 *{queue}* ({date_str}): ничего не закрыто"
         else:
             lines = [f"🌆 *Вечерний отчёт — {queue}* ({date_str}, {count} закрыто)\n"]
-            for idx, issue in enumerate(issues[:10], 1):
+            for idx, issue in enumerate(issues, 1):
                 key = issue.get("key", "")
-                summary = escape_md(issue.get("summary", "")[:40])
+                summary = escape_md(issue.get("summary", "")[:50])
                 url = issue.get("url", f"https://tracker.yandex.ru/{key}")
                 lines.append(f"{idx}. [{key}]({url}): {summary}")
             text = "\n".join(lines)
