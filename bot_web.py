@@ -2633,9 +2633,10 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
             await loading.edit_text("❌ Не удалось получить ответ")
     
     except Exception as e:
-        logger.error(f"Chat processing error: {e}")
+        import traceback
+        logger.error(f"Chat processing error: {e}\n{traceback.format_exc()}")
         try:
-            await loading.edit_text("❌ Произошла ошибка. Попробуйте позже.")
+            await loading.edit_text(f"❌ Ошибка: {str(e)[:100]}")
         except Exception:
             pass
 
