@@ -1782,6 +1782,24 @@ async def issue_summary_endpoint(
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 
+@app.get("/tracker/issue/{issue_key}")
+async def get_issue_endpoint(
+    tg: int = Query(..., ge=1),
+    issue_key: str = ""
+):
+    """Get full issue data with comments."""
+    err = _check_config()
+    if err:
+        return err
+    rate_err = await _check_rate_limit(tg)
+    if rate_err:
+        return rate_err
+    metrics.inc("api.get_issue")
+    with Timer("get_issue"):
+        result = await _service.get_issue_full(tg, issue_key)  # type: ignore
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
 @app.get("/tracker/ai_search")
 async def ai_search_endpoint(
     tg: int = Query(..., ge=1),

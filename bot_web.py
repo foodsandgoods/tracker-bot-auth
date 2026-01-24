@@ -2528,9 +2528,9 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
             {"tg": tg_id},
             long_timeout=True
         )
-        if sc == 200 and data.get("status_code") == 200:
-            issue_data = data.get("response", {})
-            issue_context = _format_issue_context(issue_data)
+        # API returns issue data directly on success
+        if sc == 200 and data.get("key"):
+            issue_context = _format_issue_context(data)
     
     # Get history
     history = state.chat_history.get(tg_id)
