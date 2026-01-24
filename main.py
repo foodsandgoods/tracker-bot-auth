@@ -683,7 +683,10 @@ class TrackerService:
 
     def _build_candidate_query(self, queues: list[str], days: int) -> str:
         """Build search query for checklist candidates."""
-        exclude_closed = 'Status: !"Закрыт", !"Завершен", !"Решен", !"Closed", !"Done", !"Resolved"'
+        exclude_closed = (
+            'Status: !"Закрыт" AND Status: !"Завершен" AND Status: !"Решен" '
+            'AND Status: !"Closed" AND Status: !"Done" AND Status: !"Resolved"'
+        )
         base = f"Updated: >= now()-{int(days)}d AND {exclude_closed}"
         if not queues:
             return base
