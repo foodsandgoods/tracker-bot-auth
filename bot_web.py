@@ -2527,8 +2527,12 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
         queues = []
         days = 30
         if user_settings:
-            queues_str = user_settings[0] or ""
-            queues = [q.strip() for q in queues_str.split(",") if q.strip()]
+            queues_raw = user_settings[0]
+            # Handle both string and list formats
+            if isinstance(queues_raw, list):
+                queues = queues_raw
+            elif isinstance(queues_raw, str) and queues_raw:
+                queues = [q.strip() for q in queues_raw.split(",") if q.strip()]
             days = user_settings[1] or 30
         
         # Build context from various sources
