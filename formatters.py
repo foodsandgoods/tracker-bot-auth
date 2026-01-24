@@ -28,11 +28,12 @@ FORMAT_WORKER = ListFormatConfig(summary_limit=40, show_status=False, items_limi
 
 
 def escape_md(text: str) -> str:
-    """Escape Markdown special characters."""
+    """Escape Markdown special characters for Telegram Markdown (not MarkdownV2)."""
     if not text:
         return ""
-    # Escape: _ * [ ] ( ) ~ ` > # + - = | { } . !
-    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
+    # For regular Markdown: replace [ ] with ( ) to avoid breaking links
+    # Don't escape other chars as they're safe in regular Markdown
+    return text.replace("[", "(").replace("]", ")")
 
 
 def strip_markdown(text: str) -> str:
