@@ -809,11 +809,20 @@ class TrackerService:
                         issue_full.get("updatedAt") or issue_full.get("updated") or
                         orig_issue.get("updatedAt") or orig_issue.get("updated")
                     )
+                    # Extract status
+                    status_obj = issue_full.get("status") or orig_issue.get("status")
+                    status_name = ""
+                    if isinstance(status_obj, dict):
+                        status_name = status_obj.get("display") or status_obj.get("name") or ""
+                    elif isinstance(status_obj, str):
+                        status_name = status_obj
+                    
                     result.append({
                         "key": key,
                         "summary": orig_issue.get("summary") or issue_full.get("summary") or "",
                         "url": f"https://tracker.yandex.ru/{key}",
                         "updatedAt": updated_at,
+                        "status": status_name,
                         "items": matched_items,
                         "all_items": all_items,
                     })
@@ -1018,11 +1027,20 @@ class TrackerService:
                 except Exception:
                     pass
                 
+                # Extract status
+                status_obj = issue.get("status")
+                status_name = ""
+                if isinstance(status_obj, dict):
+                    status_name = status_obj.get("display") or status_obj.get("name") or ""
+                elif isinstance(status_obj, str):
+                    status_name = status_obj
+                
                 return {
                     "key": issue_key,
                     "summary": issue.get("summary") or "",
                     "url": f"https://tracker.yandex.ru/{issue_key}",
                     "updatedAt": issue.get("updatedAt") or issue.get("updated"),
+                    "status": status_name,
                     "has_responded": has_responded
                 }
             

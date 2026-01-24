@@ -599,6 +599,10 @@ def build_checklist_response(
     
     for idx, issue in enumerate(issues, 1):
         lines.append(f"\n{idx}. {fmt_issue_link(issue)}")
+        # Show status if available
+        status = issue.get("status")
+        if status:
+            lines.append(f"   _{escape_md(status)}_")
         
         if show_all_items and issue.get("all_items"):
             lines.append("   📋 *Все пункты чеклиста:*")
@@ -763,8 +767,12 @@ async def cmd_mentions(m: Message):
 
     lines = ["📣 *Требующие ответа:*"]
     for idx, issue in enumerate(issues, 1):
-        status = "✅" if issue.get("has_responded") else "⏳"
-        lines.append(f"\n{idx}. {fmt_issue_link(issue, prefix=f'{status} ')}")
+        responded_icon = "✅" if issue.get("has_responded") else "⏳"
+        lines.append(f"\n{idx}. {fmt_issue_link(issue, prefix=f'{responded_icon} ')}")
+        # Show status if available
+        issue_status = issue.get("status")
+        if issue_status:
+            lines.append(f"   _{escape_md(issue_status)}_")
     
     lines.append("\n_✅ — вы ответили, ⏳ — ожидает ответа_")
     
