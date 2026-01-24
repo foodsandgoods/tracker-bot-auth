@@ -2594,7 +2594,9 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
         search_keywords = [
             "покажи", "найди", "список", "сколько", "последние",
             "открытые", "закрытые", "статистика", "поиск", "найти",
-            "незавершённых", "незавершенных", "активных", "в работе"
+            "незавершённых", "незавершенных", "активных", "в работе",
+            "задач", "задачи", "зада", "очередь", "очереди", "тикет",
+            "все ", "первые", "новые", "старые"
         ]
         # Only skip search if issue was directly mentioned in this message
         needs_search = any(kw in text.lower() for kw in search_keywords) and not issue_mentioned_directly
