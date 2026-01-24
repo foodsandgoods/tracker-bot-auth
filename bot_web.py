@@ -895,8 +895,7 @@ async def cmd_morning(m: Message):
     
     kb = InlineKeyboardBuilder()
     kb.button(text="📆 Вчера", callback_data="report:morning:1")
-    kb.button(text="🔄 Обновить", callback_data="report:morning:0")
-    kb.adjust(2)
+    kb.adjust(1)
     
     if not issues:
         await loading.edit_text(
@@ -957,8 +956,7 @@ async def cmd_evening(m: Message):
     
     kb = InlineKeyboardBuilder()
     kb.button(text="📆 Вчера", callback_data="report:evening:1")
-    kb.button(text="🔄 Обновить", callback_data="report:evening:0")
-    kb.adjust(2)
+    kb.adjust(1)
     
     if not issues:
         await loading.edit_text(
@@ -1878,8 +1876,7 @@ async def handle_report_callback(c: CallbackQuery):
             kb.button(text="📅 Сегодня", callback_data="report:morning:0")
             if date_offset < 7:
                 kb.button(text="◀️ Раньше", callback_data=f"report:morning:{date_offset + 1}")
-        kb.button(text="🔄 Обновить", callback_data=f"report:morning:{date_offset}")
-        kb.adjust(2, 1)
+        kb.adjust(2)
         
         if c.message:
             try:
@@ -1928,8 +1925,7 @@ async def handle_report_callback(c: CallbackQuery):
             kb.button(text="📅 Сегодня", callback_data="report:evening:0")
             if date_offset < 7:
                 kb.button(text="◀️ Раньше", callback_data=f"report:evening:{date_offset + 1}")
-        kb.button(text="🔄 Обновить", callback_data=f"report:evening:{date_offset}")
-        kb.adjust(2, 1)
+        kb.adjust(2)
         
         if c.message:
             try:
