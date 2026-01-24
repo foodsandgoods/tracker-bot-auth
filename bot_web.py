@@ -133,6 +133,7 @@ class ChatHistory:
     def __init__(self, max_messages: int = 10, ttl: int = 3600):
         self._history: Dict[int, List[dict]] = {}
         self._timestamps: Dict[int, float] = {}
+        self._last_issue: Dict[int, str] = {}  # Last discussed issue key
         self._max_messages = max_messages  # 5 pairs = 10 messages
         self._ttl = ttl  # 1 hour
     
@@ -142,6 +143,7 @@ class ChatHistory:
         # Clear expired
         if user_id in self._timestamps and now - self._timestamps[user_id] > self._ttl:
             self._history[user_id] = []
+            self._last_issue.pop(user_id, None)
         
         if user_id not in self._history:
             self._history[user_id] = []
@@ -158,13 +160,27 @@ class ChatHistory:
         now = time.time()
         if user_id in self._timestamps and now - self._timestamps[user_id] > self._ttl:
             self._history[user_id] = []
+            self._last_issue.pop(user_id, None)
             return []
         return self._history.get(user_id, [])
+    
+    def set_last_issue(self, user_id: int, issue_key: str):
+        """Remember last discussed issue."""
+        self._last_issue[user_id] = issue_key
+        self._timestamps[user_id] = time.time()
+    
+    def get_last_issue(self, user_id: int) -> Optional[str]:
+        """Get last discussed issue key."""
+        now = time.time()
+        if user_id in self._timestamps and now - self._timestamps[user_id] > self._ttl:
+            return None
+        return self._last_issue.get(user_id)
     
     def clear(self, user_id: int):
         """Clear history for user."""
         self._history.pop(user_id, None)
         self._timestamps.pop(user_id, None)
+        self._last_issue.pop(user_id, None)
 
 
 class AppState:
@@ -2518,9 +2534,25 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
     loading = await m.answer("🤔 Думаю...")
     
     try:
-        # Check for issue keys in message (e.g., INV-123, DOC-45)
-        issue_pattern = r'\b([A-Z]{2,10}-\d+)\b'
-        issue_keys = re.findall(issue_pattern, text.upper())
+        # Check for issue keys in message (e.g., INV-123, DOC-45, inv123, doc45)
+        # Pattern 1: with hyphen (INV-123)
+        issue_pattern1 = r'\b([A-Z]{2,10}-\d+)\b'
+        # Pattern 2: without hyphen (INV123, doc125)
+        issue_pattern2 = r'\b([A-Z]{2,10})(\d+)\b'
+        
+        issue_keys = re.findall(issue_pattern1, text.upper())
+        
+        # Also check for keys without hyphen
+        if not issue_keys:
+            matches = re.findall(issue_pattern2, text.upper())
+            issue_keys = [f"{m[0]}-{m[1]}" for m in matches]
+        
+        # If no issue mentioned, check last discussed issue
+        if not issue_keys:
+            last_issue = state.chat_history.get_last_issue(tg_id)
+            if last_issue:
+                issue_keys = [last_issue]
+                logger.info(f"Using last issue from context: {last_issue}")
         
         # Get user settings for search constraints
         user_settings = await get_settings(tg_id)
@@ -2550,6 +2582,9 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                 )
                 if sc == 200 and data.get("key"):
                     issue_context = _format_issue_context(data)
+                    # Remember this issue for follow-up questions
+                    state.chat_history.set_last_issue(tg_id, issue_key)
+                    logger.info(f"Loaded issue {issue_key}, set as last issue")
             except Exception as e:
                 logger.warning(f"Failed to get issue {issue_key}: {e}")
         
