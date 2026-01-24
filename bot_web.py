@@ -2517,113 +2517,127 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
     # Show typing indicator
     loading = await m.answer("🤔 Думаю...")
     
-    # Check for issue keys in message (e.g., INV-123, DOC-45)
-    issue_pattern = r'\b([A-Z]{2,10}-\d+)\b'
-    issue_keys = re.findall(issue_pattern, text.upper())
-    
-    # Get user settings for search constraints
-    user_settings = await get_settings(tg_id)
-    queues = []
-    days = 30
-    if user_settings:
-        queues_str = user_settings[0] or ""
-        queues = [q.strip() for q in queues_str.split(",") if q.strip()]
-        days = user_settings[1] or 30
-    
-    # Build context from various sources
-    issue_context = None
-    search_results = None
-    
-    # 1. If specific issue mentioned - get its data
-    if issue_keys:
-        issue_key = issue_keys[0]
-        sc, data = await api_request(
-            "GET", f"/tracker/issue/{issue_key}",
-            {"tg": tg_id},
-            long_timeout=True
-        )
-        if sc == 200 and data.get("key"):
-            issue_context = _format_issue_context(data)
-    
-    # 2. Check if user is asking for search/list/stats
-    search_keywords = [
-        "покажи", "найди", "список", "задачи", "сколько", "последние",
-        "открытые", "закрытые", "статистика", "поиск", "найти"
-    ]
-    needs_search = any(kw in text.lower() for kw in search_keywords) and not issue_keys
-    
-    if needs_search:
-        # Generate YQL query from natural language
-        yql_query, err = await generate_search_query(text, queues, days)
+    try:
+        # Check for issue keys in message (e.g., INV-123, DOC-45)
+        issue_pattern = r'\b([A-Z]{2,10}-\d+)\b'
+        issue_keys = re.findall(issue_pattern, text.upper())
         
-        if yql_query and not err:
-            # Handle special commands
-            if yql_query == "CHECKLIST":
-                sc, data = await api_request(
-                    "GET", "/tracker/checklist/assigned",
-                    {"tg": tg_id, "limit": 10},
-                    long_timeout=True
-                )
-                if sc == 200:
-                    issues = data.get("issues", [])
-                    if issues:
-                        search_results = _format_search_results(issues, "Задачи с чеклистами")
-                    else:
-                        search_results = "Задач с чеклистами не найдено."
-            elif yql_query == "SUMMONS":
-                sc, data = await api_request(
-                    "GET", "/tracker/summons",
-                    {"tg": tg_id, "limit": 10},
-                    long_timeout=True
-                )
-                if sc == 200:
-                    issues = data.get("issues", [])
-                    if issues:
-                        search_results = _format_search_results(issues, "Требующие ответа")
-                    else:
-                        search_results = "Задач, требующих ответа, не найдено."
-            else:
-                # Execute YQL search
-                sc, data = await api_request(
-                    "GET", "/tracker/search",
-                    {"tg": tg_id, "query": yql_query, "limit": 10},
-                    long_timeout=True
-                )
-                if sc == 200:
-                    issues = data.get("issues", [])
-                    if issues:
-                        search_results = _format_search_results(issues, f"Результаты поиска ({len(issues)})")
-                    else:
-                        search_results = f"По запросу ничего не найдено.\nYQL: {yql_query}"
-    
-    # Build full context for AI
-    full_context = ""
-    if issue_context:
-        full_context += f"\n\n{issue_context}"
-    if search_results:
-        full_context += f"\n\nРезультаты из Tracker:\n{search_results}"
-    
-    # Get history
-    history = state.chat_history.get(tg_id)
-    
-    # Call AI with context
-    response, error = await chat_with_ai(text, history, full_context if full_context else None)
-    
-    if error:
-        await loading.edit_text(error)
-        return
-    
-    if response:
-        # Save to history
-        state.chat_history.add(tg_id, "user", text)
-        state.chat_history.add(tg_id, "assistant", response)
+        # Get user settings for search constraints
+        user_settings = await get_settings(tg_id)
+        queues = []
+        days = 30
+        if user_settings:
+            queues_str = user_settings[0] or ""
+            queues = [q.strip() for q in queues_str.split(",") if q.strip()]
+            days = user_settings[1] or 30
         
-        # Send response (split if too long)
-        await loading.delete()
-        for chunk in [response[i:i+4000] for i in range(0, len(response), 4000)]:
-            await m.answer(chunk)
-    else:
-        await loading.edit_text("❌ Не удалось получить ответ")
+        # Build context from various sources
+        issue_context = None
+        search_results = None
+        
+        # 1. If specific issue mentioned - get its data
+        if issue_keys:
+            issue_key = issue_keys[0]
+            try:
+                sc, data = await api_request(
+                    "GET", f"/tracker/issue/{issue_key}",
+                    {"tg": tg_id},
+                    long_timeout=True
+                )
+                if sc == 200 and data.get("key"):
+                    issue_context = _format_issue_context(data)
+            except Exception as e:
+                logger.warning(f"Failed to get issue {issue_key}: {e}")
+        
+        # 2. Check if user is asking for search/list/stats
+        search_keywords = [
+            "покажи", "найди", "список", "сколько", "последние",
+            "открытые", "закрытые", "статистика", "поиск", "найти"
+        ]
+        needs_search = any(kw in text.lower() for kw in search_keywords) and not issue_keys
+        
+        if needs_search:
+            try:
+                # Generate YQL query from natural language
+                yql_query, err = await generate_search_query(text, queues, days)
+                
+                if yql_query and not err:
+                    # Handle special commands
+                    if yql_query == "CHECKLIST":
+                        sc, data = await api_request(
+                            "GET", "/tracker/checklist/assigned",
+                            {"tg": tg_id, "limit": 10},
+                            long_timeout=True
+                        )
+                        if sc == 200:
+                            issues = data.get("issues", [])
+                            if issues:
+                                search_results = _format_search_results(issues, "Задачи с чеклистами")
+                            else:
+                                search_results = "Задач с чеклистами не найдено."
+                    elif yql_query == "SUMMONS":
+                        sc, data = await api_request(
+                            "GET", "/tracker/summons",
+                            {"tg": tg_id, "limit": 10},
+                            long_timeout=True
+                        )
+                        if sc == 200:
+                            issues = data.get("issues", [])
+                            if issues:
+                                search_results = _format_search_results(issues, "Требующие ответа")
+                            else:
+                                search_results = "Задач, требующих ответа, не найдено."
+                    else:
+                        # Execute YQL search
+                        sc, data = await api_request(
+                            "GET", "/tracker/search",
+                            {"tg": tg_id, "query": yql_query, "limit": 10},
+                            long_timeout=True
+                        )
+                        if sc == 200:
+                            issues = data.get("issues", [])
+                            if issues:
+                                search_results = _format_search_results(issues, f"Результаты поиска ({len(issues)})")
+                            else:
+                                search_results = f"По запросу ничего не найдено.\nYQL: {yql_query}"
+            except Exception as e:
+                logger.warning(f"Search failed: {e}")
+        
+        # Build full context for AI
+        full_context = ""
+        if issue_context:
+            full_context += f"\n\n{issue_context}"
+        if search_results:
+            full_context += f"\n\nРезультаты из Tracker:\n{search_results}"
+        
+        # Get history
+        history = state.chat_history.get(tg_id)
+        
+        # Call AI with context
+        response, error = await chat_with_ai(text, history, full_context if full_context else None)
+        
+        if error:
+            await loading.edit_text(error)
+            return
+        
+        if response:
+            # Save to history
+            state.chat_history.add(tg_id, "user", text)
+            state.chat_history.add(tg_id, "assistant", response)
+            
+            # Send response (split if too long)
+            await loading.delete()
+            for chunk in [response[i:i+4000] for i in range(0, len(response), 4000)]:
+                await m.answer(chunk)
+        else:
+            await loading.edit_text("❌ Не удалось получить ответ")
+    
+    except Exception as e:
+        logger.error(f"Chat processing error: {e}")
+        try:
+            await loading.edit_text("❌ Произошла ошибка. Попробуйте позже.")
+        except Exception:
+            pass
 
 
 def _format_search_results(issues: list, title: str) -> str:
