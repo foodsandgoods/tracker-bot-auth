@@ -455,9 +455,11 @@ YQL ПРИМЕРЫ (для query параметра):
 4. Числа и даты — из данных, не выдумывай.
 
 ФОРМАТ ОТВЕТА:
-- Для списка задач: нумерованный список с ключом, названием, статусом
-- Для одной задачи: краткое summary (статус, что сделано, что дальше)
-- Для подсчёта: число + краткий вывод"""
+- Для списка задач: нумерованный список с ключом, названием, статусом. ВСЕГДА используй ссылки в формате Markdown: [ключ: название](https://tracker.yandex.ru/ключ)
+- Для одной задачи: краткое summary (статус, что сделано, что дальше) с ссылкой на задачу
+- Для подсчёта: число + краткий вывод
+- Пример списка: 1. [INV-130: название задачи](https://tracker.yandex.ru/INV-130) [Статус] (дата)
+"""
 
 
 def _format_issue_context(issue_data: dict) -> str:
@@ -669,15 +671,31 @@ async def chat_with_ai(
                 if not tool_calls or not tool_executor:
                     content = message.get("content", "")
                     if content:
-                        if tool_executor:
-                            logger.warning(f"AI did not call tools, returned content directly: {content[:200]}")
+                        if tool_executor and round_num > 0:
+                            # This is final response after tool calls
+                            logger.info(f"AI final response after {round_num} tool call rounds: {content[:300]}")
+                            # Check if response contains error keywords after tool calls
+                            error_keywords = ["не удалось получить", "не удалось", "попробуйте позже", "попробуйте уточнить"]
+                            if any(kw in content.lower() for kw in error_keywords):
+                                logger.error(f"AI returned error message after tool calls: content='{content[:500]}', rounds={round_num}, messages_count={len(messages)}")
+                        elif tool_executor:
+                            # Check if content looks like error message
+                            error_keywords = ["не удалось получить", "не удалось", "попробуйте позже", "попробуйте уточнить"]
+                            if any(kw in content.lower() for kw in error_keywords):
+                                logger.error(f"AI returned error message without calling tools: content='{content[:300]}', user_message='{messages[-1].get('content', '')[:100] if messages else 'N/A'}'")
+                            else:
+                                logger.warning(f"AI did not call tools, returned content directly: {content[:200]}")
                         metrics.inc("ai.chat_success")
                         return content, None
                     # Try extract from data
                     content = _extract_content(data)
                     if content:
                         if tool_executor:
-                            logger.warning(f"AI did not call tools, extracted content: {content[:200]}")
+                            error_keywords = ["не удалось получить", "не удалось", "попробуйте позже"]
+                            if any(kw in content.lower() for kw in error_keywords):
+                                logger.error(f"AI returned error message without calling tools (extracted): content='{content[:300]}'")
+                            else:
+                                logger.warning(f"AI did not call tools, extracted content: {content[:200]}")
                         metrics.inc("ai.chat_success")
                         return content, None
                     continue
@@ -706,8 +724,12 @@ async def chat_with_ai(
                         result = await tool_executor(func_name, func_args)
                         # Result is already formatted text
                         result_str = result if isinstance(result, str) else str(result)
+                        
+                        # Check if result contains error
+                        if "ошибка" in result_str.lower() or "error" in result_str.lower():
+                            logger.warning(f"Tool returned error: {func_name}({func_args}) -> {result_str[:200]}")
                     except Exception as e:
-                        logger.error(f"Tool execution error: {e}")
+                        logger.error(f"Tool execution error: {e}", exc_info=True)
                         result_str = f"Ошибка выполнения: {e}"
                     
                     logger.info(f"Tool result preview: {result_str[:100]}...")

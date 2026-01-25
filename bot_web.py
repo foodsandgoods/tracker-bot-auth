@@ -2554,7 +2554,7 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                     if not issues:
                         return f"Найдено 0 задач по запросу: {query}"
                     
-                    # Format as readable text
+                    # Format as readable text with links
                     lines = [f"Найдено {len(issues)} задач:"]
                     for i, issue in enumerate(issues, 1):
                         key = issue.get("key", "?")
@@ -2562,7 +2562,9 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                         status = issue.get("status", {})
                         status_name = status.get("display") if isinstance(status, dict) else str(status)
                         updated = (issue.get("updatedAt") or "")[:10]
-                        lines.append(f"{i}. {key}: {summary} [{status_name}] ({updated})")
+                        url = f"https://tracker.yandex.ru/{key}"
+                        # Markdown format for Telegram: [text](url)
+                        lines.append(f"{i}. [{key}: {summary}]({url}) [{status_name}] ({updated})")
                     return "\n".join(lines)
                 
                 # Extract error details
@@ -2571,7 +2573,7 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                     error_detail = data.get("error") or data.get("message") or data.get("body", {}).get("error")
                     if error_detail:
                         error_msg += f": {error_detail}"
-                logger.warning(f"Search failed: query={query}, sc={sc}, error={data}")
+                logger.error(f"Search failed: query='{query}', sc={sc}, tg_id={tg_id}, error={data}")
                 return error_msg
             
             elif func_name == "get_issue":
@@ -2612,8 +2614,9 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                     
                     deadline = data.get("deadline") or "Не указан"
                     updated = data.get("updatedAt", "")[:19].replace("T", " ")
+                    url = f"https://tracker.yandex.ru/{key}"
                     
-                    result = f"""Задача {key}: {summary}
+                    result = f"""[Задача {key}: {summary}]({url})
 
 Статус: {status_name}
 Приоритет: {priority_name}
@@ -2643,7 +2646,7 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                         error_detail = data.get("error") or data.get("message") or data.get("body", {}).get("error")
                         if error_detail:
                             error_msg += f": {error_detail}"
-                    logger.warning(f"Get issue failed: key={issue_key}, sc={sc}, error={data}")
+                    logger.error(f"Get issue failed: key={issue_key}, sc={sc}, tg_id={tg_id}, error={data}")
                 return error_msg
             
             elif func_name == "count_issues":
@@ -2674,14 +2677,15 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                     error_detail = data.get("error") or data.get("message") or data.get("body", {}).get("error")
                     if error_detail:
                         error_msg += f": {error_detail}"
-                logger.warning(f"Count failed: query={query}, sc={sc}, error={data}")
+                logger.error(f"Count failed: query='{query}', sc={sc}, tg_id={tg_id}, error={data}")
                 return error_msg
             
             else:
                 return f"Неизвестная функция: {func_name}"
                 
         except Exception as e:
-            logger.error(f"Tool executor error: {e}")
+            import traceback
+            logger.error(f"Tool executor exception: func={func_name}, args={func_args}, tg_id={tg_id}, error={e}\n{traceback.format_exc()}")
             return f"Ошибка: {e}"
     
     try:
@@ -2709,6 +2713,12 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
             return
         
         if response:
+            # Check if AI responded with error message without calling functions
+            error_keywords = ["не удалось получить", "не удалось", "ошибка", "попробуйте позже", "попробуйте уточнить"]
+            response_lower = response.lower()
+            if any(kw in response_lower for kw in error_keywords) and "ошибка" not in text.lower():
+                logger.warning(f"AI returned error-like response without calling functions: user_query='{text}', response='{response[:300]}'")
+            
             # Save to history
             state.chat_history.add(tg_id, "user", text)
             state.chat_history.add(tg_id, "assistant", response)
@@ -2716,7 +2726,7 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
             # Send response (split if too long)
             await loading.delete()
             for chunk in [response[i:i+4000] for i in range(0, len(response), 4000)]:
-                await m.answer(chunk)
+                await m.answer(chunk, parse_mode="Markdown")
         else:
             await loading.edit_text("❌ Не удалось получить ответ")
     
