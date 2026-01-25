@@ -2996,7 +2996,7 @@ async def handle_calendar_callback(cb: CallbackQuery):
 # =============================================================================
 async def setup_bot_commands(bot: Bot):
     """Set up bot commands menu."""
-    await bot.set_my_commands([
+    commands = [
         BotCommand(command="menu", description="📋 Меню"),
         BotCommand(command="connect", description="🔗 Привязать аккаунт"),
         BotCommand(command="me", description="👤 Проверить доступ"),
@@ -3013,7 +3013,9 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="clear", description="🗑️ Очистить историю чата"),
         BotCommand(command="logs", description="📋 Последние ошибки ИИ"),
         BotCommand(command="calendar", description="📅 События календаря"),
-    ])
+    ]
+    await bot.set_my_commands(commands)
+    logger.info(f"Bot commands registered: {len(commands)} commands including calendar")
 
 
 async def run_bot():
