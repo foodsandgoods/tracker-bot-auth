@@ -3037,20 +3037,31 @@ async def run_bot():
     state.bot = bot
     await setup_bot_commands(bot)
     
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await asyncio.sleep(5)  # Wait for old instance to fully stop
-    except Exception:
-        pass
+    # Aggressively delete webhook before starting polling
+    logger.info("Deleting webhook before starting polling...")
+    for webhook_attempt in range(3):
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info(f"Webhook deleted successfully (attempt {webhook_attempt + 1})")
+            break
+        except Exception as e:
+            logger.warning(f"Failed to delete webhook (attempt {webhook_attempt + 1}): {e}")
+            if webhook_attempt < 2:
+                await asyncio.sleep(2)
+    
+    # Wait longer for old instances to fully stop
+    logger.info("Waiting 15 seconds for old instances to stop...")
+    await asyncio.sleep(15)
     
     if state.dispatcher is None:
         dp = Dispatcher()
         dp.include_router(router)
         state.dispatcher = dp
     
-    max_retries = 5
+    max_retries = 8
     for attempt in range(max_retries):
         try:
+            logger.info(f"Starting polling (attempt {attempt + 1}/{max_retries})...")
             await state.dispatcher.start_polling(
                 bot,
                 close_bot_session=False,
@@ -3058,17 +3069,29 @@ async def run_bot():
                 drop_pending_updates=True,
                 polling_timeout=30
             )
+            logger.info("Polling started successfully!")
             break
         except Exception as e:
             error_str = str(e)
+            logger.error(f"Polling failed (attempt {attempt + 1}/{max_retries}): {error_str}")
             if ("Conflict" in error_str or "terminated" in error_str) and attempt < max_retries - 1:
-                logger.warning(f"Bot conflict, retrying in {10 * (attempt + 1)}s... (attempt {attempt + 1}/{max_retries})")
-                await asyncio.sleep(10 * (attempt + 1))  # 10, 20, 30, 40 seconds
-                try:
-                    await bot.delete_webhook(drop_pending_updates=True)
-                except Exception:
-                    pass
+                wait_time = 15 * (attempt + 1)  # 15, 30, 45, 60, 75, 90, 105 seconds
+                logger.warning(f"Bot conflict detected, waiting {wait_time}s before retry...")
+                
+                # Try to delete webhook again
+                for webhook_attempt in range(3):
+                    try:
+                        await bot.delete_webhook(drop_pending_updates=True)
+                        logger.info(f"Webhook deleted during retry (attempt {webhook_attempt + 1})")
+                        break
+                    except Exception as webhook_err:
+                        logger.warning(f"Failed to delete webhook during retry: {webhook_err}")
+                        if webhook_attempt < 2:
+                            await asyncio.sleep(2)
+                
+                await asyncio.sleep(wait_time)
             else:
+                logger.error(f"Polling failed permanently: {e}")
                 raise
 
 
