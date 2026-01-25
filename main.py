@@ -338,6 +338,7 @@ class CalendarClient:
     """Yandex Calendar CalDAV client."""
     
     def __init__(self):
+        # Yandex Calendar CalDAV endpoint
         self._caldav_base = "https://caldav.yandex.ru"
     
     def _headers(self, access_token: str) -> dict[str, str]:
@@ -383,6 +384,9 @@ class CalendarClient:
         
         try:
             # CalDAV uses REPORT method (not GET/POST)
+            logger.info(f"[CALENDAR] Sending REPORT request to: {calendar_url}")
+            logger.debug(f"[CALENDAR] Request body: {report_body[:500]}")
+            
             r = await client.request(
                 "REPORT",
                 calendar_url,
@@ -391,14 +395,16 @@ class CalendarClient:
                 timeout=get_timeout(long=True)
             )
             
+            logger.info(f"[CALENDAR] Response: status={r.status_code}, headers={dict(r.headers)}, body_length={len(r.text)}")
+            
             if r.status_code == 200:
                 # Parse iCalendar data from response
                 events = self._parse_icalendar(r.text)
                 logger.info(f"[CALENDAR] Retrieved events: email={email}, date={start_date}, count={len(events)}")
                 return 200, events
             else:
-                logger.warning(f"[CALENDAR] Request failed: status={r.status_code}, email={email}, response={r.text[:200]}")
-                return r.status_code, {"error": f"Calendar API returned {r.status_code}"}
+                logger.warning(f"[CALENDAR] Request failed: status={r.status_code}, email={email}, response={r.text[:500]}")
+                return r.status_code, {"error": f"Calendar API returned {r.status_code}", "response": r.text[:500]}
                 
         except Exception as e:
             logger.error(f"[CALENDAR] Request exception: {type(e).__name__}: {e}", exc_info=True)
@@ -2057,6 +2063,62 @@ async def search_endpoint(
     with Timer("search"):
         result = await _service.search_issues(tg, query=query, limit=limit)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.get("/calendar/test")
+async def calendar_test(
+    tg: int = Query(..., ge=1)
+):
+    """Test calendar connection - check token and user info."""
+    err = _check_config()
+    if err:
+        return err
+    
+    if not _service:
+        return JSONResponse({"error": "Service not initialized"}, status_code=500)
+    
+    logger.info(f"[CALENDAR_TEST] Testing connection for tg_id={tg}")
+    
+    # Get access token
+    access, err_dict = await _service._get_valid_access_token(tg)  # type: ignore
+    if err_dict:
+        logger.warning(f"[CALENDAR_TEST] No valid token: {err_dict}")
+        return JSONResponse(err_dict["body"], status_code=err_dict["http_status"])
+    
+    logger.info(f"[CALENDAR_TEST] Token obtained: {access[:20]}...")
+    
+    # Get user info
+    try:
+        st, me = await _service.tracker.myself(access)  # type: ignore
+        if st != 200 or not isinstance(me, dict):
+            logger.error(f"[CALENDAR_TEST] Failed to get user info: status={st}")
+            return JSONResponse({"error": f"Failed to get user info: {st}", "response": me}, status_code=503)
+        
+        email = me.get("login")
+        if not email:
+            logger.error(f"[CALENDAR_TEST] No email in user info")
+            return JSONResponse({"error": "User email not found", "user_info": me}, status_code=404)
+        
+        logger.info(f"[CALENDAR_TEST] User email: {email}")
+        
+        # Test calendar URL construction
+        calendar_url = f"https://caldav.yandex.ru/calendars/{email}/events-default"
+        
+        return JSONResponse({
+            "status": "ok",
+            "token_valid": True,
+            "email": email,
+            "calendar_url": calendar_url,
+            "user_info": {
+                "id": me.get("id"),
+                "login": me.get("login"),
+                "display": me.get("display"),
+            }
+        }, status_code=200)
+        
+    except Exception as e:
+        logger.error(f"[CALENDAR_TEST] Exception: {type(e).__name__}: {e}", exc_info=True)
+        return JSONResponse({"error": f"Test failed: {type(e).__name__}", "message": str(e)}, status_code=503)
 
 
 @app.get("/calendar/events")
