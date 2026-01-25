@@ -2831,6 +2831,53 @@ async def cmd_logs(m: Message):
     await m.answer(text, parse_mode=None)
 
 
+@router.message(Command("calendar_test"))
+async def cmd_calendar_test(m: Message):
+    """Test calendar connection."""
+    if not m.from_user:
+        return
+    
+    tg_id = m.from_user.id
+    logger.info(f"[CALENDAR_TEST] Command received: tg_id={tg_id}")
+    
+    loading = await m.answer("🔍 Проверяю подключение к календарю...")
+    
+    try:
+        sc, data = await api_request(
+            "GET", "/calendar/test",
+            {"tg": tg_id},
+            long_timeout=True
+        )
+        
+        if sc == 200:
+            status = data.get("status", "unknown")
+            token_valid = data.get("token_valid", False)
+            email = data.get("email", "не найден")
+            calendar_url = data.get("calendar_url", "")
+            
+            result_text = f"✅ **Тест подключения к календарю**\n\n"
+            result_text += f"Статус: `{status}`\n"
+            result_text += f"Токен валиден: {'✅' if token_valid else '❌'}\n"
+            result_text += f"Email: `{email}`\n"
+            result_text += f"URL календаря: `{calendar_url}`\n"
+            
+            if data.get("user_info"):
+                user_info = data["user_info"]
+                result_text += f"\n**Информация о пользователе:**\n"
+                result_text += f"ID: `{user_info.get('id', 'N/A')}`\n"
+                result_text += f"Login: `{user_info.get('login', 'N/A')}`\n"
+                result_text += f"Display: `{user_info.get('display', 'N/A')}`\n"
+            
+            await loading.edit_text(result_text, parse_mode="Markdown")
+        else:
+            error_msg = data.get("error", "Неизвестная ошибка")
+            await loading.edit_text(f"❌ **Ошибка подключения**\n\nСтатус: `{sc}`\nОшибка: `{error_msg}`", parse_mode="Markdown")
+            
+    except Exception as e:
+        logger.error(f"[CALENDAR_TEST] Exception: {e}", exc_info=True)
+        await loading.edit_text(f"❌ Исключение: {type(e).__name__}: {e}")
+
+
 @router.message(Command("calendar"))
 async def cmd_calendar(m: Message):
     """Show calendar events for today."""
