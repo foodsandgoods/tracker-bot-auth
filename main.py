@@ -332,15 +332,171 @@ class TrackerClient:
 
 
 # =============================================================================
+# Calendar Client (CalDAV)
+# =============================================================================
+class CalendarClient:
+    """Yandex Calendar CalDAV client."""
+    
+    def __init__(self):
+        self._caldav_base = "https://caldav.yandex.ru"
+    
+    def _headers(self, access_token: str) -> dict[str, str]:
+        """Build CalDAV request headers."""
+        return {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/xml; charset=utf-8",
+            "Depth": "1",
+        }
+    
+    @with_retry(max_attempts=2, base_delay=1.0)
+    async def get_events(self, access_token: str, email: str, start_date: str, end_date: str) -> tuple[int, Any]:
+        """
+        Get calendar events for date range using CalDAV REPORT.
+        
+        Args:
+            access_token: OAuth token
+            email: User email (login)
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format (inclusive)
+        
+        Returns:
+            Tuple of (status_code, events_list)
+        """
+        client = await get_client()
+        calendar_url = f"{self._caldav_base}/calendars/{email}/events-default"
+        
+        # CalDAV REPORT request body for date range query
+        report_body = f"""<?xml version="1.0" encoding="utf-8"?>
+<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+    <D:prop>
+        <D:getetag/>
+        <C:calendar-data/>
+    </D:prop>
+    <C:filter>
+        <C:comp-filter name="VCALENDAR">
+            <C:comp-filter name="VEVENT">
+                <C:time-range start="{start_date}T00:00:00Z" end="{end_date}T23:59:59Z"/>
+            </C:comp-filter>
+        </C:comp-filter>
+    </C:filter>
+</C:calendar-query>"""
+        
+        try:
+            # CalDAV uses REPORT method (not GET/POST)
+            r = await client.request(
+                "REPORT",
+                calendar_url,
+                headers=self._headers(access_token),
+                content=report_body.encode('utf-8'),
+                timeout=get_timeout(long=True)
+            )
+            
+            if r.status_code == 200:
+                # Parse iCalendar data from response
+                events = self._parse_icalendar(r.text)
+                logger.info(f"[CALENDAR] Retrieved events: email={email}, date={start_date}, count={len(events)}")
+                return 200, events
+            else:
+                logger.warning(f"[CALENDAR] Request failed: status={r.status_code}, email={email}, response={r.text[:200]}")
+                return r.status_code, {"error": f"Calendar API returned {r.status_code}"}
+                
+        except Exception as e:
+            logger.error(f"[CALENDAR] Request exception: {type(e).__name__}: {e}", exc_info=True)
+            return 503, {"error": f"Calendar request failed: {type(e).__name__}"}
+    
+    def _parse_icalendar(self, ical_data: str) -> list[dict]:
+        """
+        Parse iCalendar data and extract events.
+        Returns list of event dicts with: summary, start, end, description, url
+        """
+        events = []
+        if not ical_data or "BEGIN:VEVENT" not in ical_data:
+            return events
+        
+        try:
+            import re
+            # Split by VEVENT blocks
+            event_blocks = re.split(r'BEGIN:VEVENT', ical_data)
+            
+            for block in event_blocks[1:]:  # Skip first empty part
+                if "END:VEVENT" not in block:
+                    continue
+                
+                event = {}
+                
+                # Extract summary (title)
+                summary_match = re.search(r'SUMMARY[;:]([^\r\n]+)', block)
+                if summary_match:
+                    event["summary"] = summary_match.group(1).strip()
+                
+                # Extract start time
+                dtstart_match = re.search(r'DTSTART[;:]([^\r\n]+)', block)
+                if dtstart_match:
+                    dtstart = dtstart_match.group(1).strip()
+                    event["start"] = self._parse_ical_date(dtstart)
+                
+                # Extract end time
+                dtend_match = re.search(r'DTEND[;:]([^\r\n]+)', block)
+                if dtend_match:
+                    dtend = dtend_match.group(1).strip()
+                    event["end"] = self._parse_ical_date(dtend)
+                
+                # Extract description
+                desc_match = re.search(r'DESCRIPTION[;:]([^\r\n]+)', block)
+                if desc_match:
+                    event["description"] = desc_match.group(1).strip()
+                
+                # Extract URL
+                url_match = re.search(r'URL[;:]([^\r\n]+)', block)
+                if url_match:
+                    event["url"] = url_match.group(1).strip()
+                
+                # Extract UID for calendar link
+                uid_match = re.search(r'UID[;:]([^\r\n]+)', block)
+                if uid_match:
+                    uid = uid_match.group(1).strip()
+                    # Build Yandex Calendar URL
+                    event["calendar_url"] = f"https://calendar.yandex.ru/event/{uid}"
+                
+                if event.get("summary"):  # Only add if has title
+                    events.append(event)
+                    
+        except Exception as e:
+            logger.error(f"Failed to parse iCalendar: {e}")
+        
+        return events
+    
+    def _parse_ical_date(self, dt_str: str) -> str:
+        """Parse iCalendar date format to readable string."""
+        try:
+            # Handle formats: 20240125T100000Z or 20240125
+            dt_str = dt_str.replace("Z", "").replace("T", "")
+            if len(dt_str) >= 8:
+                year = dt_str[0:4]
+                month = dt_str[4:6]
+                day = dt_str[6:8]
+                time_str = ""
+                if len(dt_str) > 8:
+                    hour = dt_str[9:11] if len(dt_str) > 9 else dt_str[8:10]
+                    minute = dt_str[11:13] if len(dt_str) > 11 else dt_str[10:12]
+                    time_str = f" {hour}:{minute}"
+                return f"{year}-{month}-{day}{time_str}"
+        except Exception:
+            pass
+        return dt_str
+
+
+# =============================================================================
 # Service Layer
 # =============================================================================
 class TrackerService:
     """Business logic for Tracker operations."""
     
-    def __init__(self, storage: TokenStorage, oauth: OAuthClient, tracker: TrackerClient):
+    def __init__(self, storage: TokenStorage, oauth: OAuthClient, tracker: TrackerClient, calendar: CalendarClient):
         self.storage = storage
         self.oauth = oauth
         self.tracker = tracker
+        self.calendar = calendar
 
     async def _get_valid_access_token(self, tg_id: int) -> tuple[Optional[str], Optional[dict]]:
         """Get valid access token, refreshing if needed."""
@@ -1237,6 +1393,54 @@ class TrackerService:
                 "comment_id": resp.get("id") if isinstance(resp, dict) else None
             }
         }
+    
+    async def get_calendar_events(self, tg_id: int, date: str) -> dict:
+        """
+        Get calendar events for a specific date.
+        
+        Args:
+            tg_id: Telegram user ID
+            date: Date in YYYY-MM-DD format
+        
+        Returns:
+            Dict with http_status and body containing events list
+        """
+        logger.info(f"[CALENDAR] Getting events: tg_id={tg_id}, date={date}")
+        
+        # Get access token
+        access, err = await self._get_valid_access_token(tg_id)
+        if err:
+            logger.warning(f"[CALENDAR] No valid token for tg_id={tg_id}")
+            return err
+        
+        # Get user email from /myself
+        try:
+            st, me = await self.tracker.myself(access)
+            if st != 200 or not isinstance(me, dict):
+                logger.error(f"[CALENDAR] Failed to get user info, status={st}")
+                return {"http_status": 503, "body": {"error": "Failed to get user info"}}
+            
+            email = me.get("login")
+            if not email:
+                logger.error(f"[CALENDAR] No email in user info for tg_id={tg_id}")
+                return {"http_status": 404, "body": {"error": "User email not found"}}
+        except Exception as e:
+            logger.error(f"[CALENDAR] Exception getting user info: {type(e).__name__}: {e}")
+            return {"http_status": 503, "body": {"error": f"Failed to get user info: {type(e).__name__}"}}
+        
+        # Get events for the date (start and end are the same day)
+        try:
+            st, events = await self.calendar.get_events(access, email, date, date)
+            if st == 200:
+                event_count = len(events) if isinstance(events, list) else 0
+                logger.info(f"[CALENDAR] Retrieved {event_count} events for {email} on {date}")
+                return {"http_status": 200, "body": {"events": events, "date": date, "email": email}}
+            else:
+                logger.warning(f"[CALENDAR] API returned status {st} for {email} on {date}")
+                return {"http_status": st, "body": events if isinstance(events, dict) else {"error": f"Calendar API error: {st}"}}
+        except Exception as e:
+            logger.error(f"[CALENDAR] Exception getting events: {type(e).__name__}: {e}", exc_info=True)
+            return {"http_status": 503, "body": {"error": f"Calendar request failed: {type(e).__name__}"}}
 
     async def create_issue(
         self, tg_id: int, queue: str, summary: str,
@@ -1326,7 +1530,8 @@ async def lifespan(app: FastAPI):
     if settings.is_configured and _storage:
         _oauth = OAuthClient()
         _tracker = TrackerClient()
-        _service = TrackerService(_storage, _oauth, _tracker)
+        _calendar = CalendarClient()
+        _service = TrackerService(_storage, _oauth, _tracker, _calendar)
         logger.info("Service layer initialized")
     else:
         logger.warning(f"Service not fully configured. Missing: {settings.missing_vars}")
@@ -1851,6 +2056,30 @@ async def search_endpoint(
     metrics.inc("api.search")
     with Timer("search"):
         result = await _service.search_issues(tg, query=query, limit=limit)  # type: ignore
+    return JSONResponse(result["body"], status_code=result["http_status"])
+
+
+@app.get("/calendar/events")
+async def calendar_events(
+    tg: int = Query(..., ge=1),
+    date: str = Query(..., description="Date in YYYY-MM-DD format")
+):
+    """Get calendar events for a specific date."""
+    err = _check_config()
+    if err:
+        return err
+    rate_err = await _check_rate_limit(tg)
+    if rate_err:
+        return rate_err
+    
+    # Validate date format
+    import re
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', date):
+        return JSONResponse({"error": "Invalid date format. Use YYYY-MM-DD"}, status_code=400)
+    
+    metrics.inc("api.calendar_events")
+    with Timer("calendar_events"):
+        result = await _service.get_calendar_events(tg, date)  # type: ignore
     return JSONResponse(result["body"], status_code=result["http_status"])
 
 

@@ -2831,6 +2831,168 @@ async def cmd_logs(m: Message):
     await m.answer(text, parse_mode=None)
 
 
+@router.message(Command("calendar"))
+async def cmd_calendar(m: Message):
+    """Show calendar events for today."""
+    if not m.from_user:
+        return
+    
+    tg_id = m.from_user.id
+    from datetime import datetime, timedelta
+    
+    # Get today's date
+    today = datetime.now().strftime("%Y-%m-%d")
+    
+    loading = await m.answer("📅 Загружаю события...")
+    
+    try:
+        sc, data = await api_request(
+            "GET", "/calendar/events",
+            {"tg": tg_id, "date": today},
+            long_timeout=True
+        )
+        
+        if sc == 200:
+            events = data.get("events", [])
+            if not events:
+                text = f"📅 Сегодня ({today}) событий нет"
+            else:
+                lines = [f"📅 События на сегодня ({today}):\n"]
+                for i, event in enumerate(events, 1):
+                    summary = event.get("summary", "Без названия")
+                    start = event.get("start", "")
+                    end = event.get("end", "")
+                    description = event.get("description", "")
+                    url = event.get("calendar_url") or event.get("url", "")
+                    
+                    # Format time
+                    time_str = ""
+                    if start:
+                        if " " in start:
+                            time_str = start.split(" ")[1][:5]  # HH:MM
+                        else:
+                            time_str = start
+                    
+                    line = f"{i}. "
+                    if time_str:
+                        line += f"{time_str} — "
+                    line += summary
+                    
+                    if description:
+                        line += f"\n   {description[:100]}"
+                    
+                    if url:
+                        line += f"\n   [Открыть в календаре]({url})"
+                    
+                    lines.append(line)
+                
+                text = "\n".join(lines)
+            
+            # Add button for tomorrow
+            from aiogram.utils.keyboard import InlineKeyboardBuilder
+            builder = InlineKeyboardBuilder()
+            tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+            builder.button(text="📅 Завтра", callback_data=f"calendar:{tomorrow}")
+            
+            await loading.delete()
+            await m.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+        else:
+            error_msg = data.get("error", f"Ошибка {sc}")
+            await loading.edit_text(f"❌ Не удалось загрузить события: {error_msg}")
+    except Exception as e:
+        logger.error(f"Calendar command error: {e}", exc_info=True)
+        try:
+            await loading.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data.startswith("calendar:"))
+async def handle_calendar_callback(cb: CallbackQuery):
+    """Handle calendar date navigation."""
+    if not cb.from_user or not cb.data:
+        return
+    
+    tg_id = cb.from_user.id
+    date = cb.data.split(":", 1)[1]
+    
+    await cb.answer()
+    loading = await cb.message.answer("📅 Загружаю события...") if cb.message else None
+    
+    try:
+        from datetime import datetime, timedelta
+        
+        sc, data = await api_request(
+            "GET", "/calendar/events",
+            {"tg": tg_id, "date": date},
+            long_timeout=True
+        )
+        
+        if sc == 200:
+            events = data.get("events", [])
+            date_str = datetime.strptime(date, "%Y-%m-%d").strftime("%d.%m.%Y")
+            
+            if not events:
+                text = f"📅 {date_str} — событий нет"
+            else:
+                lines = [f"📅 События на {date_str}:\n"]
+                for i, event in enumerate(events, 1):
+                    summary = event.get("summary", "Без названия")
+                    start = event.get("start", "")
+                    description = event.get("description", "")
+                    url = event.get("calendar_url") or event.get("url", "")
+                    
+                    time_str = ""
+                    if start and " " in start:
+                        time_str = start.split(" ")[1][:5]
+                    
+                    line = f"{i}. "
+                    if time_str:
+                        line += f"{time_str} — "
+                    line += summary
+                    
+                    if description:
+                        line += f"\n   {description[:100]}"
+                    
+                    if url:
+                        line += f"\n   [Открыть в календаре]({url})"
+                    
+                    lines.append(line)
+                
+                text = "\n".join(lines)
+            
+            # Add navigation buttons
+            from aiogram.utils.keyboard import InlineKeyboardBuilder
+            builder = InlineKeyboardBuilder()
+            
+            date_obj = datetime.strptime(date, "%Y-%m-%d")
+            today = datetime.now().date()
+            yesterday = (date_obj - timedelta(days=1)).strftime("%Y-%m-%d")
+            tomorrow = (date_obj + timedelta(days=1)).strftime("%Y-%m-%d")
+            
+            if date_obj.date() != today:
+                builder.button(text="◀️ Вчера", callback_data=f"calendar:{yesterday}")
+            builder.button(text="📅 Сегодня", callback_data=f"calendar:{today.strftime('%Y-%m-%d')}")
+            builder.button(text="Завтра ▶️", callback_data=f"calendar:{tomorrow}")
+            builder.adjust(3)
+            
+            if loading:
+                await loading.delete()
+            if cb.message:
+                await cb.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+        else:
+            error_msg = data.get("error", f"Ошибка {sc}")
+            if loading:
+                await loading.edit_text(f"❌ Не удалось загрузить события: {error_msg}")
+    except Exception as e:
+        logger.error(f"Calendar callback error: {e}", exc_info=True)
+        if loading:
+            try:
+                await loading.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+            except Exception:
+                pass
+
+
 # =============================================================================
 # Bot Setup and Run
 # =============================================================================
@@ -2852,6 +3014,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="new", description="📝 Создать задачу"),
         BotCommand(command="clear", description="🗑️ Очистить историю чата"),
         BotCommand(command="logs", description="📋 Последние ошибки ИИ"),
+        BotCommand(command="calendar", description="📅 События календаря"),
     ])
 
 
