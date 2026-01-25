@@ -2534,6 +2534,7 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
     
     async def tool_executor(func_name: str, func_args: dict) -> str:
         """Execute AI tool calls against Tracker API. Returns formatted text."""
+        logger.info(f"Tool executor called: {func_name}({func_args})")
         try:
             if func_name == "search_issues":
                 query = func_args.get("query", "")
@@ -2694,13 +2695,14 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
             context_hint = f"Последняя обсуждаемая задача: {last_issue}"
         
         # Call AI with tools
+        logger.info(f"Calling AI with text: {text[:100]}, has_history={len(history) > 0}")
         response, error = await chat_with_ai(
             text, 
             history, 
             issue_context=context_hint,
             tool_executor=tool_executor
         )
-        logger.info(f"AI response: len={len(response) if response else 0}, error={error}")
+        logger.info(f"AI response: len={len(response) if response else 0}, error={error}, preview={response[:200] if response else None}")
         
         if error:
             await loading.edit_text(error)

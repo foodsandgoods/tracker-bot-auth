@@ -442,7 +442,11 @@ YQL ПРИМЕРЫ (для query параметра):
 - Для "покажи задачи" используй search_issues
 - Для периода используй "Updated: >= now()-7d" (7 дней), "now()-30d" (30 дней)
 - Статус "Closed" = закрытые, "!Closed" = незакрытые
-- Если ошибка — попробуй упростить запрос (убери фильтры по дате или статусу)
+- Если функция вернула ошибку — попробуй упростить запрос:
+  * Убери фильтр по дате: "Queue: DOC AND Status: Closed" вместо "Queue: DOC AND Status: Closed AND Updated: >= now()-7d"
+  * Убери фильтр по статусу: "Queue: DOC" вместо "Queue: DOC AND Status: Closed"
+  * Попробуй базовый запрос: "Queue: DOC"
+- НИКОГДА не говори "не удалось получить данные" без вызова функции!
 
 ПРАВИЛА:
 1. Нужны данные → вызови функцию. НЕ говори "нет доступа".
@@ -621,6 +625,7 @@ async def chat_with_ai(
     if tool_executor:
         payload["tools"] = TRACKER_TOOLS
         payload["tool_choice"] = "auto"
+        logger.info(f"Added {len(TRACKER_TOOLS)} tools to payload")
     
     client = await get_client()
     timeout = get_timeout(long=True)
@@ -635,9 +640,12 @@ async def chat_with_ai(
     for headers in auth_variants:
         try:
             for round_num in range(max_tool_rounds + 1):
+                logger.debug(f"AI request round {round_num + 1}/{max_tool_rounds + 1}, payload keys: {list(payload.keys())}")
                 status, data = await _make_request(
                     client, ai_config.api_url, headers, payload, timeout
                 )
+                
+                logger.info(f"AI API response: status={status}, has_choices={bool(data.get('choices'))}")
                 
                 if status != 200:
                     if status == 401:
@@ -661,11 +669,15 @@ async def chat_with_ai(
                 if not tool_calls or not tool_executor:
                     content = message.get("content", "")
                     if content:
+                        if tool_executor:
+                            logger.warning(f"AI did not call tools, returned content directly: {content[:200]}")
                         metrics.inc("ai.chat_success")
                         return content, None
                     # Try extract from data
                     content = _extract_content(data)
                     if content:
+                        if tool_executor:
+                            logger.warning(f"AI did not call tools, extracted content: {content[:200]}")
                         metrics.inc("ai.chat_success")
                         return content, None
                     continue
