@@ -2834,17 +2834,21 @@ async def cmd_logs(m: Message):
 @router.message(Command("calendar"))
 async def cmd_calendar(m: Message):
     """Show calendar events for today."""
-    logger.info(f"Calendar command received: tg_id={m.from_user.id if m.from_user else None}")
+    logger.info(f"[CALENDAR_CMD] Command received: tg_id={m.from_user.id if m.from_user else None}, text={m.text}")
     
     if not m.from_user:
+        logger.warning("[CALENDAR_CMD] No from_user")
         return
     
     tg_id = m.from_user.id
+    logger.info(f"[CALENDAR_CMD] Processing for tg_id={tg_id}")
     
     # Get today's date
     today = datetime.now().strftime("%Y-%m-%d")
+    logger.info(f"[CALENDAR_CMD] Date: {today}")
     
     loading = await m.answer("📅 Загружаю события...")
+    logger.info(f"[CALENDAR_CMD] Loading message sent")
     
     try:
         sc, data = await api_request(
