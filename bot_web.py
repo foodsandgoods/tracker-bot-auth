@@ -2529,12 +2529,14 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
     """Process chat message with AI assistant using function calling."""
     from ai_service import chat_with_ai, _format_issue_context
     
+    logger.info(f"Processing chat message: tg_id={tg_id}, text='{text[:100]}'")
+    
     # Show typing indicator
     loading = await m.answer("🤔 Думаю...")
     
     async def tool_executor(func_name: str, func_args: dict) -> str:
         """Execute AI tool calls against Tracker API. Returns formatted text."""
-        logger.info(f"Tool executor called: {func_name}({func_args})")
+        logger.info(f"[TOOL_CALL] tg_id={tg_id}, func={func_name}, args={func_args}")
         try:
             if func_name == "search_issues":
                 query = func_args.get("query", "")
@@ -2551,8 +2553,11 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                 
                 if sc == 200:
                     issues = data.get("issues", [])
+                    logger.info(f"[TOOL_RESULT] search_issues: sc=200, found={len(issues)}, query='{query}'")
                     if not issues:
-                        return f"Найдено 0 задач по запросу: {query}"
+                        result = f"Найдено 0 задач по запросу: {query}"
+                        logger.info(f"[TOOL_RESULT] search_issues: returning '{result}'")
+                        return result
                     
                     # Format as readable text with links
                     lines = [f"Найдено {len(issues)} задач:"]
@@ -2565,7 +2570,9 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                         url = f"https://tracker.yandex.ru/{key}"
                         # Markdown format for Telegram: [text](url)
                         lines.append(f"{i}. [{key}: {summary}]({url}) [{status_name}] ({updated})")
-                    return "\n".join(lines)
+                    result = "\n".join(lines)
+                    logger.info(f"[TOOL_RESULT] search_issues: returning formatted list, length={len(result)}")
+                    return result
                 
                 # Extract error details
                 error_msg = f"Ошибка поиска (код {sc})"
@@ -2669,7 +2676,9 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                         issues = []
                     count = len(issues)
                     note = " (возможно больше, показано до 100)" if count >= 100 else ""
-                    return f"Количество задач по запросу '{query}': {count}{note}"
+                    result = f"Количество задач по запросу '{query}': {count}{note}"
+                    logger.info(f"[TOOL_RESULT] count_issues: sc=200, count={count}, query='{query}', result='{result}'")
+                    return result
                 
                 # Extract error details
                 error_msg = f"Ошибка подсчёта (код {sc})"
@@ -2716,8 +2725,8 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
             # Check if AI responded with error message without calling functions
             error_keywords = ["не удалось получить", "не удалось", "ошибка", "попробуйте позже", "попробуйте уточнить"]
             response_lower = response.lower()
-            if any(kw in response_lower for kw in error_keywords) and "ошибка" not in text.lower():
-                logger.warning(f"AI returned error-like response without calling functions: user_query='{text}', response='{response[:300]}'")
+            if any(kw in response_lower for kw in error_keywords):
+                logger.error(f"AI returned error-like response: user_query='{text}', response='{response[:500]}', tg_id={tg_id}")
             
             # Save to history
             state.chat_history.add(tg_id, "user", text)

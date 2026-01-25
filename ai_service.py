@@ -673,18 +673,27 @@ async def chat_with_ai(
                     if content:
                         if tool_executor and round_num > 0:
                             # This is final response after tool calls
-                            logger.info(f"AI final response after {round_num} tool call rounds: {content[:300]}")
+                            logger.info(f"[AI_FINAL_RESPONSE] After {round_num} tool call rounds, messages_count={len(messages)}")
+                            logger.info(f"[AI_FINAL_RESPONSE] Content: {content[:500]}")
+                            
+                            # Log last tool results for debugging
+                            tool_results = [msg.get("content", "")[:200] for msg in messages if msg.get("role") == "tool"]
+                            if tool_results:
+                                logger.info(f"[AI_FINAL_RESPONSE] Last tool results: {tool_results[-1]}")
+                            
                             # Check if response contains error keywords after tool calls
                             error_keywords = ["не удалось получить", "не удалось", "попробуйте позже", "попробуйте уточнить"]
                             if any(kw in content.lower() for kw in error_keywords):
-                                logger.error(f"AI returned error message after tool calls: content='{content[:500]}', rounds={round_num}, messages_count={len(messages)}")
+                                logger.error(f"[AI_ERROR] AI returned error AFTER tool calls: content='{content[:500]}', rounds={round_num}, tool_results_count={len(tool_results)}")
+                                if tool_results:
+                                    logger.error(f"[AI_ERROR] Last tool result was: {tool_results[-1][:500]}")
                         elif tool_executor:
                             # Check if content looks like error message
                             error_keywords = ["не удалось получить", "не удалось", "попробуйте позже", "попробуйте уточнить"]
                             if any(kw in content.lower() for kw in error_keywords):
-                                logger.error(f"AI returned error message without calling tools: content='{content[:300]}', user_message='{messages[-1].get('content', '')[:100] if messages else 'N/A'}'")
+                                logger.error(f"[AI_ERROR] AI returned error WITHOUT calling tools: content='{content[:300]}', user_message='{messages[-1].get('content', '')[:100] if messages else 'N/A'}'")
                             else:
-                                logger.warning(f"AI did not call tools, returned content directly: {content[:200]}")
+                                logger.warning(f"[AI_WARNING] AI did not call tools, returned content directly: {content[:200]}")
                         metrics.inc("ai.chat_success")
                         return content, None
                     # Try extract from data
@@ -701,13 +710,13 @@ async def chat_with_ai(
                     continue
                 
                 # Execute tool calls
-                logger.info(f"AI requested {len(tool_calls)} tool calls")
+                logger.info(f"[AI_TOOL_CALLS] Round {round_num + 1}: AI requested {len(tool_calls)} tool calls")
                 
                 # Add assistant message with tool calls
                 messages.append(message)
                 
                 # Execute each tool and add results
-                for tool_call in tool_calls:
+                for idx, tool_call in enumerate(tool_calls):
                     func_name = tool_call.get("function", {}).get("name", "")
                     func_args_str = tool_call.get("function", {}).get("arguments", "{}")
                     tool_id = tool_call.get("id", "")
@@ -715,10 +724,11 @@ async def chat_with_ai(
                     try:
                         import json
                         func_args = json.loads(func_args_str)
-                    except:
+                    except Exception as e:
+                        logger.warning(f"[AI_TOOL_CALLS] Failed to parse tool args: {func_args_str}, error={e}")
                         func_args = {}
                     
-                    logger.info(f"Executing tool: {func_name}({func_args})")
+                    logger.info(f"[AI_TOOL_CALLS] Round {round_num + 1}, call {idx + 1}/{len(tool_calls)}: {func_name}({func_args})")
                     
                     try:
                         result = await tool_executor(func_name, func_args)
@@ -727,12 +737,12 @@ async def chat_with_ai(
                         
                         # Check if result contains error
                         if "ошибка" in result_str.lower() or "error" in result_str.lower():
-                            logger.warning(f"Tool returned error: {func_name}({func_args}) -> {result_str[:200]}")
+                            logger.error(f"[AI_TOOL_RESULT] Tool returned ERROR: {func_name}({func_args}) -> {result_str[:500]}")
+                        else:
+                            logger.info(f"[AI_TOOL_RESULT] Tool returned SUCCESS: {func_name}({func_args}) -> {result_str[:300]}...")
                     except Exception as e:
-                        logger.error(f"Tool execution error: {e}", exc_info=True)
+                        logger.error(f"[AI_TOOL_RESULT] Tool execution EXCEPTION: {func_name}({func_args}), error={e}", exc_info=True)
                         result_str = f"Ошибка выполнения: {e}"
-                    
-                    logger.info(f"Tool result preview: {result_str[:100]}...")
                     
                     # Add tool result message
                     messages.append({
@@ -740,6 +750,8 @@ async def chat_with_ai(
                         "tool_call_id": tool_id,
                         "content": result_str
                     })
+                    
+                    logger.debug(f"[AI_TOOL_RESULT] Added tool result to messages, total messages: {len(messages)}")
                 
                 # Update payload for next round
                 payload["messages"] = messages
