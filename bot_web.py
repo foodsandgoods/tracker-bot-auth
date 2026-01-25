@@ -2526,155 +2526,125 @@ async def handle_text_message(m: Message):
 
 
 async def process_chat_message(m: Message, text: str, tg_id: int):
-    """Process chat message with AI assistant."""
-    import re
-    from ai_service import chat_with_ai, _format_issue_context, generate_search_query
+    """Process chat message with AI assistant using function calling."""
+    from ai_service import chat_with_ai, _format_issue_context
     
     # Show typing indicator
     loading = await m.answer("🤔 Думаю...")
     
-    try:
-        # Check for issue keys in message (e.g., INV-123, DOC-45, inv123, doc45)
-        # Pattern 1: with hyphen (INV-123)
-        issue_pattern1 = r'\b([A-Z]{2,10}-\d+)\b'
-        # Pattern 2: without hyphen (INV123, doc125)
-        issue_pattern2 = r'\b([A-Z]{2,10})(\d+)\b'
-        
-        issue_keys = re.findall(issue_pattern1, text.upper())
-        issue_mentioned_directly = bool(issue_keys)
-        
-        # Also check for keys without hyphen
-        if not issue_keys:
-            matches = re.findall(issue_pattern2, text.upper())
-            issue_keys = [f"{m[0]}-{m[1]}" for m in matches]
-            issue_mentioned_directly = bool(issue_keys)
-        
-        # If no issue mentioned, check last discussed issue
-        if not issue_keys:
-            last_issue = state.chat_history.get_last_issue(tg_id)
-            if last_issue:
-                issue_keys = [last_issue]
-                logger.info(f"Using last issue from context: {last_issue}")
-        
-        # Get user settings for search constraints
-        user_settings = await get_settings(tg_id)
-        queues = []
-        days = 30
-        if user_settings:
-            queues_raw = user_settings[0]
-            # Handle both string and list formats
-            if isinstance(queues_raw, list):
-                queues = queues_raw
-            elif isinstance(queues_raw, str) and queues_raw:
-                queues = [q.strip() for q in queues_raw.split(",") if q.strip()]
-            days = user_settings[1] or 30
-        
-        # Build context from various sources
-        issue_context = None
-        search_results = None
-        
-        # 1. If specific issue mentioned - get its data
-        if issue_keys:
-            issue_key = issue_keys[0]
-            try:
+    async def tool_executor(func_name: str, func_args: dict) -> dict:
+        """Execute AI tool calls against Tracker API."""
+        try:
+            if func_name == "search_issues":
+                query = func_args.get("query", "")
+                limit = min(func_args.get("limit", 10), 50)
+                
+                sc, data = await api_request(
+                    "GET", "/tracker/search",
+                    {"tg": tg_id, "query": query, "limit": limit},
+                    long_timeout=True
+                )
+                
+                if sc == 200:
+                    issues = data.get("issues", [])
+                    return {
+                        "success": True,
+                        "count": len(issues),
+                        "issues": [
+                            {
+                                "key": i.get("key"),
+                                "summary": i.get("summary"),
+                                "status": i.get("status", {}).get("display") if isinstance(i.get("status"), dict) else i.get("status"),
+                                "updated": i.get("updatedAt", "")[:10]
+                            }
+                            for i in issues
+                        ]
+                    }
+                return {"success": False, "error": f"API error: {sc}"}
+            
+            elif func_name == "get_issue":
+                issue_key = func_args.get("issue_key", "").upper()
+                if not issue_key:
+                    return {"success": False, "error": "issue_key required"}
+                
+                # Normalize key (inv123 -> INV-123)
+                import re
+                if not "-" in issue_key:
+                    match = re.match(r'^([A-Z]+)(\d+)$', issue_key)
+                    if match:
+                        issue_key = f"{match.group(1)}-{match.group(2)}"
+                
                 sc, data = await api_request(
                     "GET", f"/tracker/issue/{issue_key}",
                     {"tg": tg_id},
                     long_timeout=True
                 )
-                if sc == 200 and data.get("key"):
-                    issue_context = _format_issue_context(data)
-                    # Remember this issue for follow-up questions
-                    state.chat_history.set_last_issue(tg_id, issue_key)
-                    logger.info(f"Loaded issue {issue_key}, set as last issue")
-            except Exception as e:
-                logger.warning(f"Failed to get issue {issue_key}: {e}")
-        
-        # 2. Check if user is asking for search/list/stats
-        search_keywords = [
-            "покажи", "найди", "список", "сколько", "последние",
-            "открытые", "закрытые", "статистика", "поиск", "найти",
-            "незавершённых", "незавершенных", "активных", "в работе",
-            "задач", "задачи", "зада", "очередь", "очереди", "тикет",
-            "все ", "первые", "новые", "старые"
-        ]
-        # Only skip search if issue was directly mentioned in this message
-        needs_search = any(kw in text.lower() for kw in search_keywords) and not issue_mentioned_directly
-        
-        if needs_search:
-            try:
-                # Generate YQL query from natural language
-                logger.info(f"Generating YQL for: {text[:50]}, queues={queues}, days={days}")
-                yql_query, err = await generate_search_query(text, queues, days)
-                logger.info(f"YQL result: query={yql_query}, err={err}")
                 
-                if yql_query and not err:
-                    # Handle special commands
-                    if yql_query == "CHECKLIST":
-                        sc, data = await api_request(
-                            "GET", "/tracker/checklist/assigned",
-                            {"tg": tg_id, "limit": 10},
-                            long_timeout=True
-                        )
-                        if sc == 200:
-                            issues = data.get("issues", [])
-                            if issues:
-                                search_results = _format_search_results(issues, "Задачи с чеклистами")
-                            else:
-                                search_results = "Задач с чеклистами не найдено."
-                    elif yql_query == "SUMMONS":
-                        sc, data = await api_request(
-                            "GET", "/tracker/summons",
-                            {"tg": tg_id, "limit": 10},
-                            long_timeout=True
-                        )
-                        if sc == 200:
-                            issues = data.get("issues", [])
-                            if issues:
-                                search_results = _format_search_results(issues, "Требующие ответа")
-                            else:
-                                search_results = "Задач, требующих ответа, не найдено."
-                    else:
-                        # Clean up YQL query - remove Sort by if present (it's an API param, not YQL)
-                        clean_query = yql_query
-                        if "Sort by:" in clean_query:
-                            # Remove Sort by clause
-                            import re as re_clean
-                            clean_query = re_clean.sub(r'\s*\(?\s*Sort by:[^)]*\)?\s*AND\s*', '', clean_query)
-                            clean_query = re_clean.sub(r'\s*AND\s*\(?\s*Sort by:[^)]*\)?\s*', '', clean_query)
-                            clean_query = re_clean.sub(r'\(?\s*Sort by:[^)]*\)?\s*', '', clean_query)
-                        
-                        logger.info(f"Executing search: {clean_query}")
-                        # Execute YQL search
-                        sc, data = await api_request(
-                            "GET", "/tracker/search",
-                            {"tg": tg_id, "query": clean_query, "limit": 10},
-                            long_timeout=True
-                        )
-                        logger.info(f"Search result: sc={sc}, issues={len(data.get('issues', []))}")
-                        if sc == 200:
-                            issues = data.get("issues", [])
-                            if issues:
-                                search_results = _format_search_results(issues, f"Результаты поиска ({len(issues)})")
-                            else:
-                                search_results = f"По запросу ничего не найдено.\nYQL: {clean_query}"
-            except Exception as e:
-                logger.warning(f"Search failed: {e}")
-        
-        # Build full context for AI
-        full_context = ""
-        if issue_context:
-            full_context += f"\n\n{issue_context}"
-        if search_results:
-            full_context += f"\n\nРезультаты из Tracker:\n{search_results}"
-        
-        logger.info(f"AI context length: {len(full_context)}, has_issue={bool(issue_context)}, has_search={bool(search_results)}")
-        
+                if sc == 200 and data.get("key"):
+                    # Remember this issue for follow-up
+                    state.chat_history.set_last_issue(tg_id, issue_key)
+                    
+                    return {
+                        "success": True,
+                        "key": data.get("key"),
+                        "summary": data.get("summary"),
+                        "description": (data.get("description") or "")[:500],
+                        "status": data.get("status", {}).get("display") if isinstance(data.get("status"), dict) else None,
+                        "priority": data.get("priority", {}).get("display") if isinstance(data.get("priority"), dict) else None,
+                        "assignee": data.get("assignee", {}).get("display") if isinstance(data.get("assignee"), dict) else None,
+                        "deadline": data.get("deadline"),
+                        "updated": data.get("updatedAt"),
+                        "comments_count": len(data.get("comments", [])),
+                        "last_comments": [
+                            {"author": c.get("createdBy", {}).get("display", "?"), "text": c.get("text", "")[:200]}
+                            for c in (data.get("comments") or [])[-3:]
+                        ]
+                    }
+                return {"success": False, "error": f"Issue not found: {issue_key}"}
+            
+            elif func_name == "count_issues":
+                query = func_args.get("query", "")
+                
+                # Get up to 100 to count
+                sc, data = await api_request(
+                    "GET", "/tracker/search",
+                    {"tg": tg_id, "query": query, "limit": 100},
+                    long_timeout=True
+                )
+                
+                if sc == 200:
+                    issues = data.get("issues", [])
+                    return {
+                        "success": True,
+                        "count": len(issues),
+                        "note": "Показано до 100 задач" if len(issues) >= 100 else None
+                    }
+                return {"success": False, "error": f"API error: {sc}"}
+            
+            else:
+                return {"success": False, "error": f"Unknown function: {func_name}"}
+                
+        except Exception as e:
+            logger.error(f"Tool executor error: {e}")
+            return {"success": False, "error": str(e)}
+    
+    try:
         # Get history
         history = state.chat_history.get(tg_id)
         
-        # Call AI with context
-        response, error = await chat_with_ai(text, history, full_context if full_context else None)
+        # Check if there's a last issue context to mention
+        last_issue = state.chat_history.get_last_issue(tg_id)
+        context_hint = None
+        if last_issue:
+            context_hint = f"Последняя обсуждаемая задача: {last_issue}"
+        
+        # Call AI with tools
+        response, error = await chat_with_ai(
+            text, 
+            history, 
+            issue_context=context_hint,
+            tool_executor=tool_executor
+        )
         logger.info(f"AI response: len={len(response) if response else 0}, error={error}")
         
         if error:

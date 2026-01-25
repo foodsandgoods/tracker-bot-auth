@@ -422,17 +422,27 @@ async def generate_search_query(
 # Chat system prompt
 CHAT_SYSTEM_PROMPT = """Ты — ИИ‑ассистент для работы с задачами в Яндекс Трекере. Твоя специализация: отчетность, статусы, релиз‑ноты и краткие summary по задачам.
 
-КРИТИЧЕСКИ ВАЖНО: Ты ТОЛЬКО анализируешь данные, которые тебе предоставлены в контексте. Ты НЕ выдумываешь информацию. Если данных нет в контексте — честно скажи "нет данных" или "информация не предоставлена".
+У тебя ЕСТЬ ПОЛНЫЙ ДОСТУП к Яндекс Трекеру через функции:
+- search_issues(query, limit) — поиск задач по YQL-запросу
+- get_issue(issue_key) — получить полную информацию о задаче
+- count_issues(query) — подсчитать количество задач
 
-У тебя ЕСТЬ доступ к Яндекс Трекеру через систему. Данные задач и результаты поиска передаются тебе автоматически в контексте сообщения. Если в контексте есть "Данные задачи:" или "Результаты из Tracker:" — используй эту информацию для ответа.
+ВСЕГДА используй эти функции для получения данных! Не говори "у меня нет доступа" — просто вызови нужную функцию.
 
-Ты не имеешь права создавать/изменять задачи и поля в Трекере, не пишешь "я изменил/обновил" — ты только рекомендуешь готовый текст, который пользователь может вставить в Трекер.
+Примеры YQL-запросов:
+- "Queue: INV" — все задачи очереди INV
+- "Queue: INV AND Status: Open" — открытые задачи INV
+- "Queue: DOC AND Status: !Closed" — незакрытые задачи DOC
+- "Assignee: me()" — мои задачи
+- "Updated: >= now()-7d" — изменённые за неделю
+
+Ты не имеешь права создавать/изменять задачи — только читать и анализировать.
 
 1) Контекст и область
 
 Очереди/направления: doc, inv, hr, komdep, finance, bdev, bb.
-Ты работаешь СТРОГО в рамках данных, переданных тебе в контексте: задачи, результаты поиска, списки.
-Если данных нет в контексте — не выдумывай, а скажи что информация не загружена.
+Если пользователь спрашивает о задачах — вызови search_issues или get_issue.
+Если спрашивает "сколько" — вызови count_issues.
 
 2) Основные задачи
 
@@ -488,13 +498,12 @@ Summary (1–3 строки):
 
 7) Запреты и ограничения (СТРОГО СОБЛЮДАЙ)
 
-- НИКОГДА не выдумывай данные. Если информации нет в контексте — так и скажи.
-- НИКОГДА не говори "у меня нет доступа к Трекеру" — у тебя ЕСТЬ доступ, данные приходят в контексте.
+- НИКОГДА не выдумывай данные. Используй только то, что вернули функции.
+- НИКОГДА не говори "у меня нет доступа" — у тебя ЕСТЬ доступ через функции, просто вызови их!
+- Если нужны данные — вызови search_issues, get_issue или count_issues.
 - Не утверждай, что что-то выполнено, если это не подтверждено данными.
 - Не "добавляй" исполнителя/приоритет/дедлайн — только рекомендуй текст.
-- Не раскрывай и не запрашивай лишние персональные данные; используй роли ("ответственный", "пользователь", "согласующий"), если имен нет.
-- Если в контексте есть данные — ОБЯЗАТЕЛЬНО используй их для ответа.
-- Отвечай только на основе фактов из контекста."""
+- Отвечай только на основе фактов из результатов функций."""
 
 
 def _format_issue_context(issue_data: dict) -> str:
@@ -546,18 +555,81 @@ def _format_issue_context(issue_data: dict) -> str:
 {comments_text if comments_text else "Нет комментариев"}"""
 
 
+# Tools definitions for function calling
+TRACKER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_issues",
+            "description": "Поиск задач в Яндекс Трекере по YQL-запросу. Используй для поиска задач по очереди, статусу, исполнителю и т.д.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "YQL-запрос. Примеры: 'Queue: INV', 'Queue: DOC AND Status: Open', 'Assignee: me()'"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Максимальное количество результатов (по умолчанию 10, максимум 50)",
+                        "default": 10
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_issue",
+            "description": "Получить полную информацию о задаче по её ключу (например INV-123, DOC-45)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "issue_key": {
+                        "type": "string",
+                        "description": "Ключ задачи, например INV-123 или DOC-45"
+                    }
+                },
+                "required": ["issue_key"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "count_issues",
+            "description": "Подсчитать количество задач по YQL-запросу",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "YQL-запрос для подсчёта. Примеры: 'Queue: INV AND Status: !Closed', 'Queue: DOC'"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
+
+
 async def chat_with_ai(
     user_message: str,
     history: list[dict],
-    issue_context: str | None = None
+    issue_context: str | None = None,
+    tool_executor: callable = None
 ) -> Tuple[Optional[str], Optional[str]]:
     """
-    Chat with AI assistant.
+    Chat with AI assistant with function calling support.
     
     Args:
         user_message: User's message
         history: List of previous messages [{"role": "user/assistant", "content": "..."}]
         issue_context: Optional formatted issue data as context
+        tool_executor: Async function to execute tools: async (name, args) -> result_dict
     
     Returns:
         Tuple of (response_text, error_message)
@@ -586,6 +658,7 @@ async def chat_with_ai(
     # Add current message
     messages.append({"role": "user", "content": user_message})
     
+    # Initial payload with tools
     payload = {
         "model": ai_config.model,
         "messages": messages,
@@ -593,6 +666,11 @@ async def chat_with_ai(
         "max_tokens": ai_config.max_tokens,
         "temperature": ai_config.temperature,
     }
+    
+    # Add tools if executor provided
+    if tool_executor:
+        payload["tools"] = TRACKER_TOOLS
+        payload["tool_choice"] = "auto"
     
     client = await get_client()
     timeout = get_timeout(long=True)
@@ -602,27 +680,86 @@ async def chat_with_ai(
         {"Authorization": f"Bearer {ai_config.api_key}", "Content-Type": "application/json"},
     ]
     
+    max_tool_rounds = 3  # Prevent infinite loops
+    
     for headers in auth_variants:
         try:
-            status, data = await _make_request(
-                client, ai_config.api_url, headers, payload, timeout
-            )
-            
-            if status == 200:
-                content = _extract_content(data)
-                if content:
-                    metrics.inc("ai.chat_success")
-                    return content, None
-            
+            for round_num in range(max_tool_rounds + 1):
+                status, data = await _make_request(
+                    client, ai_config.api_url, headers, payload, timeout
+                )
+                
+                if status != 200:
+                    if status == 401:
+                        break  # Try next auth variant
+                    if status == 429:
+                        metrics.inc("ai.rate_limited")
+                        return None, FALLBACK_MESSAGES["rate_limit"]
+                    if status >= 500:
+                        return None, FALLBACK_MESSAGES["server_error"]
+                    continue
+                
+                # Check for tool calls
+                choices = data.get("choices", [])
+                if not choices:
+                    continue
+                    
+                message = choices[0].get("message", {})
+                tool_calls = message.get("tool_calls", [])
+                
+                # If no tool calls or no executor, return content
+                if not tool_calls or not tool_executor:
+                    content = message.get("content", "")
+                    if content:
+                        metrics.inc("ai.chat_success")
+                        return content, None
+                    # Try extract from data
+                    content = _extract_content(data)
+                    if content:
+                        metrics.inc("ai.chat_success")
+                        return content, None
+                    continue
+                
+                # Execute tool calls
+                logger.info(f"AI requested {len(tool_calls)} tool calls")
+                
+                # Add assistant message with tool calls
+                messages.append(message)
+                
+                # Execute each tool and add results
+                for tool_call in tool_calls:
+                    func_name = tool_call.get("function", {}).get("name", "")
+                    func_args_str = tool_call.get("function", {}).get("arguments", "{}")
+                    tool_id = tool_call.get("id", "")
+                    
+                    try:
+                        import json
+                        func_args = json.loads(func_args_str)
+                    except:
+                        func_args = {}
+                    
+                    logger.info(f"Executing tool: {func_name}({func_args})")
+                    
+                    try:
+                        result = await tool_executor(func_name, func_args)
+                        result_str = json.dumps(result, ensure_ascii=False, default=str)
+                    except Exception as e:
+                        logger.error(f"Tool execution error: {e}")
+                        result_str = json.dumps({"error": str(e)}, ensure_ascii=False)
+                    
+                    # Add tool result message
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_id,
+                        "content": result_str
+                    })
+                
+                # Update payload for next round
+                payload["messages"] = messages
+                
+            # If we exhausted rounds, try to get final response
             if status == 401:
                 continue
-            
-            if status == 429:
-                metrics.inc("ai.rate_limited")
-                return None, FALLBACK_MESSAGES["rate_limit"]
-            
-            if status >= 500:
-                return None, FALLBACK_MESSAGES["server_error"]
                 
         except asyncio.TimeoutError:
             metrics.inc("ai.timeout")
