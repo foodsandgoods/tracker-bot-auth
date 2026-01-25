@@ -3064,6 +3064,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="clear", description="🗑️ Очистить историю чата"),
         BotCommand(command="logs", description="📋 Последние ошибки ИИ"),
         BotCommand(command="calendar", description="📅 События календаря"),
+        BotCommand(command="calendar_test", description="🔍 Тест подключения к календарю"),
     ]
     await bot.set_my_commands(commands)
     logger.info(f"Bot commands registered: {len(commands)} commands including calendar")
