@@ -2834,11 +2834,12 @@ async def cmd_logs(m: Message):
 @router.message(Command("calendar"))
 async def cmd_calendar(m: Message):
     """Show calendar events for today."""
+    logger.info(f"Calendar command received: tg_id={m.from_user.id if m.from_user else None}")
+    
     if not m.from_user:
         return
     
     tg_id = m.from_user.id
-    from datetime import datetime, timedelta
     
     # Get today's date
     today = datetime.now().strftime("%Y-%m-%d")
@@ -2889,7 +2890,6 @@ async def cmd_calendar(m: Message):
                 text = "\n".join(lines)
             
             # Add button for tomorrow
-            from aiogram.utils.keyboard import InlineKeyboardBuilder
             builder = InlineKeyboardBuilder()
             tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
             builder.button(text="📅 Завтра", callback_data=f"calendar:{tomorrow}")
@@ -2898,9 +2898,10 @@ async def cmd_calendar(m: Message):
             await m.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
         else:
             error_msg = data.get("error", f"Ошибка {sc}")
+            logger.warning(f"Calendar API error: tg_id={tg_id}, sc={sc}, error={error_msg}")
             await loading.edit_text(f"❌ Не удалось загрузить события: {error_msg}")
     except Exception as e:
-        logger.error(f"Calendar command error: {e}", exc_info=True)
+        logger.error(f"Calendar command error: tg_id={tg_id}, error={e}", exc_info=True)
         try:
             await loading.edit_text(f"❌ Ошибка: {str(e)[:100]}")
         except Exception:
@@ -2920,8 +2921,6 @@ async def handle_calendar_callback(cb: CallbackQuery):
     loading = await cb.message.answer("📅 Загружаю события...") if cb.message else None
     
     try:
-        from datetime import datetime, timedelta
-        
         sc, data = await api_request(
             "GET", "/calendar/events",
             {"tg": tg_id, "date": date},
@@ -2962,7 +2961,6 @@ async def handle_calendar_callback(cb: CallbackQuery):
                 text = "\n".join(lines)
             
             # Add navigation buttons
-            from aiogram.utils.keyboard import InlineKeyboardBuilder
             builder = InlineKeyboardBuilder()
             
             date_obj = datetime.strptime(date, "%Y-%m-%d")
