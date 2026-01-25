@@ -2532,8 +2532,8 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
     # Show typing indicator
     loading = await m.answer("🤔 Думаю...")
     
-    async def tool_executor(func_name: str, func_args: dict) -> dict:
-        """Execute AI tool calls against Tracker API."""
+    async def tool_executor(func_name: str, func_args: dict) -> str:
+        """Execute AI tool calls against Tracker API. Returns formatted text."""
         try:
             if func_name == "search_issues":
                 query = func_args.get("query", "")
@@ -2547,29 +2547,29 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                 
                 if sc == 200:
                     issues = data.get("issues", [])
-                    return {
-                        "success": True,
-                        "count": len(issues),
-                        "issues": [
-                            {
-                                "key": i.get("key"),
-                                "summary": i.get("summary"),
-                                "status": i.get("status", {}).get("display") if isinstance(i.get("status"), dict) else i.get("status"),
-                                "updated": i.get("updatedAt", "")[:10]
-                            }
-                            for i in issues
-                        ]
-                    }
-                return {"success": False, "error": f"API error: {sc}"}
+                    if not issues:
+                        return f"Найдено 0 задач по запросу: {query}"
+                    
+                    # Format as readable text
+                    lines = [f"Найдено {len(issues)} задач:"]
+                    for i, issue in enumerate(issues, 1):
+                        key = issue.get("key", "?")
+                        summary = issue.get("summary", "Без названия")[:60]
+                        status = issue.get("status", {})
+                        status_name = status.get("display") if isinstance(status, dict) else str(status)
+                        updated = (issue.get("updatedAt") or "")[:10]
+                        lines.append(f"{i}. {key}: {summary} [{status_name}] ({updated})")
+                    return "\n".join(lines)
+                return f"Ошибка поиска: код {sc}"
             
             elif func_name == "get_issue":
                 issue_key = func_args.get("issue_key", "").upper()
                 if not issue_key:
-                    return {"success": False, "error": "issue_key required"}
+                    return "Ошибка: не указан ключ задачи"
                 
                 # Normalize key (inv123 -> INV-123)
                 import re
-                if not "-" in issue_key:
+                if "-" not in issue_key:
                     match = re.match(r'^([A-Z]+)(\d+)$', issue_key)
                     if match:
                         issue_key = f"{match.group(1)}-{match.group(2)}"
@@ -2584,23 +2584,45 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                     # Remember this issue for follow-up
                     state.chat_history.set_last_issue(tg_id, issue_key)
                     
-                    return {
-                        "success": True,
-                        "key": data.get("key"),
-                        "summary": data.get("summary"),
-                        "description": (data.get("description") or "")[:500],
-                        "status": data.get("status", {}).get("display") if isinstance(data.get("status"), dict) else None,
-                        "priority": data.get("priority", {}).get("display") if isinstance(data.get("priority"), dict) else None,
-                        "assignee": data.get("assignee", {}).get("display") if isinstance(data.get("assignee"), dict) else None,
-                        "deadline": data.get("deadline"),
-                        "updated": data.get("updatedAt"),
-                        "comments_count": len(data.get("comments", [])),
-                        "last_comments": [
-                            {"author": c.get("createdBy", {}).get("display", "?"), "text": c.get("text", "")[:200]}
-                            for c in (data.get("comments") or [])[-3:]
-                        ]
-                    }
-                return {"success": False, "error": f"Issue not found: {issue_key}"}
+                    # Format as readable text
+                    key = data.get("key")
+                    summary = data.get("summary", "Без названия")
+                    description = (data.get("description") or "Нет описания")[:500]
+                    
+                    status = data.get("status", {})
+                    status_name = status.get("display") if isinstance(status, dict) else "Не указан"
+                    
+                    priority = data.get("priority", {})
+                    priority_name = priority.get("display") if isinstance(priority, dict) else "Не указан"
+                    
+                    assignee = data.get("assignee", {})
+                    assignee_name = assignee.get("display") if isinstance(assignee, dict) else "Не назначен"
+                    
+                    deadline = data.get("deadline") or "Не указан"
+                    updated = data.get("updatedAt", "")[:19].replace("T", " ")
+                    
+                    result = f"""Задача {key}: {summary}
+
+Статус: {status_name}
+Приоритет: {priority_name}
+Исполнитель: {assignee_name}
+Дедлайн: {deadline}
+Обновлено: {updated}
+
+Описание:
+{description}"""
+                    
+                    # Add comments if any
+                    comments = data.get("comments") or []
+                    if comments:
+                        result += f"\n\nКомментарии ({len(comments)}):"
+                        for c in comments[-3:]:
+                            author = c.get("createdBy", {}).get("display", "?")
+                            text = (c.get("text") or "")[:150]
+                            result += f"\n- {author}: {text}"
+                    
+                    return result
+                return f"Задача {issue_key} не найдена"
             
             elif func_name == "count_issues":
                 query = func_args.get("query", "")
@@ -2614,19 +2636,17 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                 
                 if sc == 200:
                     issues = data.get("issues", [])
-                    return {
-                        "success": True,
-                        "count": len(issues),
-                        "note": "Показано до 100 задач" if len(issues) >= 100 else None
-                    }
-                return {"success": False, "error": f"API error: {sc}"}
+                    count = len(issues)
+                    note = " (возможно больше, показано до 100)" if count >= 100 else ""
+                    return f"Количество задач по запросу '{query}': {count}{note}"
+                return f"Ошибка подсчёта: код {sc}"
             
             else:
-                return {"success": False, "error": f"Unknown function: {func_name}"}
+                return f"Неизвестная функция: {func_name}"
                 
         except Exception as e:
             logger.error(f"Tool executor error: {e}")
-            return {"success": False, "error": str(e)}
+            return f"Ошибка: {e}"
     
     try:
         # Get history
