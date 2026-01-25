@@ -2539,6 +2539,9 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                 query = func_args.get("query", "")
                 limit = min(func_args.get("limit", 10), 50)
                 
+                if not query:
+                    return "Ошибка: не указан поисковый запрос (query)"
+                
                 sc, data = await api_request(
                     "GET", "/tracker/search",
                     {"tg": tg_id, "query": query, "limit": limit},
@@ -2560,7 +2563,15 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                         updated = (issue.get("updatedAt") or "")[:10]
                         lines.append(f"{i}. {key}: {summary} [{status_name}] ({updated})")
                     return "\n".join(lines)
-                return f"Ошибка поиска: код {sc}"
+                
+                # Extract error details
+                error_msg = f"Ошибка поиска (код {sc})"
+                if isinstance(data, dict):
+                    error_detail = data.get("error") or data.get("message") or data.get("body", {}).get("error")
+                    if error_detail:
+                        error_msg += f": {error_detail}"
+                logger.warning(f"Search failed: query={query}, sc={sc}, error={data}")
+                return error_msg
             
             elif func_name == "get_issue":
                 issue_key = func_args.get("issue_key", "").upper()
@@ -2622,10 +2633,23 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                             result += f"\n- {author}: {text}"
                     
                     return result
-                return f"Задача {issue_key} не найдена"
+                
+                # Extract error details
+                error_msg = f"Задача {issue_key} не найдена"
+                if sc != 200:
+                    error_msg = f"Ошибка получения задачи {issue_key} (код {sc})"
+                    if isinstance(data, dict):
+                        error_detail = data.get("error") or data.get("message") or data.get("body", {}).get("error")
+                        if error_detail:
+                            error_msg += f": {error_detail}"
+                    logger.warning(f"Get issue failed: key={issue_key}, sc={sc}, error={data}")
+                return error_msg
             
             elif func_name == "count_issues":
                 query = func_args.get("query", "")
+                
+                if not query:
+                    return "Ошибка: не указан поисковый запрос (query)"
                 
                 # Get up to 100 to count
                 sc, data = await api_request(
@@ -2636,10 +2660,21 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                 
                 if sc == 200:
                     issues = data.get("issues", [])
+                    if not isinstance(issues, list):
+                        logger.warning(f"Unexpected data format in count_issues: {type(issues)}")
+                        issues = []
                     count = len(issues)
                     note = " (возможно больше, показано до 100)" if count >= 100 else ""
                     return f"Количество задач по запросу '{query}': {count}{note}"
-                return f"Ошибка подсчёта: код {sc}"
+                
+                # Extract error details
+                error_msg = f"Ошибка подсчёта (код {sc})"
+                if isinstance(data, dict):
+                    error_detail = data.get("error") or data.get("message") or data.get("body", {}).get("error")
+                    if error_detail:
+                        error_msg += f": {error_detail}"
+                logger.warning(f"Count failed: query={query}, sc={sc}, error={data}")
+                return error_msg
             
             else:
                 return f"Неизвестная функция: {func_name}"
