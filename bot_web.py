@@ -191,7 +191,7 @@ class AppState:
         'checklist_cache', 'summary_cache',
         'pending_comment', 'pending_summary', 'pending_ai_search', 
         'pending_new_issue', 'pending_stats_dates', 'last_reminder',
-        'chat_history'
+        'chat_history', 'recent_errors'
     )
     
     def __init__(self):
@@ -215,6 +215,7 @@ class AppState:
         self.pending_stats_dates: Dict[int, dict] = {}  # tg_id -> {queue, msg_id}
         self.last_reminder: Dict[int, float] = {}
         self.chat_history = ChatHistory(max_messages=10, ttl=3600)  # 5 pairs, 1 hour TTL
+        self.recent_errors: List[dict] = []  # Last 20 errors: {time, user_query, error, tool_result}
 
 
 state = AppState()
@@ -2662,10 +2663,10 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                 if not query:
                     return "Ошибка: не указан поисковый запрос (query)"
                 
-                # Get up to 100 to count
+                # Get up to 50 to count (API limit is 50)
                 sc, data = await api_request(
                     "GET", "/tracker/search",
-                    {"tg": tg_id, "query": query, "limit": 100},
+                    {"tg": tg_id, "query": query, "limit": 50},
                     long_timeout=True
                 )
                 
@@ -2675,7 +2676,7 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                         logger.warning(f"Unexpected data format in count_issues: {type(issues)}")
                         issues = []
                     count = len(issues)
-                    note = " (возможно больше, показано до 100)" if count >= 100 else ""
+                    note = " (возможно больше, показано до 50)" if count >= 50 else ""
                     result = f"Количество задач по запросу '{query}': {count}{note}"
                     logger.info(f"[TOOL_RESULT] count_issues: sc=200, count={count}, query='{query}', result='{result}'")
                     return result
@@ -2687,6 +2688,20 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
                     if error_detail:
                         error_msg += f": {error_detail}"
                 logger.error(f"Count failed: query='{query}', sc={sc}, tg_id={tg_id}, error={data}")
+                
+                # Store error for /logs
+                from datetime import datetime
+                error_entry = {
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "tg_id": tg_id,
+                    "user_query": f"count_issues({query})",
+                    "ai_response": error_msg,
+                    "tool_result": str(data)[:300]
+                }
+                state.recent_errors.append(error_entry)
+                if len(state.recent_errors) > 20:
+                    state.recent_errors = state.recent_errors[-20:]
+                
                 return error_msg
             
             else:
@@ -2727,6 +2742,19 @@ async def process_chat_message(m: Message, text: str, tg_id: int):
             response_lower = response.lower()
             if any(kw in response_lower for kw in error_keywords):
                 logger.error(f"AI returned error-like response: user_query='{text}', response='{response[:500]}', tg_id={tg_id}")
+                # Store error for /logs command
+                from datetime import datetime
+                error_entry = {
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "tg_id": tg_id,
+                    "user_query": text[:200],
+                    "ai_response": response[:500],
+                    "error": "AI returned error"
+                }
+                state.recent_errors.append(error_entry)
+                # Keep only last 20 errors
+                if len(state.recent_errors) > 20:
+                    state.recent_errors = state.recent_errors[-20:]
             
             # Save to history
             state.chat_history.add(tg_id, "user", text)
@@ -2774,6 +2802,35 @@ async def cmd_clear(m: Message):
     await m.answer("🗑️ История чата очищена")
 
 
+@router.message(Command("logs"))
+async def cmd_logs(m: Message):
+    """Show recent AI errors."""
+    if not m.from_user:
+        return
+    
+    if not state.recent_errors:
+        await m.answer("✅ Нет ошибок за последнее время")
+        return
+    
+    # Show last 5 errors
+    errors = state.recent_errors[-5:]
+    lines = ["📋 Последние ошибки ИИ:\n"]
+    
+    for i, err in enumerate(reversed(errors), 1):
+        lines.append(f"{i}. {err['time']}")
+        lines.append(f"   Запрос: {err['user_query'][:100]}")
+        lines.append(f"   Ответ: {err['ai_response'][:150]}")
+        if err.get('tool_result'):
+            lines.append(f"   Tool: {err['tool_result'][:100]}")
+        lines.append("")
+    
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n..."
+    
+    await m.answer(text, parse_mode=None)
+
+
 # =============================================================================
 # Bot Setup and Run
 # =============================================================================
@@ -2794,6 +2851,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="ai", description="🔍 Поиск (ИИ)"),
         BotCommand(command="new", description="📝 Создать задачу"),
         BotCommand(command="clear", description="🗑️ Очистить историю чата"),
+        BotCommand(command="logs", description="📋 Последние ошибки ИИ"),
     ])
 
 
