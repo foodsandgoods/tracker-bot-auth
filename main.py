@@ -4,10 +4,12 @@ Optimized for low-resource environments (1GB RAM).
 """
 import asyncio
 import logging
+import re
 import secrets
 import time
 from collections import defaultdict
 from typing import Any, Optional
+from urllib.parse import urljoin, urlparse
 from urllib.parse import urlencode
 
 from contextlib import asynccontextmanager
@@ -340,14 +342,85 @@ class CalendarClient:
     def __init__(self, caldav_base: Optional[str] = None):
         self._caldav_base = (caldav_base or settings.caldav_base_url).rstrip("/")
     
-    def _headers(self, access_token: str) -> dict[str, str]:
+    def _headers(self, access_token: str, depth: str = "1") -> dict[str, str]:
         """Build CalDAV request headers. Yandex CalDAV expects OAuth scheme (same as Tracker API)."""
         return {
             "Authorization": f"OAuth {access_token}",
             "Content-Type": "application/xml; charset=utf-8",
-            "Depth": "1",
+            "Depth": depth,
         }
-    
+
+    def _parse_href(self, xml_body: str, tag_name: str) -> Optional[str]:
+        """Extract first href from XML inside tag (e.g. current-user-principal or calendar-home-set)."""
+        # Match <tag_name>...</tag_name> then <*:href>path</*:href>
+        tag_pattern = rf"<[^>]*{re.escape(tag_name)}[^>]*>.*?</[^>]*{re.escape(tag_name)}>"
+        tag_match = re.search(tag_pattern, xml_body, re.DOTALL | re.IGNORECASE)
+        if not tag_match:
+            return None
+        block = tag_match.group(0)
+        href_match = re.search(r"<[^:>]*:?href[^>]*>([^<]+)</[^:>]*:?href>", block, re.IGNORECASE)
+        if href_match:
+            return href_match.group(1).strip()
+        return None
+
+    async def _discover_calendar_url(self, access_token: str) -> Optional[str]:
+        """
+        CalDAV discovery: PROPFIND current-user-principal → calendar-home-set → first calendar.
+        Returns calendar URL for REPORT, or None if discovery fails.
+        """
+        client = await get_client()
+        base = self._caldav_base.rstrip("/")
+        headers_0 = self._headers(access_token, depth="0")
+        propfind_principal = """<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:current-user-principal /></d:prop>
+</d:propfind>"""
+        try:
+            r = await client.request("PROPFIND", base + "/", headers=headers_0, content=propfind_principal.encode("utf-8"), timeout=get_timeout(long=True))
+            if r.status_code != 207:
+                logger.debug("[CALENDAR] Discovery PROPFIND (principal) status=%s", r.status_code)
+                return None
+            principal_href = self._parse_href(r.text, "current-user-principal")
+            if not principal_href:
+                logger.debug("[CALENDAR] Discovery: no current-user-principal in response")
+                return None
+            principal_url = principal_href if principal_href.startswith("http") else urljoin(base + "/", principal_href)
+            propfind_home = """<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><c:calendar-home-set /></d:prop>
+</d:propfind>"""
+            r2 = await client.request("PROPFIND", principal_url, headers=headers_0, content=propfind_home.encode("utf-8"), timeout=get_timeout(long=True))
+            if r2.status_code != 207:
+                logger.debug("[CALENDAR] Discovery PROPFIND (calendar-home-set) status=%s", r2.status_code)
+                return None
+            home_href = self._parse_href(r2.text, "calendar-home-set")
+            if not home_href:
+                logger.debug("[CALENDAR] Discovery: no calendar-home-set in response")
+                return None
+            home_url = home_href if home_href.startswith("http") else urljoin(base + "/", home_href)
+            propfind_calendars = """<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:resourcetype /><d:displayname /></d:prop>
+</d:propfind>"""
+            r3 = await client.request("PROPFIND", home_url, headers=self._headers(access_token, depth="1"), content=propfind_calendars.encode("utf-8"), timeout=get_timeout(long=True))
+            if r3.status_code != 207:
+                logger.debug("[CALENDAR] Discovery PROPFIND (list calendars) status=%s", r3.status_code)
+                return home_url.rstrip("/") + "/events-default" if "events-default" in home_url else home_url.rstrip("/")
+            hrefs = re.findall(r"<d:response[^>]*>.*?<d:href>([^<]+)</d:href>", r3.text, re.DOTALL | re.IGNORECASE)
+            if not hrefs:
+                return home_url.rstrip("/") + "/events-default" if "events-default" not in home_url else home_url.rstrip("/")
+            for href in hrefs:
+                path = href.strip().rstrip("/")
+                if path and path != urlparse(home_url).path.rstrip("/"):
+                    full = href if href.startswith("http") else urljoin(base + "/", href)
+                    if "events-default" in full:
+                        return full
+            first = hrefs[0].strip().rstrip("/")
+            return (first if first.startswith("http") else urljoin(base + "/", first)) if first else None
+        except Exception as e:
+            logger.debug("[CALENDAR] Discovery exception: %s", e)
+            return None
+
     @with_retry(max_attempts=2, base_delay=1.0)
     async def get_events(self, access_token: str, email: str, start_date: str, end_date: str) -> tuple[int, Any]:
         """
@@ -379,17 +452,23 @@ class CalendarClient:
     </C:filter>
 </C:calendar-query>"""
 
-        # Yandex CalDAV may expect login or full email; try login first, then login@yandex.ru on 404
-        identifiers_to_try: list[str] = [email]
-        if "@" not in (email or ""):
-            identifiers_to_try.append(f"{email}@yandex.ru")
+        # 1) Discovery: PROPFIND current-user-principal → calendar-home-set → first calendar (works for 360 and personal)
+        calendar_urls_to_try: list[str] = []
+        discovered = await self._discover_calendar_url(access_token)
+        if discovered:
+            calendar_urls_to_try.append(discovered)
+            logger.info(f"[CALENDAR] Discovery found calendar URL: {discovered}")
+        # 2) Fallback: fixed paths (personal /calendars/{login}/events-default)
+        for cal_identifier in [email, f"{email}@yandex.ru" if "@" not in (email or "") else None]:
+            if cal_identifier:
+                calendar_urls_to_try.append(f"{self._caldav_base}/calendars/{cal_identifier}/events-default")
+        calendar_urls_to_try = list(dict.fromkeys(calendar_urls_to_try))
 
         last_status = 0
         last_response_text = ""
 
         try:
-            for cal_identifier in identifiers_to_try:
-                calendar_url = f"{self._caldav_base}/calendars/{cal_identifier}/events-default"
+            for calendar_url in calendar_urls_to_try:
                 logger.info(f"[CALENDAR] Sending REPORT request to: {calendar_url}")
                 r = await client.request(
                     "REPORT",
@@ -404,23 +483,22 @@ class CalendarClient:
 
                 if r.status_code == 200:
                     events = self._parse_icalendar(r.text)
-                    logger.info(f"[CALENDAR] Retrieved events: identifier={cal_identifier}, date={start_date}, count={len(events)}")
+                    logger.info(f"[CALENDAR] Retrieved events: url={calendar_url}, date={start_date}, count={len(events)}")
                     return 200, events
-                if r.status_code == 404 and cal_identifier != identifiers_to_try[-1]:
-                    continue  # try next identifier
+                if r.status_code == 404 and calendar_url != calendar_urls_to_try[-1]:
+                    continue  # try next URL
                 if r.status_code == 401:
-                    logger.warning("[CALENDAR] CalDAV 401 Unauthorized: identifier=%s", cal_identifier)
+                    logger.warning("[CALENDAR] CalDAV 401 Unauthorized: url=%s", calendar_url)
                     return 401, {"error": "Календарь: не авторизован (401). Выполните /connect заново.", "response": last_response_text}
                 if r.status_code == 403:
-                    logger.warning("[CALENDAR] CalDAV 403 Forbidden: identifier=%s", cal_identifier)
+                    logger.warning("[CALENDAR] CalDAV 403 Forbidden: url=%s", calendar_url)
                     return 403, {"error": "Calendar access denied (403). Reconnect with calendar rights.", "response": last_response_text}
                 if r.status_code == 404:
-                    logger.warning("[CALENDAR] CalDAV 404 Not Found: tried %s", identifiers_to_try)
+                    logger.warning("[CALENDAR] CalDAV 404 Not Found: tried %s", calendar_urls_to_try)
                     return 404, {"error": "Календарь не найден (404). Проверьте настройки календаря в Яндексе.", "response": last_response_text}
-                logger.warning(f"[CALENDAR] Request failed: status={r.status_code}, identifier={cal_identifier}, response={last_response_text}")
+                logger.warning(f"[CALENDAR] Request failed: status={r.status_code}, url={calendar_url}, response={last_response_text}")
                 return r.status_code, {"error": f"Calendar API returned {r.status_code}", "response": last_response_text}
 
-            # all identifiers tried, last was 404
             return 404, {"error": "Календарь не найден (404). Проверьте настройки календаря в Яндексе.", "response": last_response_text}
         except Exception as e:
             logger.error(f"[CALENDAR] Request exception: {type(e).__name__}: {e}", exc_info=True)
@@ -477,8 +555,9 @@ class CalendarClient:
                 uid_match = re.search(r'UID[;:]([^\r\n]+)', block)
                 if uid_match:
                     uid = uid_match.group(1).strip()
-                    # Build Yandex Calendar URL
-                    event["calendar_url"] = f"https://calendar.yandex.ru/event/{uid}"
+                    # Web calendar domain: 360 vs personal
+                    web_base = "https://calendar.360.yandex.ru" if "360" in (self._caldav_base or "") else "https://calendar.yandex.ru"
+                    event["calendar_url"] = f"{web_base}/event/{uid}"
                 
                 if event.get("summary"):  # Only add if has title
                     events.append(event)
@@ -2120,9 +2199,12 @@ async def calendar_test(
         
         logger.info(f"[CALENDAR_TEST] User email: {email}")
         
-        # Calendar URL uses configured CalDAV base (personal or Yandex 360)
+        # CalDAV API URL (used by bot to fetch events)
         base = settings.caldav_base_url.rstrip("/")
         calendar_url = f"{base}/calendars/{email}/events-default"
+        # Web UI link for opening calendar in browser (calendar.360.yandex.ru vs calendar.yandex.ru)
+        web_base = "https://calendar.360.yandex.ru" if "360" in base else "https://calendar.yandex.ru"
+        web_calendar_url = f"{web_base}/week"
         logger.info(f"[CALENDAR_TEST] Success: tg_id={tg}, email={email}, calendar_url={calendar_url}")
         
         return JSONResponse({
@@ -2130,6 +2212,7 @@ async def calendar_test(
             "token_valid": True,
             "email": email,
             "calendar_url": calendar_url,
+            "web_calendar_url": web_calendar_url,
             "caldav_base": base,
             "scope_note": "Full calendar access (calendar:all) required for /calendar/events.",
             "user_info": {

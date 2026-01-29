@@ -2861,7 +2861,10 @@ async def cmd_calendar_test(m: Message):
             result_text += f"Статус: `{status}`\n"
             result_text += f"Токен валиден: {'✅' if token_valid else '❌'}\n"
             result_text += f"Email: `{email}`\n"
-            result_text += f"URL календаря: `{calendar_url}`\n"
+            result_text += f"API (CalDAV): `{calendar_url}`\n"
+            web_url = data.get("web_calendar_url", "")
+            if web_url:
+                result_text += f"Открыть в браузере: {web_url}\n"
             
             if data.get("user_info"):
                 user_info = data["user_info"]
