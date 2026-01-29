@@ -335,11 +335,10 @@ class TrackerClient:
 # Calendar Client (CalDAV)
 # =============================================================================
 class CalendarClient:
-    """Yandex Calendar CalDAV client."""
+    """Yandex Calendar CalDAV client (личный caldav.yandex.ru или Яндекс 360 caldav.360.yandex.ru)."""
     
-    def __init__(self):
-        # Yandex Calendar CalDAV endpoint
-        self._caldav_base = "https://caldav.yandex.ru"
+    def __init__(self, caldav_base: Optional[str] = None):
+        self._caldav_base = (caldav_base or settings.caldav_base_url).rstrip("/")
     
     def _headers(self, access_token: str) -> dict[str, str]:
         """Build CalDAV request headers. Yandex CalDAV expects OAuth scheme (same as Tracker API)."""
@@ -364,8 +363,6 @@ class CalendarClient:
             Tuple of (status_code, events_list)
         """
         client = await get_client()
-        calendar_url = f"{self._caldav_base}/calendars/{email}/events-default"
-        
         # CalDAV REPORT request body for date range query
         report_body = f"""<?xml version="1.0" encoding="utf-8"?>
 <C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
@@ -381,44 +378,50 @@ class CalendarClient:
         </C:comp-filter>
     </C:filter>
 </C:calendar-query>"""
-        
+
+        # Yandex CalDAV may expect login or full email; try login first, then login@yandex.ru on 404
+        identifiers_to_try: list[str] = [email]
+        if "@" not in (email or ""):
+            identifiers_to_try.append(f"{email}@yandex.ru")
+
+        last_status = 0
+        last_response_text = ""
+
         try:
-            # CalDAV uses REPORT method (not GET/POST)
-            logger.info(f"[CALENDAR] Sending REPORT request to: {calendar_url}")
-            logger.debug(f"[CALENDAR] Request body: {report_body[:500]}")
-            
-            r = await client.request(
-                "REPORT",
-                calendar_url,
-                headers=self._headers(access_token),
-                content=report_body.encode('utf-8'),
-                timeout=get_timeout(long=True)
-            )
-            
-            logger.info(f"[CALENDAR] Response: status={r.status_code}, headers={dict(r.headers)}, body_length={len(r.text)}")
-            
-            if r.status_code == 200:
-                # Parse iCalendar data from response
-                events = self._parse_icalendar(r.text)
-                logger.info(f"[CALENDAR] Retrieved events: email={email}, date={start_date}, count={len(events)}")
-                return 200, events
-            elif r.status_code == 401:
-                logger.warning(
-                    "[CALENDAR] CalDAV 401 Unauthorized: email=%s. Token invalid or wrong auth scheme (use OAuth header).",
-                    email
+            for cal_identifier in identifiers_to_try:
+                calendar_url = f"{self._caldav_base}/calendars/{cal_identifier}/events-default"
+                logger.info(f"[CALENDAR] Sending REPORT request to: {calendar_url}")
+                r = await client.request(
+                    "REPORT",
+                    calendar_url,
+                    headers=self._headers(access_token),
+                    content=report_body.encode('utf-8'),
+                    timeout=get_timeout(long=True)
                 )
-                return 401, {"error": "Календарь: не авторизован (401). Выполните /connect заново.", "response": r.text[:500]}
-            elif r.status_code == 403:
-                logger.warning(
-                    "[CALENDAR] CalDAV 403 Forbidden: email=%s, date=%s. "
-                    "Ensure OAuth app has calendar:all scope and user reconnected.",
-                    email, start_date
-                )
-                return 403, {"error": "Calendar access denied (403). Reconnect with calendar rights.", "response": r.text[:500]}
-            else:
-                logger.warning(f"[CALENDAR] Request failed: status={r.status_code}, email={email}, response={r.text[:500]}")
-                return r.status_code, {"error": f"Calendar API returned {r.status_code}", "response": r.text[:500]}
-                
+                last_status = r.status_code
+                last_response_text = r.text[:500]
+                logger.info(f"[CALENDAR] Response: status={r.status_code}, url={calendar_url}, body_length={len(r.text)}")
+
+                if r.status_code == 200:
+                    events = self._parse_icalendar(r.text)
+                    logger.info(f"[CALENDAR] Retrieved events: identifier={cal_identifier}, date={start_date}, count={len(events)}")
+                    return 200, events
+                if r.status_code == 404 and cal_identifier != identifiers_to_try[-1]:
+                    continue  # try next identifier
+                if r.status_code == 401:
+                    logger.warning("[CALENDAR] CalDAV 401 Unauthorized: identifier=%s", cal_identifier)
+                    return 401, {"error": "Календарь: не авторизован (401). Выполните /connect заново.", "response": last_response_text}
+                if r.status_code == 403:
+                    logger.warning("[CALENDAR] CalDAV 403 Forbidden: identifier=%s", cal_identifier)
+                    return 403, {"error": "Calendar access denied (403). Reconnect with calendar rights.", "response": last_response_text}
+                if r.status_code == 404:
+                    logger.warning("[CALENDAR] CalDAV 404 Not Found: tried %s", identifiers_to_try)
+                    return 404, {"error": "Календарь не найден (404). Проверьте настройки календаря в Яндексе.", "response": last_response_text}
+                logger.warning(f"[CALENDAR] Request failed: status={r.status_code}, identifier={cal_identifier}, response={last_response_text}")
+                return r.status_code, {"error": f"Calendar API returned {r.status_code}", "response": last_response_text}
+
+            # all identifiers tried, last was 404
+            return 404, {"error": "Календарь не найден (404). Проверьте настройки календаря в Яндексе.", "response": last_response_text}
         except Exception as e:
             logger.error(f"[CALENDAR] Request exception: {type(e).__name__}: {e}", exc_info=True)
             return 503, {"error": f"Calendar request failed: {type(e).__name__}"}
@@ -2117,8 +2120,9 @@ async def calendar_test(
         
         logger.info(f"[CALENDAR_TEST] User email: {email}")
         
-        # Test calendar URL construction (CalDAV; requires calendar:all scope)
-        calendar_url = f"https://caldav.yandex.ru/calendars/{email}/events-default"
+        # Calendar URL uses configured CalDAV base (personal or Yandex 360)
+        base = settings.caldav_base_url.rstrip("/")
+        calendar_url = f"{base}/calendars/{email}/events-default"
         logger.info(f"[CALENDAR_TEST] Success: tg_id={tg}, email={email}, calendar_url={calendar_url}")
         
         return JSONResponse({
@@ -2126,6 +2130,7 @@ async def calendar_test(
             "token_valid": True,
             "email": email,
             "calendar_url": calendar_url,
+            "caldav_base": base,
             "scope_note": "Full calendar access (calendar:all) required for /calendar/events.",
             "user_info": {
                 "id": me.get("id"),

@@ -13,6 +13,7 @@ os.environ.setdefault("YANDEX_CLIENT_SECRET", "test_client_secret")
 os.environ.setdefault("YANDEX_ORG_ID", "test_org_id")
 os.environ.setdefault("BOT_TOKEN", "123456:ABC-DEF")
 os.environ.setdefault("GPTUNNEL_API_KEY", "test_api_key")
+os.environ.setdefault("CALDAV_BASE_URL", "https://caldav.yandex.ru")
 
 
 @pytest.fixture(scope="session")
@@ -38,4 +39,5 @@ def mock_settings():
         oauth=OAuthConfig(client_id="test_id", client_secret="test_secret"),
         bot=BotConfig(token="123:ABC"),
         ai=AIConfig(api_key="test_key"),
+        caldav_base_url="https://caldav.yandex.ru",
     )

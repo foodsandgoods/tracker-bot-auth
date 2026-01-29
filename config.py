@@ -90,7 +90,9 @@ class Settings:
     oauth: Optional[OAuthConfig]
     bot: Optional[BotConfig]
     ai: Optional[AIConfig]
-    
+    # CalDAV base URL: caldav.yandex.ru (личный) или caldav.360.yandex.ru (Яндекс 360)
+    caldav_base_url: str = "https://caldav.yandex.ru"
+
     # Derived settings
     is_configured: bool = field(init=False)
     missing_vars: list = field(default_factory=list, init=False)
@@ -160,7 +162,10 @@ def load_settings() -> Settings:
     ai_key = _get_env("GPTUNNEL_API_KEY")
     ai_model = _get_env("GPTUNNEL_MODEL", "gpt-4o-mini")
     ai = AIConfig(api_key=ai_key, model=ai_model) if ai_key else None
-    
+
+    # CalDAV: по умолчанию личный календарь; для Яндекс 360 задайте CALDAV_BASE_URL=https://caldav.360.yandex.ru
+    caldav_base_url = _get_env("CALDAV_BASE_URL", "https://caldav.yandex.ru").rstrip("/")
+
     settings = Settings(
         base_url=base_url,
         port=port,
@@ -171,6 +176,7 @@ def load_settings() -> Settings:
         oauth=oauth,
         bot=bot,
         ai=ai,
+        caldav_base_url=caldav_base_url,
     )
     
     if settings.missing_vars:
