@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import uvicorn
 from aiogram import Bot, Dispatcher, Router, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, CallbackQuery, BotCommand
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -3038,7 +3039,11 @@ async def handle_calendar_callback(cb: CallbackQuery):
             if loading:
                 await loading.delete()
             if cb.message:
-                await cb.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+                try:
+                    await cb.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+                except TelegramBadRequest as e:
+                    if "message is not modified" not in str(e):
+                        raise
         else:
             error_msg = data.get("error", f"Ошибка {sc}")
             logger.warning(f"[CALENDAR_CALLBACK] Failed: tg_id={tg_id}, date={date}, status={sc}, error={error_msg}")

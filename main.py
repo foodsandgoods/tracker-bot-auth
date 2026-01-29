@@ -436,7 +436,9 @@ class CalendarClient:
             Tuple of (status_code, events_list)
         """
         client = await get_client()
-        # CalDAV REPORT request body for date range query
+        # CalDAV REPORT time-range: RFC 4791 expects YYYYMMDDTHHMMSSZ (no hyphens)
+        start_ts = start_date.replace("-", "") + "T000000Z"
+        end_ts = end_date.replace("-", "") + "T235959Z"
         report_body = f"""<?xml version="1.0" encoding="utf-8"?>
 <C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
     <D:prop>
@@ -446,7 +448,7 @@ class CalendarClient:
     <C:filter>
         <C:comp-filter name="VCALENDAR">
             <C:comp-filter name="VEVENT">
-                <C:time-range start="{start_date}T00:00:00Z" end="{end_date}T23:59:59Z"/>
+                <C:time-range start="{start_ts}" end="{end_ts}"/>
             </C:comp-filter>
         </C:comp-filter>
     </C:filter>
@@ -486,6 +488,9 @@ class CalendarClient:
                     ical_body = self._extract_ical_from_multistatus(r.text) if r.status_code == 207 else r.text
                     events = self._parse_icalendar(ical_body)
                     logger.info(f"[CALENDAR] Retrieved events: url={calendar_url}, date={start_date}, count={len(events)}")
+                    if not events and r.status_code == 207 and r.text:
+                        logger.info("[CALENDAR] 0 events: raw 207 snippet=%s, ical_extracted=%s",
+                            r.text[:800], (ical_body[:500] if ical_body else "(empty)"))
                     return 200, events
                 if r.status_code == 404 and calendar_url != calendar_urls_to_try[-1]:
                     continue  # try next URL
@@ -581,8 +586,8 @@ class CalendarClient:
                     web_base = "https://calendar.360.yandex.ru" if "360" in (self._caldav_base or "") else "https://calendar.yandex.ru"
                     event["calendar_url"] = f"{web_base}/event/{uid}"
                 
-                if event.get("summary"):  # Only add if has title
-                    events.append(event)
+                event.setdefault("summary", "Без названия")
+                events.append(event)
                     
         except Exception as e:
             logger.error(f"Failed to parse iCalendar: {e}")
