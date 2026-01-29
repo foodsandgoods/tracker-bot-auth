@@ -2919,16 +2919,11 @@ async def cmd_calendar(m: Message):
             if not events:
                 text = f"📅 Сегодня ({today}) событий нет"
             else:
-                web_url = data.get("web_calendar_url", "")
                 lines = [f"📅 События на сегодня ({today}):\n"]
                 for i, event in enumerate(events, 1):
                     summary = event.get("summary", "Без названия")
                     start = event.get("start", "")
                     end = event.get("end", "")
-                    description = event.get("description", "")
-                    url = web_url or event.get("calendar_url") or event.get("url", "")
-                    
-                    # Format time: "HH:MM" or "HH:MM–HH:MM"
                     start_hm = start.split(" ")[1][:5] if start and " " in start else ""
                     end_hm = end.split(" ")[1][:5] if end and " " in end else ""
                     time_str = ""
@@ -2936,18 +2931,10 @@ async def cmd_calendar(m: Message):
                         time_str = f"{start_hm}–{end_hm}"
                     elif start_hm:
                         time_str = start_hm
-                    
                     line = f"{i}. "
                     if time_str:
                         line += f"**{time_str}** — "
                     line += summary
-                    
-                    if description:
-                        line += f"\n   {description[:100]}"
-                    
-                    if url:
-                        line += f"\n   [Открыть в календаре]({url})"
-                    
                     lines.append(line)
                 
                 text = "\n".join(lines)
@@ -2998,15 +2985,11 @@ async def handle_calendar_callback(cb: CallbackQuery):
             if not events:
                 text = f"📅 {date_str} — событий нет"
             else:
-                web_url = data.get("web_calendar_url", "")
                 lines = [f"📅 События на {date_str}:\n"]
                 for i, event in enumerate(events, 1):
                     summary = event.get("summary", "Без названия")
                     start = event.get("start", "")
                     end = event.get("end", "")
-                    description = event.get("description", "")
-                    url = web_url or event.get("calendar_url") or event.get("url", "")
-                    
                     start_hm = start.split(" ")[1][:5] if start and " " in start else ""
                     end_hm = end.split(" ")[1][:5] if end and " " in end else ""
                     time_str = ""
@@ -3014,18 +2997,10 @@ async def handle_calendar_callback(cb: CallbackQuery):
                         time_str = f"{start_hm}–{end_hm}"
                     elif start_hm:
                         time_str = start_hm
-                    
                     line = f"{i}. "
                     if time_str:
                         line += f"**{time_str}** — "
                     line += summary
-                    
-                    if description:
-                        line += f"\n   {description[:100]}"
-                    
-                    if url:
-                        line += f"\n   [Открыть в календаре]({url})"
-                    
                     lines.append(line)
                 
                 text = "\n".join(lines)

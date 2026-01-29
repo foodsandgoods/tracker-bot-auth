@@ -591,11 +591,17 @@ class CalendarClient:
         if not raw:
             return raw
         s = raw.strip()
-        # Match leading optional /, then word:word (queue-like), then — or -
-        prefix_re = re.compile(r"^/?\s*[A-Za-z0-9]+:[A-Za-z0-9]+\s*[—\-]\s*", re.IGNORECASE)
+        # Match leading optional /, then word:word (queue-like), then dash (— – - etc.)
+        prefix_re = re.compile(r"^/?\s*[A-Za-z0-9]+:[A-Za-z0-9]+\s*[\u2010-\u2015\-]\s*", re.IGNORECASE)
         while prefix_re.match(s):
             s = prefix_re.sub("", s, count=1).strip()
         return s or raw
+
+    def _unfold_ical(self, text: str) -> str:
+        """RFC 5545: unfold lines (remove CRLF + SP/HTAB continuation)."""
+        if not text:
+            return text
+        return re.sub(r'\r?\n[ \t]', '', text)
 
     def _parse_icalendar(self, ical_data: str) -> list[dict]:
         """
@@ -608,8 +614,8 @@ class CalendarClient:
         
         try:
             import re
-            # Split by VEVENT blocks
-            event_blocks = re.split(r'BEGIN:VEVENT', ical_data)
+            ical_unfolded = self._unfold_ical(ical_data)
+            event_blocks = re.split(r'BEGIN:VEVENT', ical_unfolded)
             
             for block in event_blocks[1:]:  # Skip first empty part
                 if "END:VEVENT" not in block:
@@ -617,7 +623,6 @@ class CalendarClient:
                 
                 event = {}
                 
-                # Extract summary (title)
                 summary_match = re.search(r'SUMMARY[;:]([^\r\n]+)', block)
                 if summary_match:
                     raw = summary_match.group(1).strip()
