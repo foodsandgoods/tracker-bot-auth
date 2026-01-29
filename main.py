@@ -481,8 +481,10 @@ class CalendarClient:
                 last_response_text = r.text[:500]
                 logger.info(f"[CALENDAR] Response: status={r.status_code}, url={calendar_url}, body_length={len(r.text)}")
 
-                if r.status_code == 200:
-                    events = self._parse_icalendar(r.text)
+                # CalDAV REPORT returns 207 Multi-Status with calendar-data in XML; 200 with raw iCal is rare
+                if r.status_code in (200, 207):
+                    ical_body = self._extract_ical_from_multistatus(r.text) if r.status_code == 207 else r.text
+                    events = self._parse_icalendar(ical_body)
                     logger.info(f"[CALENDAR] Retrieved events: url={calendar_url}, date={start_date}, count={len(events)}")
                     return 200, events
                 if r.status_code == 404 and calendar_url != calendar_urls_to_try[-1]:
@@ -504,6 +506,26 @@ class CalendarClient:
             logger.error(f"[CALENDAR] Request exception: {type(e).__name__}: {e}", exc_info=True)
             return 503, {"error": f"Calendar request failed: {type(e).__name__}"}
     
+    def _extract_ical_from_multistatus(self, xml_body: str) -> str:
+        """Extract iCalendar text from CalDAV 207 Multi-Status response (calendar-data elements)."""
+        if not xml_body:
+            return ""
+        parts: list[str] = []
+        # <*:calendar-data*>...</*:calendar-data*> — content can be CDATA or escaped text
+        pattern = r"<[^:>]*:?calendar-data[^>]*>([\s\S]*?)</[^:>]*:?calendar-data>"
+        for m in re.finditer(pattern, xml_body, re.IGNORECASE):
+            inner = m.group(1).strip()
+            if "<![CDATA[" in inner:
+                cdata = re.search(r"<!\[CDATA\[([\s\S]*?)\]\]>", inner)
+                if cdata:
+                    inner = cdata.group(1)
+            if inner and ("BEGIN:VCALENDAR" in inner or "BEGIN:VEVENT" in inner):
+                parts.append(inner)
+        if not parts:
+            return ""
+        import html
+        return html.unescape("\n".join(parts))
+
     def _parse_icalendar(self, ical_data: str) -> list[dict]:
         """
         Parse iCalendar data and extract events.
