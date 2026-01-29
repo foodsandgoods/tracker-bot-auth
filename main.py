@@ -586,13 +586,16 @@ class CalendarClient:
         Strip sync prefixes from event title.
         Prefixes come from the calendar data (SUMMARY), not from our code.
         Typical sources: Yandex Tracker "Создать событие в календаре" and similar
-        integrations that prepend queue/project id (e.g. /M:os — , lm:at — , /B:el — ).
+        integrations that prepend queue/project id (e.g. /M:os — , lm:at , /B:el ).
         """
         if not raw:
             return raw
         s = raw.strip()
-        # Match leading optional /, then word:word (queue-like), then dash (— – - etc.)
-        prefix_re = re.compile(r"^/?\s*[A-Za-z0-9]+:[A-Za-z0-9]+\s*[\u2010-\u2015\-]\s*", re.IGNORECASE)
+        # Match optional /, word:word, then dash (— – -) OR space(s). Loop to strip lm:at , /B:el , etc.
+        prefix_re = re.compile(
+            r"^/?\s*[A-Za-z0-9]+:[A-Za-z0-9]+(\s*[\u2010-\u2015\-]\s*|\s+)",
+            re.IGNORECASE,
+        )
         while prefix_re.match(s):
             s = prefix_re.sub("", s, count=1).strip()
         return s or raw
@@ -628,17 +631,17 @@ class CalendarClient:
                     raw = summary_match.group(1).strip()
                     event["summary"] = self._normalize_calendar_summary(raw)
                 
-                # Extract start time
                 dtstart_match = re.search(r'DTSTART[;:]([^\r\n]+)', block)
                 if dtstart_match:
-                    dtstart = dtstart_match.group(1).strip()
-                    event["start"] = self._parse_ical_date(dtstart)
+                    raw_dt = dtstart_match.group(1).strip()
+                    value = raw_dt.split(":")[-1].strip()
+                    event["start"] = self._parse_ical_date(value)
                 
-                # Extract end time
                 dtend_match = re.search(r'DTEND[;:]([^\r\n]+)', block)
                 if dtend_match:
-                    dtend = dtend_match.group(1).strip()
-                    event["end"] = self._parse_ical_date(dtend)
+                    raw_dt = dtend_match.group(1).strip()
+                    value = raw_dt.split(":")[-1].strip()
+                    event["end"] = self._parse_ical_date(value)
                 
                 # Extract description
                 desc_match = re.search(r'DESCRIPTION[;:]([^\r\n]+)', block)
@@ -667,18 +670,21 @@ class CalendarClient:
         return events
     
     def _parse_ical_date(self, dt_str: str) -> str:
-        """Parse iCalendar date format to readable string."""
+        """Parse iCalendar date format to readable string. Value only (e.g. 20240125T100000Z or 20240125)."""
         try:
-            # Handle formats: 20240125T100000Z or 20240125
-            dt_str = dt_str.replace("Z", "").replace("T", "")
-            if len(dt_str) >= 8:
-                year = dt_str[0:4]
-                month = dt_str[4:6]
-                day = dt_str[6:8]
+            s = dt_str.strip().replace("Z", "")
+            if "T" in s:
+                date_part, time_part = s.split("T", 1)
+            else:
+                date_part, time_part = s, ""
+            if len(date_part) >= 8:
+                year = date_part[0:4]
+                month = date_part[4:6]
+                day = date_part[6:8]
                 time_str = ""
-                if len(dt_str) > 8:
-                    hour = dt_str[9:11] if len(dt_str) > 9 else dt_str[8:10]
-                    minute = dt_str[11:13] if len(dt_str) > 11 else dt_str[10:12]
+                if len(time_part) >= 4:
+                    hour = time_part[0:2]
+                    minute = time_part[2:4]
                     time_str = f" {hour}:{minute}"
                 return f"{year}-{month}-{day}{time_str}"
         except Exception:
