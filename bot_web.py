@@ -5,6 +5,7 @@ Optimized for low-resource environments (1GB RAM).
 import asyncio
 import logging
 import re
+import signal
 import time
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
@@ -187,7 +188,7 @@ class AppState:
     """Application state container."""
     
     __slots__ = (
-        'bot', 'dispatcher', 'shutdown_event',
+        'bot', 'dispatcher', 'shutdown_event', 'main_tasks',
         'checklist_cache', 'summary_cache',
         'pending_comment', 'pending_summary', 'pending_ai_search', 
         'pending_new_issue', 'pending_stats_dates', 'last_reminder',
@@ -198,6 +199,7 @@ class AppState:
         self.bot: Optional[Bot] = None
         self.dispatcher: Optional[Dispatcher] = None
         self.shutdown_event = asyncio.Event()
+        self.main_tasks: Optional[Dict[str, asyncio.Task]] = None
         
         # Caches with config-based sizes
         self.checklist_cache = TTLCache(
@@ -3102,9 +3104,10 @@ async def run_bot():
             if webhook_attempt < 2:
                 await asyncio.sleep(2)
     
-    # Wait longer for old instances to fully stop
-    logger.info("Waiting 15 seconds for old instances to stop...")
-    await asyncio.sleep(15)
+    # Wait for old instances to release getUpdates (avoid TelegramConflictError on deploy)
+    wait_sec = 25
+    logger.info(f"Waiting {wait_sec} seconds for old instances to stop...")
+    await asyncio.sleep(wait_sec)
     
     if state.dispatcher is None:
         dp = Dispatcher()
@@ -3112,40 +3115,51 @@ async def run_bot():
         state.dispatcher = dp
     
     max_retries = 8
-    for attempt in range(max_retries):
-        try:
-            logger.info(f"Starting polling (attempt {attempt + 1}/{max_retries})...")
-            await state.dispatcher.start_polling(
-                bot,
-                close_bot_session=False,
-                allowed_updates=["message", "callback_query"],
-                drop_pending_updates=True,
-                polling_timeout=30
-            )
-            logger.info("Polling started successfully!")
-            break
-        except Exception as e:
-            error_str = str(e)
-            logger.error(f"Polling failed (attempt {attempt + 1}/{max_retries}): {error_str}")
-            if ("Conflict" in error_str or "terminated" in error_str) and attempt < max_retries - 1:
-                wait_time = 15 * (attempt + 1)  # 15, 30, 45, 60, 75, 90, 105 seconds
-                logger.warning(f"Bot conflict detected, waiting {wait_time}s before retry...")
-                
-                # Try to delete webhook again
-                for webhook_attempt in range(3):
-                    try:
-                        await bot.delete_webhook(drop_pending_updates=True)
-                        logger.info(f"Webhook deleted during retry (attempt {webhook_attempt + 1})")
-                        break
-                    except Exception as webhook_err:
-                        logger.warning(f"Failed to delete webhook during retry: {webhook_err}")
-                        if webhook_attempt < 2:
-                            await asyncio.sleep(2)
-                
-                await asyncio.sleep(wait_time)
-            else:
-                logger.error(f"Polling failed permanently: {e}")
+    try:
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Starting polling (attempt {attempt + 1}/{max_retries})...")
+                await state.dispatcher.start_polling(
+                    bot,
+                    close_bot_session=False,
+                    allowed_updates=["message", "callback_query"],
+                    drop_pending_updates=True,
+                    polling_timeout=30
+                )
+                logger.info("Polling started successfully!")
+                break
+            except asyncio.CancelledError:
+                logger.info("Polling cancelled (SIGTERM or shutdown)")
                 raise
+            except Exception as e:
+                error_str = str(e)
+                logger.error(f"Polling failed (attempt {attempt + 1}/{max_retries}): {error_str}")
+                if ("Conflict" in error_str or "terminated" in error_str) and attempt < max_retries - 1:
+                    wait_time = 15 * (attempt + 1)  # 15, 30, 45, 60, 75, 90, 105 seconds
+                    logger.warning(f"Bot conflict detected, waiting {wait_time}s before retry...")
+                    
+                    # Try to delete webhook again
+                    for webhook_attempt in range(3):
+                        try:
+                            await bot.delete_webhook(drop_pending_updates=True)
+                            logger.info(f"Webhook deleted during retry (attempt {webhook_attempt + 1})")
+                            break
+                        except Exception as webhook_err:
+                            logger.warning(f"Failed to delete webhook during retry: {webhook_err}")
+                            if webhook_attempt < 2:
+                                await asyncio.sleep(2)
+                    
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error(f"Polling failed permanently: {e}")
+                    raise
+    finally:
+        # Release getUpdates quickly on shutdown so new instance can start
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            await bot.session.close()
+        except Exception:
+            pass
 
 
 async def run_web():
@@ -3480,6 +3494,16 @@ async def shutdown():
     logger.info("Shutdown complete")
 
 
+def _on_sigterm(*_args):
+    """Stop polling immediately on SIGTERM so old instance releases getUpdates."""
+    state.shutdown_event.set()
+    if state.main_tasks:
+        bot_task = state.main_tasks.get("bot")
+        if bot_task and not bot_task.done():
+            bot_task.cancel()
+            logger.info("SIGTERM: cancelled bot task to release getUpdates")
+
+
 async def main():
     """Main entry point."""
     tasks = {
@@ -3490,9 +3514,17 @@ async def main():
         "morning_report": asyncio.create_task(morning_report_worker()),
         "evening_report": asyncio.create_task(evening_report_worker()),
     }
-    
+    state.main_tasks = tasks
+
+    sigterm = getattr(signal, "SIGTERM", None)
+    if sigterm is not None:
+        try:
+            signal.signal(sigterm, _on_sigterm)
+        except (ValueError, OSError):
+            pass  # main thread only / not supported
+
     logger.info(f"Starting tracker-bot on port {settings.port}")
-    
+
     try:
         while not state.shutdown_event.is_set():
             await asyncio.sleep(5)
