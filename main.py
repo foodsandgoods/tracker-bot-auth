@@ -9,8 +9,8 @@ import secrets
 import time
 from collections import defaultdict
 from typing import Any, Optional
-from urllib.parse import urljoin, urlparse
-from urllib.parse import urlencode
+import html
+from urllib.parse import urljoin, urlparse, urlencode
 
 from contextlib import asynccontextmanager
 
@@ -485,12 +485,25 @@ class CalendarClient:
 
                 # CalDAV REPORT returns 207 Multi-Status with calendar-data in XML; 200 with raw iCal is rare
                 if r.status_code in (200, 207):
-                    ical_body = self._extract_ical_from_multistatus(r.text) if r.status_code == 207 else r.text
-                    events = self._parse_icalendar(ical_body)
+                    if r.status_code == 207:
+                        pairs = self._extract_responses_from_multistatus(r.text)
+                        events = []
+                        for href, ical_fragment in pairs:
+                            chunk = self._parse_icalendar(ical_fragment)
+                            event_id = self._event_id_from_href(href)
+                            web_url = self._calendar_web_event_url(event_id) if event_id else ""
+                            for ev in chunk:
+                                if web_url:
+                                    ev["calendar_url"] = web_url
+                                events.append(ev)
+                        if not events and r.text:
+                            ical_legacy = self._extract_ical_from_multistatus(r.text)
+                            logger.info("[CALENDAR] 0 events: raw 207 snippet=%s, ical_extracted=%s",
+                                r.text[:800], (ical_legacy[:500] if ical_legacy else "(empty)"))
+                    else:
+                        ical_body = r.text
+                        events = self._parse_icalendar(ical_body)
                     logger.info(f"[CALENDAR] Retrieved events: url={calendar_url}, date={start_date}, count={len(events)}")
-                    if not events and r.status_code == 207 and r.text:
-                        logger.info("[CALENDAR] 0 events: raw 207 snippet=%s, ical_extracted=%s",
-                            r.text[:800], (ical_body[:500] if ical_body else "(empty)"))
                     return 200, events
                 if r.status_code == 404 and calendar_url != calendar_urls_to_try[-1]:
                     continue  # try next URL
@@ -528,8 +541,45 @@ class CalendarClient:
                 parts.append(inner)
         if not parts:
             return ""
-        import html
         return html.unescape("\n".join(parts))
+
+    def _extract_responses_from_multistatus(self, xml_body: str) -> list[tuple[str, str]]:
+        """Extract (href, ical) pairs per CalDAV 207 d:response. href identifies the resource (.ics)."""
+        if not xml_body:
+            return []
+        pairs: list[tuple[str, str]] = []
+        blocks = re.findall(r"<[^:>]*:?response[^>]*>([\s\S]*?)</[^:>]*:?response>", xml_body, re.IGNORECASE)
+        for block in blocks:
+            href_m = re.search(r"<[^:>]*:?href[^>]*>([^<]+)</[^:>]*:?href>", block, re.IGNORECASE)
+            cal_m = re.search(
+                r"<[^:>]*:?calendar-data[^>]*>([\s\S]*?)</[^:>]*:?calendar-data>",
+                block, re.IGNORECASE
+            )
+            if not href_m or not cal_m:
+                continue
+            inner = cal_m.group(1).strip()
+            if "<![CDATA[" in inner:
+                cdata = re.search(r"<!\[CDATA\[([\s\S]*?)\]\]>", inner)
+                if cdata:
+                    inner = cdata.group(1)
+            if not inner or ("BEGIN:VCALENDAR" not in inner and "BEGIN:VEVENT" not in inner):
+                continue
+            href = href_m.group(1).strip()
+            pairs.append((href, html.unescape(inner)))
+        return pairs
+
+    def _event_id_from_href(self, href: str) -> str:
+        """Derive web event ID from CalDAV resource href (e.g. .../ev.ics -> ev)."""
+        path = urlparse(href).path or href
+        segment = path.rstrip("/").split("/")[-1] or ""
+        if segment.lower().endswith(".ics"):
+            return segment[:-4]
+        return segment
+
+    def _calendar_web_event_url(self, event_id: str) -> str:
+        """Build Yandex Calendar web URL to open specific event (by resource ID)."""
+        base = "https://calendar.360.yandex.ru" if "360" in (self._caldav_base or "") else "https://calendar.yandex.ru"
+        return f"{base}/event/{event_id}"
 
     def _parse_icalendar(self, ical_data: str) -> list[dict]:
         """
