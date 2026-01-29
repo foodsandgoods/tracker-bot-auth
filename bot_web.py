@@ -2854,6 +2854,7 @@ async def cmd_calendar_test(m: Message):
             token_valid = data.get("token_valid", False)
             email = data.get("email", "не найден")
             calendar_url = data.get("calendar_url", "")
+            logger.info(f"[CALENDAR_TEST] Success: tg_id={tg_id}, email={email}, calendar_url={calendar_url}")
             
             result_text = f"✅ **Тест подключения к календарю**\n\n"
             result_text += f"Статус: `{status}`\n"
@@ -2871,6 +2872,7 @@ async def cmd_calendar_test(m: Message):
             await loading.edit_text(result_text, parse_mode="Markdown")
         else:
             error_msg = data.get("error", "Неизвестная ошибка")
+            logger.warning(f"[CALENDAR_TEST] Failed: tg_id={tg_id}, status={sc}, error={error_msg}")
             await loading.edit_text(f"❌ **Ошибка подключения**\n\nСтатус: `{sc}`\nОшибка: `{error_msg}`", parse_mode="Markdown")
             
     except Exception as e:
@@ -2906,6 +2908,7 @@ async def cmd_calendar(m: Message):
         
         if sc == 200:
             events = data.get("events", [])
+            logger.info(f"[CALENDAR_CMD] Success: tg_id={tg_id}, date={today}, events_count={len(events)}")
             if not events:
                 text = f"📅 Сегодня ({today}) событий нет"
             else:
@@ -2981,6 +2984,7 @@ async def handle_calendar_callback(cb: CallbackQuery):
         if sc == 200:
             events = data.get("events", [])
             date_str = datetime.strptime(date, "%Y-%m-%d").strftime("%d.%m.%Y")
+            logger.info(f"[CALENDAR_CALLBACK] Success: tg_id={tg_id}, date={date}, events_count={len(events)}")
             
             if not events:
                 text = f"📅 {date_str} — событий нет"
@@ -3031,10 +3035,11 @@ async def handle_calendar_callback(cb: CallbackQuery):
                 await cb.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
         else:
             error_msg = data.get("error", f"Ошибка {sc}")
+            logger.warning(f"[CALENDAR_CALLBACK] Failed: tg_id={tg_id}, date={date}, status={sc}, error={error_msg}")
             if loading:
                 await loading.edit_text(f"❌ Не удалось загрузить события: {error_msg}")
     except Exception as e:
-        logger.error(f"Calendar callback error: {e}", exc_info=True)
+        logger.error(f"[CALENDAR_CALLBACK] Error: tg_id={tg_id}, date={date}, {e}", exc_info=True)
         if loading:
             try:
                 await loading.edit_text(f"❌ Ошибка: {str(e)[:100]}")

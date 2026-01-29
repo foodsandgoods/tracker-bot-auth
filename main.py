@@ -402,6 +402,13 @@ class CalendarClient:
                 events = self._parse_icalendar(r.text)
                 logger.info(f"[CALENDAR] Retrieved events: email={email}, date={start_date}, count={len(events)}")
                 return 200, events
+            elif r.status_code == 403:
+                logger.warning(
+                    "[CALENDAR] CalDAV 403 Forbidden: email=%s, date=%s. "
+                    "Ensure OAuth app has calendar:all scope and user reconnected.",
+                    email, start_date
+                )
+                return 403, {"error": "Calendar access denied (403). Reconnect with calendar rights.", "response": r.text[:500]}
             else:
                 logger.warning(f"[CALENDAR] Request failed: status={r.status_code}, email={email}, response={r.text[:500]}")
                 return r.status_code, {"error": f"Calendar API returned {r.status_code}", "response": r.text[:500]}
@@ -1442,10 +1449,13 @@ class TrackerService:
                 logger.info(f"[CALENDAR] Retrieved {event_count} events for {email} on {date}")
                 return {"http_status": 200, "body": {"events": events, "date": date, "email": email}}
             else:
-                logger.warning(f"[CALENDAR] API returned status {st} for {email} on {date}")
-                return {"http_status": st, "body": events if isinstance(events, dict) else {"error": f"Calendar API error: {st}"}}
+                err_body = events if isinstance(events, dict) else {"error": f"Calendar API error: {st}"}
+                logger.warning(
+                    f"[CALENDAR] API returned status {st} for tg_id={tg_id}, email={email}, date={date}, body={err_body.get('error', err_body)}"
+                )
+                return {"http_status": st, "body": err_body}
         except Exception as e:
-            logger.error(f"[CALENDAR] Exception getting events: {type(e).__name__}: {e}", exc_info=True)
+            logger.error(f"[CALENDAR] Exception getting events: tg_id={tg_id}, {type(e).__name__}: {e}", exc_info=True)
             return {"http_status": 503, "body": {"error": f"Calendar request failed: {type(e).__name__}"}}
 
     async def create_issue(
@@ -2101,14 +2111,16 @@ async def calendar_test(
         
         logger.info(f"[CALENDAR_TEST] User email: {email}")
         
-        # Test calendar URL construction
+        # Test calendar URL construction (CalDAV; requires calendar:all scope)
         calendar_url = f"https://caldav.yandex.ru/calendars/{email}/events-default"
+        logger.info(f"[CALENDAR_TEST] Success: tg_id={tg}, email={email}, calendar_url={calendar_url}")
         
         return JSONResponse({
             "status": "ok",
             "token_valid": True,
             "email": email,
             "calendar_url": calendar_url,
+            "scope_note": "Full calendar access (calendar:all) required for /calendar/events.",
             "user_info": {
                 "id": me.get("id"),
                 "login": me.get("login"),
@@ -2140,9 +2152,17 @@ async def calendar_events(
         return JSONResponse({"error": "Invalid date format. Use YYYY-MM-DD"}, status_code=400)
     
     metrics.inc("api.calendar_events")
+    logger.info(f"[CALENDAR_EVENTS] Request: tg_id={tg}, date={date}")
     with Timer("calendar_events"):
         result = await _service.get_calendar_events(tg, date)  # type: ignore
-    return JSONResponse(result["body"], status_code=result["http_status"])
+    status = result["http_status"]
+    body = result["body"]
+    if status == 200 and isinstance(body, dict):
+        events = body.get("events", [])
+        logger.info(f"[CALENDAR_EVENTS] Success: tg_id={tg}, date={date}, events_count={len(events)}")
+    else:
+        logger.warning(f"[CALENDAR_EVENTS] Error: tg_id={tg}, date={date}, status={status}, error={body.get('error', body)}")
+    return JSONResponse(body, status_code=status)
 
 
 @app.get("/tracker/ai_search")
