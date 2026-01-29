@@ -1352,6 +1352,8 @@ async def handle_callback(c: CallbackQuery):
         await handle_stats_callback(c)
     elif data.startswith("report:"):
         await handle_report_callback(c)
+    elif data.startswith("calendar:"):
+        await handle_calendar_callback(c)
     else:
         await c.answer()
 
