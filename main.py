@@ -342,9 +342,9 @@ class CalendarClient:
         self._caldav_base = "https://caldav.yandex.ru"
     
     def _headers(self, access_token: str) -> dict[str, str]:
-        """Build CalDAV request headers."""
+        """Build CalDAV request headers. Yandex CalDAV expects OAuth scheme (same as Tracker API)."""
         return {
-            "Authorization": f"Bearer {access_token}",
+            "Authorization": f"OAuth {access_token}",
             "Content-Type": "application/xml; charset=utf-8",
             "Depth": "1",
         }
@@ -402,6 +402,12 @@ class CalendarClient:
                 events = self._parse_icalendar(r.text)
                 logger.info(f"[CALENDAR] Retrieved events: email={email}, date={start_date}, count={len(events)}")
                 return 200, events
+            elif r.status_code == 401:
+                logger.warning(
+                    "[CALENDAR] CalDAV 401 Unauthorized: email=%s. Token invalid or wrong auth scheme (use OAuth header).",
+                    email
+                )
+                return 401, {"error": "Календарь: не авторизован (401). Выполните /connect заново.", "response": r.text[:500]}
             elif r.status_code == 403:
                 logger.warning(
                     "[CALENDAR] CalDAV 403 Forbidden: email=%s, date=%s. "
