@@ -229,6 +229,8 @@ state = AppState()
 from main import app
 
 router = Router(name="main_router")
+# Commands that must be checked before F.text (calendar, calendar_test, clear, logs)
+commands_router = Router(name="commands_priority")
 
 
 # Override root endpoint
@@ -2393,15 +2395,12 @@ async def handle_settings_callback(c: CallbackQuery):
 
 
 # =============================================================================
-# Text Message Handler
+# Text Message Handler (must not match commands — /calendar_test, /calendar, etc.)
 # =============================================================================
-@router.message(F.text)
+@router.message(F.text, ~F.text.startswith("/"))
 async def handle_text_message(m: Message):
-    """Handle plain text messages for pending inputs."""
+    """Handle plain text messages for pending inputs. Commands are handled by Command() handlers."""
     if not m.text or not m.from_user:
-        return
-
-    if m.text.startswith("/"):
         return
 
     tg_id = m.from_user.id
@@ -2794,7 +2793,7 @@ def _format_search_results(issues: list, title: str) -> str:
     return "\n".join(lines)
 
 
-@router.message(Command("clear"))
+@commands_router.message(Command("clear"))
 async def cmd_clear(m: Message):
     """Clear chat history."""
     if not m.from_user:
@@ -2804,7 +2803,7 @@ async def cmd_clear(m: Message):
     await m.answer("🗑️ История чата очищена")
 
 
-@router.message(Command("logs"))
+@commands_router.message(Command("logs"))
 async def cmd_logs(m: Message):
     """Show recent AI errors."""
     if not m.from_user:
@@ -2833,7 +2832,7 @@ async def cmd_logs(m: Message):
     await m.answer(text, parse_mode=None)
 
 
-@router.message(Command("calendar_test"))
+@commands_router.message(Command("calendar_test"))
 async def cmd_calendar_test(m: Message):
     """Test calendar connection."""
     if not m.from_user:
@@ -2882,7 +2881,7 @@ async def cmd_calendar_test(m: Message):
         await loading.edit_text(f"❌ Исключение: {type(e).__name__}: {e}")
 
 
-@router.message(Command("calendar"))
+@commands_router.message(Command("calendar"))
 async def cmd_calendar(m: Message):
     """Show calendar events for today."""
     logger.info(f"[CALENDAR_CMD] Command received: tg_id={m.from_user.id if m.from_user else None}, text={m.text}")
@@ -3111,6 +3110,7 @@ async def run_bot():
     
     if state.dispatcher is None:
         dp = Dispatcher()
+        dp.include_router(commands_router)  # calendar, calendar_test, clear, logs — before F.text
         dp.include_router(router)
         state.dispatcher = dp
     
