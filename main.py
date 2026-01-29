@@ -581,6 +581,22 @@ class CalendarClient:
         base = "https://calendar.360.yandex.ru" if "360" in (self._caldav_base or "") else "https://calendar.yandex.ru"
         return f"{base}/event/{event_id}"
 
+    def _normalize_calendar_summary(self, raw: str) -> str:
+        """
+        Strip sync prefixes from event title.
+        Prefixes come from the calendar data (SUMMARY), not from our code.
+        Typical sources: Yandex Tracker "Создать событие в календаре" and similar
+        integrations that prepend queue/project id (e.g. /M:os — , lm:at — , /B:el — ).
+        """
+        if not raw:
+            return raw
+        s = raw.strip()
+        # Match leading optional /, then word:word (queue-like), then — or -
+        prefix_re = re.compile(r"^/?\s*[A-Za-z0-9]+:[A-Za-z0-9]+\s*[—\-]\s*", re.IGNORECASE)
+        while prefix_re.match(s):
+            s = prefix_re.sub("", s, count=1).strip()
+        return s or raw
+
     def _parse_icalendar(self, ical_data: str) -> list[dict]:
         """
         Parse iCalendar data and extract events.
@@ -604,7 +620,8 @@ class CalendarClient:
                 # Extract summary (title)
                 summary_match = re.search(r'SUMMARY[;:]([^\r\n]+)', block)
                 if summary_match:
-                    event["summary"] = summary_match.group(1).strip()
+                    raw = summary_match.group(1).strip()
+                    event["summary"] = self._normalize_calendar_summary(raw)
                 
                 # Extract start time
                 dtstart_match = re.search(r'DTSTART[;:]([^\r\n]+)', block)
@@ -1612,7 +1629,13 @@ class TrackerService:
             if st == 200:
                 event_count = len(events) if isinstance(events, list) else 0
                 logger.info(f"[CALENDAR] Retrieved {event_count} events for {email} on {date}")
-                return {"http_status": 200, "body": {"events": events, "date": date, "email": email}}
+                base = settings.caldav_base_url.rstrip("/") if settings.caldav_base_url else ""
+                web_base = "https://calendar.360.yandex.ru" if "360" in base else "https://calendar.yandex.ru"
+                web_calendar_url = f"{web_base}/week"
+                return {
+                    "http_status": 200,
+                    "body": {"events": events, "date": date, "email": email, "web_calendar_url": web_calendar_url},
+                }
             else:
                 err_body = events if isinstance(events, dict) else {"error": f"Calendar API error: {st}"}
                 logger.warning(
