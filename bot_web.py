@@ -361,11 +361,8 @@ def kb_settings_main() -> InlineKeyboardMarkup:
     kb.button(text="Период", callback_data="st:days")
     kb.button(text="Лимит", callback_data="st:limit")
     kb.button(text="🔔 Напоминание", callback_data="st:reminder")
-    kb.button(text="🌅 Утренний отчёт", callback_data="st:morning")
-    kb.button(text="🌆 Вечерний отчёт", callback_data="st:evening")
-    kb.button(text="📊 Итоговый отчёт", callback_data="st:report")
     kb.button(text="Закрыть", callback_data="st:close")
-    kb.adjust(2, 2, 3, 1)
+    kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 
@@ -491,7 +488,7 @@ def kb_settings_morning(enabled: bool, queue: str, limit: int) -> InlineKeyboard
     )
     kb.button(text=f"📋 Очередь: {queue or '—'}", callback_data="st:morning_queue")
     kb.button(text=f"🔢 Лимит: {limit}", callback_data="st:morning_limit")
-    kb.button(text="Назад", callback_data="st:back")
+    kb.button(text="⬅️ Назад", callback_data="reports:settings")
     kb.adjust(1, 2, 1)
     return kb.as_markup()
 
@@ -524,7 +521,7 @@ def kb_settings_evening(enabled: bool, queue: str) -> InlineKeyboardMarkup:
         callback_data=f"st:evening_toggle"
     )
     kb.button(text=f"📋 Очередь: {queue or '(= утренняя)'}", callback_data="st:evening_info")
-    kb.button(text="Назад", callback_data="st:back")
+    kb.button(text="⬅️ Назад", callback_data="reports:settings")
     kb.adjust(1, 1, 1)
     return kb.as_markup()
 
@@ -539,7 +536,7 @@ def kb_settings_report(enabled: bool, queue: str, period: str) -> InlineKeyboard
     )
     kb.button(text=f"📋 Очередь: {queue or '—'}", callback_data="st:report_queue")
     kb.button(text=f"📅 Период: {period_names.get(period, period)}", callback_data="st:report_period")
-    kb.button(text="Назад", callback_data="st:back")
+    kb.button(text="⬅️ Назад", callback_data="reports:settings")
     kb.adjust(1, 2, 1)
     return kb.as_markup()
 
@@ -719,7 +716,19 @@ def kb_reports_menu() -> InlineKeyboardMarkup:
     kb.button(text="🌅 Утренний отчёт", callback_data="reports:morning")
     kb.button(text="🌆 Вечерний отчёт", callback_data="reports:evening")
     kb.button(text="📊 Итоговый отчёт", callback_data="reports:stats")
+    kb.button(text="⚙️ Настройки", callback_data="reports:settings")
     kb.button(text="⬅️ Назад", callback_data="menu:back")
+    kb.adjust(1, 1, 1, 1, 1)
+    return kb.as_markup()
+
+
+def kb_reports_settings() -> InlineKeyboardMarkup:
+    """Reports settings submenu keyboard."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🌅 Утренний отчёт", callback_data="st:morning")
+    kb.button(text="🌆 Вечерний отчёт", callback_data="st:evening")
+    kb.button(text="📊 Итоговый отчёт", callback_data="st:report")
+    kb.button(text="⬅️ Назад", callback_data="menu:reports")
     kb.adjust(1, 1, 1, 1)
     return kb.as_markup()
 
@@ -1765,6 +1774,13 @@ async def handle_reports_callback(c: CallbackQuery):
             "📊 *Итоговый отчёт*\n\nВыберите очередь:",
             parse_mode="Markdown",
             reply_markup=kb_stats_queue()
+        )
+    elif action == "settings":
+        await c.answer()
+        await c.message.edit_text(
+            "⚙️ *Настройки отчётов*",
+            parse_mode="Markdown",
+            reply_markup=kb_reports_settings()
         )
     else:
         await c.answer()
