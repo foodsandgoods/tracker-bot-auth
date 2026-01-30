@@ -4,6 +4,7 @@ Single AsyncClient instance for the entire application to minimize resource usag
 """
 import asyncio
 import logging
+import random
 from functools import wraps
 from typing import Any, Callable, Optional, TypeVar
 
@@ -111,16 +112,24 @@ def with_retry(
     max_attempts: int = 3,
     base_delay: float = 0.5,
     max_delay: float = 5.0,
+    jitter: bool = True,
     retryable: tuple = (httpx.TimeoutException, httpx.ConnectError),
 ) -> Callable:
     """
-    Decorator for async functions with exponential backoff retry.
+    Decorator for async functions with exponential backoff retry and jitter.
     
     Args:
         max_attempts: Maximum number of attempts
-        base_delay: Initial delay between retries
-        max_delay: Maximum delay between retries
+        base_delay: Initial delay between retries (seconds)
+        max_delay: Maximum delay between retries (seconds)
+        jitter: If True, add random jitter (±50%) to prevent thundering herd
         retryable: Tuple of exception types to retry on
+    
+    The delay formula with jitter:
+        delay = min(base_delay * 2^attempt, max_delay) * random(0.5, 1.5)
+    
+    This prevents all clients from retrying at exactly the same time
+    after a service recovers from an outage.
     """
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
@@ -133,10 +142,16 @@ def with_retry(
                 except retryable as e:
                     last_exception = e
                     if attempt < max_attempts - 1:
-                        delay = min(base_delay * (2 ** attempt), max_delay)
+                        # Calculate base delay with exponential backoff
+                        base = min(base_delay * (2 ** attempt), max_delay)
+                        # Apply jitter: ±50% randomization to prevent thundering herd
+                        if jitter:
+                            delay = base * random.uniform(0.5, 1.5)
+                        else:
+                            delay = base
                         logger.warning(
                             f"Retry {attempt + 1}/{max_attempts} for {func.__name__}: "
-                            f"{type(e).__name__}"
+                            f"{type(e).__name__}, delay={delay:.2f}s"
                         )
                         await asyncio.sleep(delay)
             

@@ -36,6 +36,51 @@ logging.getLogger("asyncpg").setLevel(logging.WARNING)
 
 
 # =============================================================================
+# Queue Name Sanitization (YQL Injection Prevention)
+# =============================================================================
+# Valid queue names: 1-20 alphanumeric chars, underscores, hyphens
+_QUEUE_NAME_PATTERN = re.compile(r'^[A-Z0-9_-]{1,20}$')
+
+
+def sanitize_queue(queue: str) -> str:
+    """
+    Validate and sanitize a single queue name to prevent YQL injection.
+    
+    Args:
+        queue: Queue name to validate
+        
+    Returns:
+        Uppercase sanitized queue name
+        
+    Raises:
+        ValueError: If queue name contains invalid characters
+    """
+    if not queue:
+        raise ValueError("Queue name cannot be empty")
+    
+    q = queue.strip().upper()
+    if not _QUEUE_NAME_PATTERN.match(q):
+        raise ValueError(f"Invalid queue name: {queue!r}. Only A-Z, 0-9, _, - allowed (max 20 chars)")
+    return q
+
+
+def sanitize_queues(queues: list[str]) -> list[str]:
+    """
+    Validate and sanitize a list of queue names.
+    
+    Args:
+        queues: List of queue names to validate
+        
+    Returns:
+        List of uppercase sanitized queue names
+        
+    Raises:
+        ValueError: If any queue name is invalid
+    """
+    return [sanitize_queue(q) for q in queues if q]
+
+
+# =============================================================================
 # Rate Limiting
 # =============================================================================
 class RateLimiter:
@@ -698,14 +743,44 @@ class CalendarClient:
 class TrackerService:
     """Business logic for Tracker operations."""
     
+    # Maximum number of per-user locks to keep in memory (prevents unbounded growth)
+    _MAX_REFRESH_LOCKS = 500
+    
     def __init__(self, storage: TokenStorage, oauth: OAuthClient, tracker: TrackerClient, calendar: CalendarClient):
         self.storage = storage
         self.oauth = oauth
         self.tracker = tracker
         self.calendar = calendar
+        # Per-user locks to prevent concurrent token refresh (race condition fix)
+        self._refresh_locks: dict[int, asyncio.Lock] = {}
+        self._refresh_locks_lock = asyncio.Lock()  # Lock for managing the locks dict
+
+    async def _get_user_refresh_lock(self, tg_id: int) -> asyncio.Lock:
+        """Get or create a per-user lock for token refresh operations."""
+        async with self._refresh_locks_lock:
+            if tg_id not in self._refresh_locks:
+                # Evict oldest locks if we have too many
+                if len(self._refresh_locks) >= self._MAX_REFRESH_LOCKS:
+                    # Remove first 10% of locks (simple eviction)
+                    to_remove = list(self._refresh_locks.keys())[:self._MAX_REFRESH_LOCKS // 10]
+                    for key in to_remove:
+                        del self._refresh_locks[key]
+                self._refresh_locks[tg_id] = asyncio.Lock()
+            return self._refresh_locks[tg_id]
 
     async def _get_valid_access_token(self, tg_id: int) -> tuple[Optional[str], Optional[dict]]:
-        """Get valid access token, refreshing if needed."""
+        """Get valid access token, refreshing if needed.
+        
+        Uses per-user lock to prevent race conditions when multiple concurrent
+        requests trigger token refresh simultaneously.
+        """
+        # Acquire per-user lock to prevent concurrent refresh attempts
+        user_lock = await self._get_user_refresh_lock(tg_id)
+        async with user_lock:
+            return await self._get_valid_access_token_locked(tg_id)
+
+    async def _get_valid_access_token_locked(self, tg_id: int) -> tuple[Optional[str], Optional[dict]]:
+        """Internal token validation/refresh logic (must be called with lock held)."""
         tokens = await self.storage.get_tokens(tg_id)
         if not tokens or not tokens.get("access_token"):
             return None, {"http_status": 401, "body": {"error": "No token. Use /connect first."}}
@@ -714,6 +789,8 @@ class TrackerService:
         
         try:
             st, me = await self.tracker.myself(access)
+        except asyncio.CancelledError:
+            raise  # Propagate cancellation
         except Exception as e:
             logger.warning(f"Token validation failed for tg_id={tg_id}: {type(e).__name__}")
             return None, {"http_status": 503, "body": {"error": "Tracker API unavailable"}}
@@ -733,6 +810,8 @@ class TrackerService:
 
         try:
             new_payload = await self.oauth.refresh(refresh_token)
+        except asyncio.CancelledError:
+            raise  # Propagate cancellation
         except Exception as e:
             logger.warning(f"Token refresh failed for tg_id={tg_id}: {type(e).__name__}")
             return None, {"http_status": 401, "body": {"error": "Token refresh failed. Reconnect."}}
@@ -751,6 +830,8 @@ class TrackerService:
                 uid2 = me2.get("trackerUid") or me2.get("passportUid") or me2.get("uid")
                 if login2:
                     await self.storage.upsert_user(tg_id, login2, str(uid2) if uid2 else None)
+        except asyncio.CancelledError:
+            raise  # Propagate cancellation
         except Exception:
             pass
 
@@ -892,11 +973,17 @@ class TrackerService:
         if not queue:
             return {"http_status": 400, "body": {"error": "Очередь не указана"}}
 
+        # Sanitize queue name to prevent YQL injection
+        try:
+            safe_queue = sanitize_queue(queue)
+        except ValueError as e:
+            return {"http_status": 400, "body": {"error": str(e)}}
+
         # For today: open issues (exclude closed status). For past dates: issues updated on or before that date
         if date_offset == 0:
-            query = f'Queue: {queue} AND Status: !"Закрыт"'
+            query = f'Queue: {safe_queue} AND Status: !"Закрыт"'
         else:
-            query = f'Queue: {queue} AND Status: !"Закрыт" AND Updated: <= now()-{date_offset}d'
+            query = f'Queue: {safe_queue} AND Status: !"Закрыт" AND Updated: <= now()-{date_offset}d'
 
         try:
             st, payload = await self.tracker.search_issues(access, query=query, limit=limit, order="-updated")
@@ -944,13 +1031,19 @@ class TrackerService:
         if not queue:
             return {"http_status": 400, "body": {"error": "Очередь не указана"}}
 
+        # Sanitize queue name to prevent YQL injection
+        try:
+            safe_queue = sanitize_queue(queue)
+        except ValueError as e:
+            return {"http_status": 400, "body": {"error": str(e)}}
+
         # Closed on specific day - by status and updated date
         closed_statuses = '"Закрыт", "Завершен", "Решен", "Closed", "Done", "Resolved"'
         if date_offset == 0:
-            query = f'Queue: {queue} AND Status: {closed_statuses} AND Updated: >= today()'
+            query = f'Queue: {safe_queue} AND Status: {closed_statuses} AND Updated: >= today()'
         else:
             # Closed on that specific day: >= start of day AND < start of next day
-            query = f'Queue: {queue} AND Status: {closed_statuses} AND Updated: >= now()-{date_offset}d AND Updated: < now()-{date_offset - 1}d'
+            query = f'Queue: {safe_queue} AND Status: {closed_statuses} AND Updated: >= now()-{date_offset}d AND Updated: < now()-{date_offset - 1}d'
 
         try:
             st, payload = await self.tracker.search_issues(access, query=query, limit=50, order="-updated")
@@ -990,9 +1083,17 @@ class TrackerService:
         if not queue:
             return {"http_status": 400, "body": {"error": "Очередь не указана"}}
 
+        # Sanitize queue name to prevent YQL injection
+        try:
+            safe_queue = sanitize_queue(queue)
+        except ValueError as e:
+            return {"http_status": 400, "body": {"error": str(e)}}
+
         # Build date filter based on period
+        start: Optional[str] = None
+        end: Optional[str] = None
         if period == "today":
-            date_filter = "today()"
+            date_filter: Optional[str] = "today()"
         elif period == "week":
             date_filter = "now()-7d"
         elif period == "month":
@@ -1000,26 +1101,31 @@ class TrackerService:
         else:
             # Custom date range: period = "2024-01-01,2024-01-31"
             if "," in period:
-                start, end = period.split(",", 1)
+                parts = period.split(",", 1)
+                start, end = parts[0].strip(), parts[1].strip()
+                # Validate date format (YYYY-MM-DD) to prevent injection
+                date_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+                if not date_pattern.match(start) or not date_pattern.match(end):
+                    return {"http_status": 400, "body": {"error": "Invalid date format. Use YYYY-MM-DD"}}
                 date_filter = None  # Will use custom filter
             else:
                 date_filter = "now()-7d"  # default to week
 
-        stats = {"queue": queue, "period": period, "created": 0, "in_progress": 0, "closed": 0}
+        stats = {"queue": safe_queue, "period": period, "created": 0, "in_progress": 0, "closed": 0}
 
         try:
             # Count created
             if date_filter:
-                query = f"Queue: {queue} AND Created: >= {date_filter}"
+                query = f"Queue: {safe_queue} AND Created: >= {date_filter}"
             else:
-                query = f'Queue: {queue} AND Created: >= "{start}" AND Created: <= "{end}"'
+                query = f'Queue: {safe_queue} AND Created: >= "{start}" AND Created: <= "{end}"'
             st, payload = await self.tracker.search_issues(access, query=query, limit=200)
             if st == 200:
                 issues = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
                 stats["created"] = len(issues)
 
             # Count in progress (open)
-            query = f"Queue: {queue} AND Resolution: empty()"
+            query = f"Queue: {safe_queue} AND Resolution: empty()"
             st, payload = await self.tracker.search_issues(access, query=query, limit=200)
             if st == 200:
                 issues = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
@@ -1027,9 +1133,9 @@ class TrackerService:
 
             # Count closed in period
             if date_filter:
-                query = f"Queue: {queue} AND Resolved: >= {date_filter}"
+                query = f"Queue: {safe_queue} AND Resolved: >= {date_filter}"
             else:
-                query = f'Queue: {queue} AND Resolved: >= "{start}" AND Resolved: <= "{end}"'
+                query = f'Queue: {safe_queue} AND Resolved: >= "{start}" AND Resolved: <= "{end}"'
             st, payload = await self.tracker.search_issues(access, query=query, limit=200)
             if st == 200:
                 issues = payload if isinstance(payload, list) else payload.get("issues") or payload.get("items") or []
@@ -1044,7 +1150,18 @@ class TrackerService:
         return await self.storage.get_users_with_reminder()
 
     def _build_candidate_query(self, queues: list[str], days: int) -> str:
-        """Build search query for checklist candidates."""
+        """Build search query for checklist candidates.
+        
+        Args:
+            queues: List of queue names (will be sanitized)
+            days: Number of days to look back
+            
+        Returns:
+            YQL query string
+            
+        Raises:
+            ValueError: If any queue name is invalid
+        """
         exclude_closed = (
             'Status: !"Закрыт" AND Status: !"Завершен" AND Status: !"Решен" '
             'AND Status: !"Closed" AND Status: !"Done" AND Status: !"Resolved"'
@@ -1052,7 +1169,9 @@ class TrackerService:
         base = f"Updated: >= now()-{int(days)}d AND {exclude_closed}"
         if not queues:
             return base
-        queue_conditions = [f"Queue: {x}" for x in queues]
+        # Sanitize all queue names to prevent YQL injection
+        safe_queues = sanitize_queues(queues)
+        queue_conditions = [f"Queue: {x}" for x in safe_queues]
         q = " OR ".join(queue_conditions)
         return f"({q}) AND {base}"
 
@@ -1084,7 +1203,10 @@ class TrackerService:
         if limit == 10:
             limit = int(s.get("limit_results", 10))
 
-        query = self._build_candidate_query(queues, days)
+        try:
+            query = self._build_candidate_query(queues, days)
+        except ValueError as e:
+            return {"http_status": 400, "body": {"error": str(e)}}
         search_limit = min(max(50, limit * 5), 150)
 
         try:
@@ -1112,14 +1234,20 @@ class TrackerService:
         issues_by_key = {it.get("key"): it for it in issues if it.get("key")}
         issue_keys = list(issues_by_key.keys())[:min(len(issues_by_key), 120)]
 
+        # Semaphore to limit concurrent API requests (prevent connection pool exhaustion)
+        fetch_semaphore = asyncio.Semaphore(10)
+
         async def fetch_issue(key: str) -> tuple[str, Optional[dict]]:
-            try:
-                sti, issue_full = await self.tracker.get_issue(access, key)  # type: ignore
-                if sti == 200 and isinstance(issue_full, dict):
-                    return key, issue_full
-            except Exception:
-                pass
-            return key, None
+            async with fetch_semaphore:
+                try:
+                    sti, issue_full = await self.tracker.get_issue(access, key)  # type: ignore
+                    if sti == 200 and isinstance(issue_full, dict):
+                        return key, issue_full
+                except asyncio.CancelledError:
+                    raise  # Propagate cancellation
+                except Exception:
+                    pass
+                return key, None
 
         batch_size = 20
         result: list[dict] = []
@@ -1369,7 +1497,12 @@ class TrackerService:
         )
         base_query = f"Updated: >= now()-{days}d AND {exclude_closed}"
         if queues:
-            queue_conditions = [f"Queue: {x}" for x in queues]
+            # Sanitize all queue names to prevent YQL injection
+            try:
+                safe_queues = sanitize_queues(queues)
+            except ValueError as e:
+                return {"http_status": 400, "body": {"error": str(e)}}
+            queue_conditions = [f"Queue: {x}" for x in safe_queues]
             q = " OR ".join(queue_conditions)
             base_query = f"({q}) AND {base_query}"
 
@@ -1410,26 +1543,32 @@ class TrackerService:
             }
             api_base = settings.tracker.api_base if settings.tracker else ""
             
+            # Semaphore to limit concurrent API requests (prevent connection pool exhaustion)
+            comment_semaphore = asyncio.Semaphore(10)
+            
             async def check_responded(issue: dict) -> dict:
                 """Check if user responded to issue."""
                 issue_key = issue.get("key")
                 has_responded = False
                 
-                try:
-                    r = await client.get(
-                        f"{api_base}/issues/{issue_key}/comments",
-                        headers=headers
-                    )
-                    if r.status_code == 200:
-                        comments = safe_json(r)
-                        if isinstance(comments, list):
-                            for comment in reversed(comments):
-                                author = comment.get("createdBy", {})
-                                if (author.get("login") or "").lower() == login:
-                                    has_responded = True
-                                    break
-                except Exception:
-                    pass
+                async with comment_semaphore:
+                    try:
+                        r = await client.get(
+                            f"{api_base}/issues/{issue_key}/comments",
+                            headers=headers
+                        )
+                        if r.status_code == 200:
+                            comments = safe_json(r)
+                            if isinstance(comments, list):
+                                for comment in reversed(comments):
+                                    author = comment.get("createdBy", {})
+                                    if (author.get("login") or "").lower() == login:
+                                        has_responded = True
+                                        break
+                    except asyncio.CancelledError:
+                        raise  # Propagate cancellation
+                    except Exception:
+                        pass
                 
                 # Extract status
                 status_obj = issue.get("status")
