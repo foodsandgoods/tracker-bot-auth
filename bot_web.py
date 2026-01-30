@@ -689,32 +689,105 @@ def build_checklist_response(
 # =============================================================================
 # Bot Handlers
 # =============================================================================
+def kb_main_menu() -> InlineKeyboardMarkup:
+    """Main menu keyboard 2×2."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📋 Задачи", callback_data="menu:tasks")
+    kb.button(text="📊 Отчёты", callback_data="menu:reports")
+    kb.button(text="📅 Календарь", callback_data="menu:calendar")
+    kb.button(text="⚙️ Аккаунт", callback_data="menu:account")
+    kb.adjust(2, 2)
+    return kb.as_markup()
+
+
+def kb_tasks_menu() -> InlineKeyboardMarkup:
+    """Tasks submenu keyboard."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📝 Создать задачу", callback_data="tasks:new")
+    kb.button(text="✅ Мои задачи", callback_data="tasks:cl_my")
+    kb.button(text="❓ Ждут моего ОК", callback_data="tasks:cl_my_open")
+    kb.button(text="📣 Требуют ответа", callback_data="tasks:mentions")
+    kb.button(text="🤖 Резюме задачи", callback_data="tasks:summary")
+    kb.button(text="⬅️ Назад", callback_data="menu:back")
+    kb.adjust(2, 2, 1, 1)
+    return kb.as_markup()
+
+
+def kb_reports_menu() -> InlineKeyboardMarkup:
+    """Reports submenu keyboard."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🌅 Утренний отчёт", callback_data="reports:morning")
+    kb.button(text="🌆 Вечерний отчёт", callback_data="reports:evening")
+    kb.button(text="📊 Итоговый отчёт", callback_data="reports:stats")
+    kb.button(text="⬅️ Назад", callback_data="menu:back")
+    kb.adjust(1, 1, 1, 1)
+    return kb.as_markup()
+
+
+def kb_calendar_menu() -> InlineKeyboardMarkup:
+    """Calendar submenu keyboard."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📅 Сегодня", callback_data="cal:today")
+    kb.button(text="📆 На дату", callback_data="cal:pick_date")
+    kb.button(text="⬅️ Назад", callback_data="menu:back")
+    kb.adjust(2, 1)
+    return kb.as_markup()
+
+
+def kb_account_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
+    """Account submenu keyboard."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔗 Привязать аккаунт", callback_data="account:connect")
+    kb.button(text="👤 Проверить доступ", callback_data="account:me")
+    kb.button(text="⚙️ Настройки", callback_data="account:settings")
+    kb.button(text="🗑️ Очистить историю", callback_data="account:clear")
+    if is_admin:
+        kb.button(text="📋 Логи", callback_data="account:logs")
+    kb.button(text="⬅️ Назад", callback_data="menu:back")
+    kb.adjust(2, 2, 1, 1) if is_admin else kb.adjust(2, 2, 1)
+    return kb.as_markup()
+
+
+def is_admin(tg_id: int) -> bool:
+    """Check if user is admin."""
+    if not settings.bot or not settings.bot.admin_ids:
+        return False
+    return tg_id in settings.bot.admin_ids
+
+
 @router.message(Command("start"))
 async def cmd_start(m: Message):
-    await m.answer("Привет! Я работаю с Yandex Tracker.\n\n/menu — все команды")
+    """Main menu with inline buttons."""
+    await m.answer(
+        "👋 Привет! Я бот для работы с Yandex Tracker.\n\n"
+        "Выберите раздел:",
+        reply_markup=kb_main_menu()
+    )
 
 
 @router.message(Command("menu"))
 async def cmd_menu(m: Message):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🌅 Утренний", callback_data="report:morning")
-    kb.button(text="🌆 Вечерний", callback_data="report:evening")
-    kb.button(text="📊 Отчёт", callback_data="report:stats")
-    kb.adjust(3)
-    
+    """Alias for /start — main menu."""
+    await cmd_start(m)
+
+
+@router.message(Command("tasks"))
+async def cmd_tasks(m: Message):
+    """Tasks submenu."""
     await m.answer(
-        "📋 *Меню:*\n\n"
-        "🔗 /connect — привязать аккаунт\n"
-        "👤 /me — проверить доступ\n"
-        "⚙️ /settings — настройки\n\n"
-        "✅ /cl\\_my — задачи с моим ОК\n"
-        "❓ /cl\\_my\\_open — ждут моего ОК\n"
-        "📣 /mentions — требующие ответа\n\n"
-        "🤖 /summary ISSUE — резюме (ИИ)\n"
-        "🔍 /ai ЗАПРОС — поиск (ИИ)\n"
-        "📝 /new — создать задачу",
+        "📋 *Задачи*\n\nВыберите действие:",
         parse_mode="Markdown",
-        reply_markup=kb.as_markup()
+        reply_markup=kb_tasks_menu()
+    )
+
+
+@router.message(Command("reports"))
+async def cmd_reports(m: Message):
+    """Reports submenu."""
+    await m.answer(
+        "📊 *Отчёты*\n\nВыберите тип отчёта:",
+        parse_mode="Markdown",
+        reply_markup=kb_reports_menu()
     )
 
 
@@ -1248,6 +1321,84 @@ async def process_ai_search(m: Message, query: str, tg_id: int):
         await loading.edit_text(plain[:4000])
 
 
+async def process_calendar_date(m: Message, text: str):
+    """Process calendar date input (DD.MM.YYYY format)."""
+    import re
+    tg_id = m.from_user.id
+    
+    # Parse date: DD.MM.YYYY
+    pattern = r"(\d{1,2})\.(\d{1,2})\.(\d{4})"
+    match = re.search(pattern, text)
+    
+    if not match:
+        await m.answer(
+            "❌ Неверный формат даты.\n\n"
+            "Пример: `30.01.2026`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        d, mo, y = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        target_date = datetime(y, mo, d)
+        date_str = target_date.strftime("%Y-%m-%d")
+        display_date = target_date.strftime("%d.%m.%Y")
+    except ValueError:
+        await m.answer("❌ Неверная дата")
+        return
+    
+    loading = await m.answer("📅 Загружаю события...")
+    
+    try:
+        sc, data = await api_request(
+            "GET", "/calendar/events",
+            {"tg": tg_id, "date": date_str},
+            long_timeout=True
+        )
+        
+        if sc == 200:
+            events = data.get("events", [])
+            if not events:
+                text_result = f"📅 На {display_date} событий нет"
+            else:
+                lines = [f"📅 *События на {display_date}:*\n"]
+                for i, event in enumerate(events, 1):
+                    summary = event.get("summary", "Без названия")
+                    start = event.get("start", "")
+                    end = event.get("end", "")
+                    start_hm = start.split(" ")[1][:5] if start and " " in start else ""
+                    end_hm = end.split(" ")[1][:5] if end and " " in end else ""
+                    time_str = ""
+                    if start_hm and end_hm and start_hm != end_hm:
+                        time_str = f"{start_hm}–{end_hm}"
+                    elif start_hm:
+                        time_str = start_hm
+                    line = f"{i}. "
+                    if time_str:
+                        line += f"*{time_str}* — "
+                    line += escape_md(summary)
+                    lines.append(line)
+                text_result = "\n".join(lines)
+            
+            kb = InlineKeyboardBuilder()
+            kb.button(text="📅 Сегодня", callback_data="cal:today")
+            kb.button(text="📆 Другая дата", callback_data="cal:pick_date")
+            kb.button(text="⬅️ Назад", callback_data="menu:calendar")
+            kb.adjust(2, 1)
+            
+            await loading.delete()
+            await safe_send_markdown(m, text_result, reply_markup=kb.as_markup())
+        else:
+            error_msg = data.get("error", f"Ошибка {sc}")
+            await loading.edit_text(f"❌ {error_msg}")
+    except Exception as e:
+        logger.error(f"Calendar date error: {e}", exc_info=True)
+        try:
+            await loading.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+        except Exception:
+            pass
+
+
 async def process_custom_stats(m: Message, text: str, pending: dict):
     """Process custom date range for stats."""
     import re
@@ -1330,7 +1481,17 @@ async def handle_callback(c: CallbackQuery):
     """Handle all callback queries."""
     data = c.data or ""
     
-    if data.startswith("chk:"):
+    if data.startswith("menu:"):
+        await handle_menu_callback(c)
+    elif data.startswith("tasks:"):
+        await handle_tasks_callback(c)
+    elif data.startswith("reports:"):
+        await handle_reports_callback(c)
+    elif data.startswith("account:"):
+        await handle_account_callback(c)
+    elif data.startswith("cal:"):
+        await handle_cal_callback(c)
+    elif data.startswith("chk:"):
         await handle_check_callback(c)
     elif data.startswith("cmt_cancel:"):
         # Cancel comment
@@ -1355,6 +1516,420 @@ async def handle_callback(c: CallbackQuery):
         await handle_report_callback(c)
     elif data.startswith("calendar:"):
         await handle_calendar_callback(c)
+    else:
+        await c.answer()
+
+
+async def handle_menu_callback(c: CallbackQuery):
+    """Handle main menu navigation."""
+    if not c.message:
+        await c.answer()
+        return
+    
+    action = (c.data or "").split(":")[1] if ":" in (c.data or "") else ""
+    tg_id = c.from_user.id
+    
+    if action == "tasks":
+        await c.answer()
+        await c.message.edit_text(
+            "📋 *Задачи*\n\nВыберите действие:",
+            parse_mode="Markdown",
+            reply_markup=kb_tasks_menu()
+        )
+    elif action == "reports":
+        await c.answer()
+        await c.message.edit_text(
+            "📊 *Отчёты*\n\nВыберите тип отчёта:",
+            parse_mode="Markdown",
+            reply_markup=kb_reports_menu()
+        )
+    elif action == "calendar":
+        await c.answer()
+        await c.message.edit_text(
+            "📅 *Календарь*\n\nВыберите действие:",
+            parse_mode="Markdown",
+            reply_markup=kb_calendar_menu()
+        )
+    elif action == "account":
+        await c.answer()
+        await c.message.edit_text(
+            "⚙️ *Аккаунт*\n\nВыберите действие:",
+            parse_mode="Markdown",
+            reply_markup=kb_account_menu(is_admin=is_admin(tg_id))
+        )
+    elif action == "back":
+        await c.answer()
+        await c.message.edit_text(
+            "👋 Привет! Я бот для работы с Yandex Tracker.\n\n"
+            "Выберите раздел:",
+            reply_markup=kb_main_menu()
+        )
+    else:
+        await c.answer()
+
+
+async def handle_tasks_callback(c: CallbackQuery):
+    """Handle tasks submenu actions."""
+    if not c.message:
+        await c.answer()
+        return
+    
+    action = (c.data or "").split(":")[1] if ":" in (c.data or "") else ""
+    tg_id = c.from_user.id
+    
+    if action == "new":
+        await c.answer()
+        # Trigger new issue flow
+        state.pending_new_issue[tg_id] = {
+            "step": "queue",
+            "queue": "",
+            "summary": "",
+            "description": "",
+            "assignee": "",
+            "pending_reply_from": "",
+            "message_id": None
+        }
+        await c.message.edit_text(
+            "📝 Создание задачи\n\nВыберите очередь:",
+            reply_markup=kb_new_issue_queue()
+        )
+        state.pending_new_issue[tg_id]["message_id"] = c.message.message_id
+    elif action == "cl_my":
+        await c.answer("⏳ Загружаю...")
+        await c.message.delete()
+        # Call existing handler logic
+        user_settings = await get_settings(tg_id)
+        limit = user_settings[2] if user_settings else 10
+        sc, data = await api_request(
+            "GET", "/tracker/checklist/assigned",
+            {"tg": tg_id, "limit": limit},
+            long_timeout=True
+        )
+        if sc != 200:
+            await c.message.answer(f"❌ Ошибка {sc}: {data.get('error', data)}"[:500])
+            return
+        issues = data.get("issues", [])
+        if not issues:
+            days = data.get("settings", {}).get("days", 30)
+            await c.message.answer(f"Нет задач за {days} дней")
+            return
+        text, _, item_mapping = build_checklist_response(issues, "✅ *Задачи с моим ОК:*")
+        state.checklist_cache.set(f"cl:{tg_id}", item_mapping)
+        for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
+            await c.message.answer(chunk, parse_mode="Markdown")
+    elif action == "cl_my_open":
+        await c.answer("⏳ Загружаю...")
+        await c.message.delete()
+        user_settings = await get_settings(tg_id)
+        limit = user_settings[2] if user_settings else 10
+        sc, data = await api_request(
+            "GET", "/tracker/checklist/assigned_unchecked",
+            {"tg": tg_id, "limit": limit},
+            long_timeout=True
+        )
+        if sc != 200:
+            await c.message.answer(f"❌ Ошибка {sc}: {data.get('error', data)}"[:500])
+            return
+        issues = data.get("issues", [])
+        if not issues:
+            days = data.get("settings", {}).get("days", 30)
+            await c.message.answer(f"Нет пунктов за {days} дней")
+            return
+        text, keyboard, item_mapping = build_checklist_response(
+            issues, "❓ *Ждут моего ОК:*",
+            include_checked=False, add_buttons=True, show_all_items=True,
+            add_comment_buttons=True
+        )
+        state.checklist_cache.set(f"cl:{tg_id}", item_mapping)
+        if len(text) > 4000:
+            await c.message.answer(text[:4000], reply_markup=keyboard, parse_mode="Markdown")
+            await c.message.answer(text[4000:], parse_mode="Markdown")
+        else:
+            await c.message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+    elif action == "mentions":
+        await c.answer("⏳ Загружаю...")
+        await c.message.delete()
+        user_settings = await get_settings(tg_id)
+        limit = user_settings[2] if user_settings else 10
+        sc, data = await api_request(
+            "GET", "/tracker/summons",
+            {"tg": tg_id, "limit": limit},
+            long_timeout=True
+        )
+        if sc != 200:
+            await c.message.answer(f"❌ Ошибка {sc}: {data.get('error', data)}"[:500])
+            return
+        issues = data.get("issues", [])
+        if not issues:
+            days = data.get("settings", {}).get("days", 30)
+            await c.message.answer(f"📣 Нет упоминаний за {days} дней")
+            return
+        lines = ["📣 *Требующие ответа:*"]
+        for idx, issue in enumerate(issues, 1):
+            responded_icon = "✅" if issue.get("has_responded") else "⏳"
+            lines.append(f"\n{idx}. {fmt_issue_link(issue, prefix=f'{responded_icon} ')}")
+            issue_status = issue.get("status")
+            if issue_status:
+                lines.append(f"   _{escape_md(issue_status)}_")
+        text = "\n".join(lines)
+        for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
+            await c.message.answer(chunk, parse_mode="Markdown")
+    elif action == "summary":
+        await c.answer()
+        from aiogram.types import ForceReply
+        state.pending_summary[tg_id] = True
+        await c.message.edit_text(
+            "🤖 *Резюме задачи*\n\nВведите ключ задачи (например: INV-123):",
+            parse_mode="Markdown"
+        )
+        await c.message.answer(
+            "Ключ задачи:",
+            reply_markup=ForceReply(input_field_placeholder="INV-123")
+        )
+    else:
+        await c.answer()
+
+
+async def handle_reports_callback(c: CallbackQuery):
+    """Handle reports submenu actions."""
+    if not c.message:
+        await c.answer()
+        return
+    
+    action = (c.data or "").split(":")[1] if ":" in (c.data or "") else ""
+    tg_id = c.from_user.id
+    
+    if action == "morning":
+        # Trigger morning report
+        await c.answer("⏳ Загружаю...")
+        full_settings = await get_full_settings(tg_id)
+        queue = full_settings.get("morning_queue", "") if full_settings else ""
+        limit = full_settings.get("morning_limit", 10) if full_settings else 10
+        if not queue:
+            await c.message.edit_text("❌ Очередь не настроена. /settings → Утренний отчёт")
+            return
+        moscow_tz = timezone(timedelta(hours=3))
+        today_str = datetime.now(moscow_tz).strftime("%d.%m.%Y")
+        sc, data = await api_request(
+            "GET", "/tracker/morning_report",
+            {"tg": tg_id, "queue": queue, "limit": limit, "date_offset": 0},
+            long_timeout=True
+        )
+        if sc != 200:
+            await c.message.edit_text(f"❌ Ошибка {sc}: {data.get('error', data)}"[:500])
+            return
+        issues = data.get("issues", [])
+        count = data.get("count", 0)
+        kb = InlineKeyboardBuilder()
+        kb.button(text="📆 Вчера", callback_data="report:morning:1")
+        kb.button(text="⬅️ Назад", callback_data="menu:reports")
+        kb.adjust(2)
+        if not issues:
+            text = f"🌅 *{queue}* ({today_str}): нет открытых задач"
+        else:
+            title = f"🌅 *Утренний отчёт — {queue}* ({today_str}, {count} задач)\n"
+            text = format_issue_list(issues, title, FORMAT_MORNING)
+        await safe_edit_markdown(c.message, text, reply_markup=kb.as_markup())
+    elif action == "evening":
+        await c.answer("⏳ Загружаю...")
+        full_settings = await get_full_settings(tg_id)
+        queue = full_settings.get("morning_queue", "") if full_settings else ""
+        if not queue:
+            await c.message.edit_text("❌ Очередь не настроена. /settings → Утренний отчёт")
+            return
+        moscow_tz = timezone(timedelta(hours=3))
+        today_str = datetime.now(moscow_tz).strftime("%d.%m.%Y")
+        sc, data = await api_request(
+            "GET", "/tracker/evening_report",
+            {"tg": tg_id, "queue": queue, "date_offset": 0},
+            long_timeout=True
+        )
+        if sc != 200:
+            await c.message.edit_text(f"❌ Ошибка {sc}: {data.get('error', data)}"[:500])
+            return
+        issues = data.get("issues", [])
+        count = data.get("count", 0)
+        kb = InlineKeyboardBuilder()
+        kb.button(text="📆 Вчера", callback_data="report:evening:1")
+        kb.button(text="⬅️ Назад", callback_data="menu:reports")
+        kb.adjust(2)
+        if not issues:
+            text = f"🌆 *{queue}* ({today_str}): ничего не закрыто"
+        else:
+            title = f"🌆 *Вечерний отчёт — {queue}* ({today_str}, {count} закрыто)\n"
+            text = format_issue_list(issues, title, FORMAT_EVENING)
+        await safe_edit_markdown(c.message, text, reply_markup=kb.as_markup())
+    elif action == "stats":
+        await c.answer()
+        await c.message.edit_text(
+            "📊 *Итоговый отчёт*\n\nВыберите очередь:",
+            parse_mode="Markdown",
+            reply_markup=kb_stats_queue()
+        )
+    else:
+        await c.answer()
+
+
+async def handle_account_callback(c: CallbackQuery):
+    """Handle account submenu actions."""
+    if not c.message or not c.from_user:
+        await c.answer()
+        return
+    
+    action = (c.data or "").split(":")[1] if ":" in (c.data or "") else ""
+    tg_id = c.from_user.id
+    
+    if action == "connect":
+        await c.answer()
+        if not settings.base_url:
+            await c.message.edit_text("❌ BASE_URL не задан")
+            return
+        url = f"{settings.base_url}/oauth/start?tg={tg_id}"
+        await c.message.edit_text(
+            f"🔗 *Привязка аккаунта*\n\n"
+            f"Открой ссылку:\n{url}\n\n"
+            f"После авторизации вернись и нажми «Проверить доступ»",
+            parse_mode="Markdown",
+            reply_markup=kb_account_menu(is_admin=is_admin(tg_id))
+        )
+    elif action == "me":
+        await c.answer("⏳ Проверяю...")
+        sc, data = await api_request("GET", "/tracker/me_by_tg", {"tg": tg_id})
+        if sc != 200:
+            await c.message.edit_text(
+                f"❌ Ошибка {sc}: {data}",
+                reply_markup=kb_account_menu(is_admin=is_admin(tg_id))
+            )
+            return
+        inner_sc = data.get("status_code")
+        if inner_sc == 200:
+            user = data.get("response", {})
+            login = user.get("login") or user.get("display") or "unknown"
+            await c.message.edit_text(
+                f"✅ *Подключено к Tracker*\n\nПользователь: `{login}`",
+                parse_mode="Markdown",
+                reply_markup=kb_account_menu(is_admin=is_admin(tg_id))
+            )
+        else:
+            await c.message.edit_text(
+                f"❌ Tracker: {inner_sc} — {data.get('response')}",
+                reply_markup=kb_account_menu(is_admin=is_admin(tg_id))
+            )
+    elif action == "settings":
+        await c.answer()
+        user_settings = await get_settings(tg_id)
+        if not user_settings:
+            await c.message.edit_text("❌ Не удалось получить настройки")
+            return
+        queues, days, limit, reminder = user_settings
+        await c.message.edit_text(
+            render_settings_text(queues, days, limit, reminder),
+            reply_markup=kb_settings_main()
+        )
+    elif action == "clear":
+        await c.answer("🗑️ История очищена")
+        state.chat_history.clear(tg_id)
+        await c.message.edit_text(
+            "🗑️ *История чата очищена*",
+            parse_mode="Markdown",
+            reply_markup=kb_account_menu(is_admin=is_admin(tg_id))
+        )
+    elif action == "logs":
+        if not is_admin(tg_id):
+            await c.answer("❌ Доступ запрещён", show_alert=True)
+            return
+        await c.answer()
+        if not state.recent_errors:
+            await c.message.edit_text(
+                "✅ Нет ошибок за последнее время",
+                reply_markup=kb_account_menu(is_admin=True)
+            )
+            return
+        errors = state.recent_errors[-5:]
+        lines = ["📋 *Последние ошибки ИИ:*\n"]
+        for i, err in enumerate(reversed(errors), 1):
+            lines.append(f"{i}. {err['time']}")
+            lines.append(f"   Запрос: {err['user_query'][:100]}")
+            lines.append(f"   Ответ: {err['ai_response'][:150]}")
+            if err.get('tool_result'):
+                lines.append(f"   Tool: {err['tool_result'][:100]}")
+            lines.append("")
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:4000] + "\n..."
+        await c.message.edit_text(
+            text.replace("*", "").replace("_", ""),
+            reply_markup=kb_account_menu(is_admin=True)
+        )
+    else:
+        await c.answer()
+
+
+async def handle_cal_callback(c: CallbackQuery):
+    """Handle calendar submenu actions."""
+    if not c.message or not c.from_user:
+        await c.answer()
+        return
+    
+    action = (c.data or "").split(":")[1] if ":" in (c.data or "") else ""
+    tg_id = c.from_user.id
+    
+    if action == "today":
+        await c.answer("⏳ Загружаю...")
+        today = datetime.now().strftime("%Y-%m-%d")
+        sc, data = await api_request(
+            "GET", "/calendar/events",
+            {"tg": tg_id, "date": today},
+            long_timeout=True
+        )
+        if sc == 200:
+            events = data.get("events", [])
+            if not events:
+                text = f"📅 Сегодня ({today}) событий нет"
+            else:
+                lines = [f"📅 *События на сегодня* ({today}):\n"]
+                for i, event in enumerate(events, 1):
+                    summary = event.get("summary", "Без названия")
+                    start = event.get("start", "")
+                    end = event.get("end", "")
+                    start_hm = start.split(" ")[1][:5] if start and " " in start else ""
+                    end_hm = end.split(" ")[1][:5] if end and " " in end else ""
+                    time_str = ""
+                    if start_hm and end_hm and start_hm != end_hm:
+                        time_str = f"{start_hm}–{end_hm}"
+                    elif start_hm:
+                        time_str = start_hm
+                    line = f"{i}. "
+                    if time_str:
+                        line += f"*{time_str}* — "
+                    line += escape_md(summary)
+                    lines.append(line)
+                text = "\n".join(lines)
+            kb = InlineKeyboardBuilder()
+            tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+            kb.button(text="📅 Завтра", callback_data=f"calendar:{tomorrow}")
+            kb.button(text="⬅️ Назад", callback_data="menu:calendar")
+            kb.adjust(2)
+            await safe_edit_markdown(c.message, text, reply_markup=kb.as_markup())
+        else:
+            error_msg = data.get("error", f"Ошибка {sc}")
+            await c.message.edit_text(
+                f"❌ {error_msg}",
+                reply_markup=kb_calendar_menu()
+            )
+    elif action == "pick_date":
+        await c.answer()
+        from aiogram.types import ForceReply
+        # Use pending state for date input
+        state.pending_stats_dates[tg_id] = {"type": "calendar_date", "msg_id": c.message.message_id}
+        await c.message.edit_text(
+            "📆 *Выберите дату*\n\nВведите дату в формате `ДД.ММ.ГГГГ`\n\nПример: `30.01.2026`",
+            parse_mode="Markdown"
+        )
+        await c.message.answer(
+            "Дата:",
+            reply_markup=ForceReply(input_field_placeholder="30.01.2026")
+        )
     else:
         await c.answer()
 
@@ -2426,9 +3001,12 @@ async def handle_text_message(m: Message):
         await process_ai_search(m, text, tg_id)
         return
     
-    # Check if awaiting custom stats date range
+    # Check if awaiting custom stats date range or calendar date
     stats_pending = state.pending_stats_dates.pop(tg_id, None)
     if stats_pending:
+        if stats_pending.get("type") == "calendar_date":
+            await process_calendar_date(m, text)
+            return
         await process_custom_stats(m, text, stats_pending)
         return
     
@@ -2808,8 +3386,15 @@ async def cmd_clear(m: Message):
 
 @commands_router.message(Command("logs"))
 async def cmd_logs(m: Message):
-    """Show recent AI errors."""
+    """Show recent AI errors (admin only)."""
     if not m.from_user:
+        return
+    
+    tg_id = m.from_user.id
+    
+    # Check admin access
+    if not is_admin(tg_id):
+        await m.answer("❌ Доступ запрещён. Эта команда только для администраторов.")
         return
     
     if not state.recent_errors:
@@ -2889,73 +3474,15 @@ async def cmd_calendar_test(m: Message):
 
 @commands_router.message(Command("calendar"))
 async def cmd_calendar(m: Message):
-    """Show calendar events for today."""
-    logger.info(f"[CALENDAR_CMD] Command received: tg_id={m.from_user.id if m.from_user else None}, text={m.text}")
-    
+    """Show calendar menu."""
     if not m.from_user:
-        logger.warning("[CALENDAR_CMD] No from_user")
         return
     
-    tg_id = m.from_user.id
-    logger.info(f"[CALENDAR_CMD] Processing for tg_id={tg_id}")
-    
-    # Get today's date
-    today = datetime.now().strftime("%Y-%m-%d")
-    logger.info(f"[CALENDAR_CMD] Date: {today}")
-    
-    loading = await m.answer("📅 Загружаю события...")
-    logger.info(f"[CALENDAR_CMD] Loading message sent")
-    
-    try:
-        sc, data = await api_request(
-            "GET", "/calendar/events",
-            {"tg": tg_id, "date": today},
-            long_timeout=True
-        )
-        
-        if sc == 200:
-            events = data.get("events", [])
-            logger.info(f"[CALENDAR_CMD] Success: tg_id={tg_id}, date={today}, events_count={len(events)}")
-            if not events:
-                text = f"📅 Сегодня ({today}) событий нет"
-            else:
-                lines = [f"📅 События на сегодня ({today}):\n"]
-                for i, event in enumerate(events, 1):
-                    summary = event.get("summary", "Без названия")
-                    start = event.get("start", "")
-                    end = event.get("end", "")
-                    start_hm = start.split(" ")[1][:5] if start and " " in start else ""
-                    end_hm = end.split(" ")[1][:5] if end and " " in end else ""
-                    time_str = ""
-                    if start_hm and end_hm and start_hm != end_hm:
-                        time_str = f"{start_hm}–{end_hm}"
-                    elif start_hm:
-                        time_str = start_hm
-                    line = f"{i}. "
-                    if time_str:
-                        line += f"**{time_str}** — "
-                    line += summary
-                    lines.append(line)
-                
-                text = "\n".join(lines)
-            
-            # Add button for tomorrow
-            builder = InlineKeyboardBuilder()
-            tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-            builder.button(text="📅 Завтра", callback_data=f"calendar:{tomorrow}")
-            
-            await loading.delete()
-            await m.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
-        else:
-            error_msg = data.get("error", f"Ошибка {sc}")
-            logger.warning(f"Calendar API error: tg_id={tg_id}, sc={sc}, error={error_msg}")
-            await loading.edit_text(f"❌ Не удалось загрузить события: {error_msg}")
-    except Exception as e:
-        logger.error(f"Calendar command error: tg_id={tg_id}, error={e}", exc_info=True)
-        try:
-            await loading.edit_text(f"❌ Ошибка: {str(e)[:100]}")
-        except Exception:
-            pass
+    await m.answer(
+        "📅 *Календарь*\n\nВыберите действие:",
+        parse_mode="Markdown",
+        reply_markup=kb_calendar_menu()
+    )
 
 
 @router.callback_query(F.data.startswith("calendar:"))
@@ -3045,28 +3572,15 @@ async def handle_calendar_callback(cb: CallbackQuery):
 # Bot Setup and Run
 # =============================================================================
 async def setup_bot_commands(bot: Bot):
-    """Set up bot commands menu."""
+    """Set up bot commands menu — only 4 main commands."""
     commands = [
-        BotCommand(command="menu", description="📋 Меню"),
-        BotCommand(command="connect", description="🔗 Привязать аккаунт"),
-        BotCommand(command="me", description="👤 Проверить доступ"),
-        BotCommand(command="settings", description="⚙️ Настройки"),
-        BotCommand(command="cl_my", description="✅ Задачи с моим ОК"),
-        BotCommand(command="cl_my_open", description="❓ Ждут моего ОК"),
-        BotCommand(command="mentions", description="📣 Требующие ответа"),
-        BotCommand(command="morning", description="🌅 Утренний отчёт"),
-        BotCommand(command="evening", description="🌆 Вечерний отчёт"),
-        BotCommand(command="report", description="📊 Итоговый отчёт"),
-        BotCommand(command="summary", description="🤖 Резюме (ИИ)"),
-        BotCommand(command="ai", description="🔍 Поиск (ИИ)"),
-        BotCommand(command="new", description="📝 Создать задачу"),
-        BotCommand(command="clear", description="🗑️ Очистить историю чата"),
-        BotCommand(command="logs", description="📋 Последние ошибки ИИ"),
-        BotCommand(command="calendar", description="📅 События календаря"),
-        BotCommand(command="calendar_test", description="🔍 Тест подключения к календарю"),
+        BotCommand(command="start", description="Главное меню"),
+        BotCommand(command="tasks", description="Задачи"),
+        BotCommand(command="reports", description="Отчёты"),
+        BotCommand(command="calendar", description="Календарь"),
     ]
     await bot.set_my_commands(commands)
-    logger.info(f"Bot commands registered: {len(commands)} commands including calendar")
+    logger.info(f"Bot commands registered: {len(commands)} commands")
 
 
 async def run_bot():

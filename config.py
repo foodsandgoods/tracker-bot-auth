@@ -63,6 +63,7 @@ class OAuthConfig:
 class BotConfig:
     """Telegram bot settings."""
     token: str
+    admin_ids: tuple[int, ...] = ()  # Telegram user IDs with admin access
     keep_alive_interval: int = 300  # 5 min
     reminder_check_interval: int = 300  # 5 min
 
@@ -156,7 +157,14 @@ def load_settings() -> Settings:
     
     # Bot
     bot_token = _get_env("BOT_TOKEN")
-    bot = BotConfig(token=bot_token) if bot_token else None
+    admin_ids_str = _get_env("ADMIN_IDS", "")
+    admin_ids: tuple[int, ...] = ()
+    if admin_ids_str:
+        try:
+            admin_ids = tuple(int(x.strip()) for x in admin_ids_str.split(",") if x.strip())
+        except ValueError:
+            logger.warning(f"Invalid ADMIN_IDS format: {admin_ids_str}")
+    bot = BotConfig(token=bot_token, admin_ids=admin_ids) if bot_token else None
     
     # AI
     ai_key = _get_env("GPTUNNEL_API_KEY")

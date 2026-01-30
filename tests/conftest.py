@@ -12,6 +12,7 @@ os.environ.setdefault("YANDEX_CLIENT_ID", "test_client_id")
 os.environ.setdefault("YANDEX_CLIENT_SECRET", "test_client_secret")
 os.environ.setdefault("YANDEX_ORG_ID", "test_org_id")
 os.environ.setdefault("BOT_TOKEN", "123456:ABC-DEF")
+os.environ.setdefault("ADMIN_IDS", "123456789")
 os.environ.setdefault("GPTUNNEL_API_KEY", "test_api_key")
 os.environ.setdefault("CALDAV_BASE_URL", "https://caldav.yandex.ru")
 
@@ -37,7 +38,7 @@ def mock_settings():
         cache=CacheConfig(),
         tracker=TrackerConfig(org_id="test_org"),
         oauth=OAuthConfig(client_id="test_id", client_secret="test_secret"),
-        bot=BotConfig(token="123:ABC"),
+        bot=BotConfig(token="123:ABC", admin_ids=(123456789,)),
         ai=AIConfig(api_key="test_key"),
         caldav_base_url="https://caldav.yandex.ru",
     )

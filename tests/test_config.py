@@ -82,3 +82,26 @@ class TestCacheConfig:
         assert config.checklist_size == 25
         assert config.summary_size == 15
         assert config.checklist_ttl == 1200
+
+
+class TestBotConfig:
+    """Test BotConfig."""
+    
+    def test_default_admin_ids_empty(self):
+        """Test default admin_ids is empty tuple."""
+        from config import BotConfig
+        
+        config = BotConfig(token="test_token")
+        
+        assert config.admin_ids == ()
+        assert config.keep_alive_interval == 300
+    
+    def test_admin_ids_set(self):
+        """Test admin_ids can be set."""
+        from config import BotConfig
+        
+        config = BotConfig(token="test_token", admin_ids=(123, 456))
+        
+        assert config.admin_ids == (123, 456)
+        assert 123 in config.admin_ids
+        assert 789 not in config.admin_ids
