@@ -687,13 +687,14 @@ def build_checklist_response(
 # Bot Handlers
 # =============================================================================
 def kb_main_menu() -> InlineKeyboardMarkup:
-    """Main menu keyboard 2×2."""
+    """Main menu keyboard 2×2 + help."""
     kb = InlineKeyboardBuilder()
     kb.button(text="📋 Задачи", callback_data="menu:tasks")
     kb.button(text="📊 Отчёты", callback_data="menu:reports")
     kb.button(text="📅 Календарь", callback_data="menu:calendar")
     kb.button(text="⚙️ Аккаунт", callback_data="menu:account")
-    kb.adjust(2, 2)
+    kb.button(text="📖 Справочник", callback_data="menu:help")
+    kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 
@@ -740,6 +741,14 @@ def kb_calendar_menu() -> InlineKeyboardMarkup:
     kb.button(text="📆 На дату", callback_data="cal:pick_date")
     kb.button(text="⬅️ Назад", callback_data="menu:back")
     kb.adjust(2, 1)
+    return kb.as_markup()
+
+
+def kb_help_menu() -> InlineKeyboardMarkup:
+    """Help/reference submenu keyboard."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ Назад", callback_data="menu:back")
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -1565,6 +1574,37 @@ async def handle_menu_callback(c: CallbackQuery):
             "⚙️ *Аккаунт*\n\nВыберите действие:",
             parse_mode="Markdown",
             reply_markup=kb_account_menu(is_admin=is_admin(tg_id))
+        )
+    elif action == "help":
+        await c.answer()
+        help_text = (
+            "📖 *Справочник команд*\n\n"
+            "*Основные:*\n"
+            "• /start, /menu — Главное меню\n"
+            "• /connect — Привязка аккаунта Yandex Tracker\n"
+            "• /me — Проверка доступа\n\n"
+            "*Задачи:*\n"
+            "• /tasks — Меню задач\n"
+            "• /new — Создать новую задачу\n"
+            "• /cl\\_my — Чек-листы моих задач\n"
+            "• /cl\\_my\\_open — Задачи, ожидающие подтверждения\n"
+            "• /cl\\_done — Завершённые чек-листы\n"
+            "• /mentions — Упоминания меня\n"
+            "• /summary <ключ> — Сводка по задаче\n"
+            "• /ai <запрос> — AI-поиск по задачам\n\n"
+            "*Отчёты:*\n"
+            "• /reports — Меню отчётов\n"
+            "• /morning — Утренний отчёт\n"
+            "• /evening — Вечерний отчёт\n"
+            "• /report — Итоговый отчёт/статистика\n\n"
+            "*Другое:*\n"
+            "• /calendar — Календарь задач\n"
+            "• /settings — Настройки бота"
+        )
+        await c.message.edit_text(
+            help_text,
+            parse_mode="Markdown",
+            reply_markup=kb_help_menu()
         )
     elif action == "back":
         await c.answer()
