@@ -809,6 +809,40 @@ async def cmd_reports(m: Message):
     )
 
 
+@router.message(Command("help"))
+async def cmd_help(m: Message):
+    """Help/reference with all available commands."""
+    help_text = (
+        "📖 *Справочник команд*\n\n"
+        "*Основные:*\n"
+        "• /start, /menu — Главное меню\n"
+        "• /connect — Привязка аккаунта Yandex Tracker\n"
+        "• /me — Проверка доступа\n\n"
+        "*Задачи:*\n"
+        "• /tasks — Меню задач\n"
+        "• /new — Создать новую задачу\n"
+        "• /cl\\_my — Чек-листы моих задач\n"
+        "• /cl\\_my\\_open — Задачи, ожидающие подтверждения\n"
+        "• /cl\\_done — Завершённые чек-листы\n"
+        "• /mentions — Упоминания меня\n"
+        "• /summary <ключ> — Сводка по задаче\n"
+        "• /ai <запрос> — AI-поиск по задачам\n\n"
+        "*Отчёты:*\n"
+        "• /reports — Меню отчётов\n"
+        "• /morning — Утренний отчёт\n"
+        "• /evening — Вечерний отчёт\n"
+        "• /report — Итоговый отчёт/статистика\n\n"
+        "*Другое:*\n"
+        "• /calendar — Календарь задач\n"
+        "• /settings — Настройки бота"
+    )
+    await m.answer(
+        help_text,
+        parse_mode="Markdown",
+        reply_markup=kb_help_menu()
+    )
+
+
 @router.message(Command("connect"))
 @require_base_url
 async def cmd_connect(m: Message):
@@ -3628,12 +3662,13 @@ async def handle_calendar_callback(cb: CallbackQuery):
 # Bot Setup and Run
 # =============================================================================
 async def setup_bot_commands(bot: Bot):
-    """Set up bot commands menu — only 4 main commands."""
+    """Set up bot commands menu — 5 main commands."""
     commands = [
         BotCommand(command="start", description="Главное меню"),
         BotCommand(command="tasks", description="Задачи"),
         BotCommand(command="reports", description="Отчёты"),
         BotCommand(command="calendar", description="Календарь"),
+        BotCommand(command="help", description="Справочник"),
     ]
     await bot.set_my_commands(commands)
     logger.info(f"Bot commands registered: {len(commands)} commands")
