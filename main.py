@@ -979,11 +979,18 @@ class TrackerService:
         except ValueError as e:
             return {"http_status": 400, "body": {"error": str(e)}}
 
-        # For today: open issues (exclude closed status). For past dates: issues updated on or before that date
+        # Exclude closed/resolved statuses (Russian and English variants)
+        closed_statuses = (
+            'Status: !"Закрыт" AND Status: !"Завершен" AND Status: !"Решен" '
+            'AND Status: !"Выполнено" AND Status: !"Отменено" AND Status: !"Готово" '
+            'AND Status: !"Closed" AND Status: !"Done" AND Status: !"Resolved" AND Status: !"Cancelled"'
+        )
+        
+        # For today: open issues. For past dates: issues updated on or before that date
         if date_offset == 0:
-            query = f'Queue: {safe_queue} AND Status: !"Закрыт"'
+            query = f'Queue: {safe_queue} AND {closed_statuses}'
         else:
-            query = f'Queue: {safe_queue} AND Status: !"Закрыт" AND Updated: <= now()-{date_offset}d'
+            query = f'Queue: {safe_queue} AND {closed_statuses} AND Updated: <= now()-{date_offset}d'
 
         try:
             st, payload = await self.tracker.search_issues(access, query=query, limit=limit, order="-updated")
